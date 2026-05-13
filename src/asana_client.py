@@ -75,11 +75,43 @@ def _name_contains(task: dict, *substrings: str) -> bool:
     return any(s and s.upper() in name for s in substrings if s)
 
 
+def _verify_match(task: dict, ocr_data: dict) -> bool:
+    """
+    三重核對：任何層配對成功後，都必須通過此驗證才算真正命中。
+
+    驗證邏輯：
+      1. Serial 核對（最關鍵）：每台機器 serial 唯一，task 必須含 serial 前 8 碼
+      2. Product 核對：型號必須吻合，防止同醫院不同機器誤判
+
+    例：OCR 讀到 HKCH + EPIQ 5G + US51680818
+        找到 QEH, EPIQ 5G / USN18C0835  → serial 前8碼 US51680 ≠ USN18C08 → ❌ 拒絕
+        找到 HKCH, EPIQ 5G / US51680818 → serial + product 全符            → ✅ 接受
+    """
+    serial_no = ocr_data.get("serial_no")
+    product   = ocr_data.get("product")
+    name = task.get("name", "").upper()
+
+    # 1. Serial 核對（最重要）：task 必須含 serial 前 8 碼
+    if serial_no and len(serial_no) >= 6:
+        if serial_no[:8].upper() not in name:
+            log.warning(f"    ⚠ 三重核對失敗 Serial：OCR={serial_no} ≠ task='{task.get('name')}'")
+            return False
+
+    # 2. Product 核對：task 必須含 product 型號
+    if product:
+        if product.upper() not in name:
+            log.warning(f"    ⚠ 三重核對失敗 Product：OCR={product} ≠ task='{task.get('name')}'")
+            return False
+
+    return True
+
+
 def find_task(ocr_data: dict) -> Tuple[Optional[dict], int]:
     """
     4 層 Asana 搜尋（本地過濾版，不需要 Premium）。
+    每層命中後均須通過 _verify_match() 三重核對（serial + product）。
     回傳 (matched_task_or_None, tier_used)
-      tier: 1=OrderNo, 2=Serial, 3=Customer+Product, 4=Customer模糊, 0=未找到
+      tier: 1=OrderNo, 2=Serial, 3=Customer+Product, 4=Serial模糊, 0=未找到
     """
     order_no = ocr_data.get("order_no")
     serial_no = ocr_data.get("serial_no")
@@ -88,31 +120,33 @@ def find_task(ocr_data: dict) -> Tuple[Optional[dict], int]:
 
     tasks = _fetch_all_tasks()
 
-    # 第 1 層：Order Number
+    # 第 1 層：Order Number（order_no 唯一，仍做 serial + product 核對）
     if order_no:
         for task in tasks:
-            if _name_contains(task, order_no):
+            if _name_contains(task, order_no) and _verify_match(task, ocr_data):
                 return task, 1
 
-    # 第 2 層：Serial Number
+    # 第 2 層：Serial Number 精確比對（serial 唯一，核對 product）
     if serial_no:
         for task in tasks:
-            if _name_contains(task, serial_no):
+            if _name_contains(task, serial_no) and _verify_match(task, ocr_data):
                 return task, 2
 
-    # 第 3 層：Customer + Product 組合
+    # 第 3 層：Customer + Product 組合（核對 serial）
     if customer and product:
         for task in tasks:
             if _name_contains(task, customer) and _name_contains(task, product):
-                return task, 3
+                if _verify_match(task, ocr_data):
+                    return task, 3
 
-    # 第 4 層：Customer 模糊 fallback
-    if customer:
+    # 第 4 層：Serial 前 8 碼模糊比對 + product 核對
+    # ⚠️ product-only 已移除，serial 是唯一識別
+    if serial_no and len(serial_no) >= 6:
+        serial_prefix = serial_no[:8].upper()
         for task in tasks:
-            if serial_no and _name_contains(task, serial_no):
-                return task, 4
-            if product and _name_contains(task, product):
-                return task, 4
+            if serial_prefix in task.get("name", "").upper():
+                if _verify_match(task, ocr_data):
+                    return task, 4
 
     return None, 0
 
