@@ -1,0 +1,57 @@
+name: Jobsheet Auto Process
+
+on:
+  repository_dispatch:
+    types: [jobsheet-uploaded]
+  workflow_dispatch:           # 手動觸發（測試用）
+  schedule:
+    - cron: '*/15 * * * *'    # 每 15 分鐘輪詢備援（萬一 Apps Script 漏掉）
+
+concurrency:
+  group: jobsheet-process
+  cancel-in-progress: false   # 不取消執行中的，避免處理到一半被腰斬
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip -q rclone-current-linux-amd64.zip
+          sudo mv rclone-*/rclone /usr/local/bin/
+          rclone version
+
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone listremotes
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run orchestrator
+        env:
+          NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
+          ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}
+        run: python -m src.orchestrator
+
+      - name: Cleanup rclone config
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
