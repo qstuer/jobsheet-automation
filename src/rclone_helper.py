@@ -20,18 +20,27 @@ def run(*args, check=True) -> str:
 
 
 def list_pdfs(remote_path: str, exclude_subdirs: bool = True) -> List[str]:
-    """列出 remote 路徑下的 PDF 檔名（預設不含子資料夾）"""
-    args = ["lsf", remote_path, "--include", "*.pdf"]
+    """列出 remote 路徑下的 PDF 檔名（只列檔案，不含子資料夾）"""
+    args = ["lsf", remote_path, "--include", "*.pdf", "--files-only"]
     if exclude_subdirs:
         args += ["--exclude", "*/**"]
     output = run(*args)
-    return [line.strip() for line in output.splitlines() if line.strip()]
+    # 雙重保險：過濾掉結尾為 / 的項目（資料夾）
+    return [
+        line.strip()
+        for line in output.splitlines()
+        if line.strip() and not line.strip().endswith("/")
+    ]
 
 
 def list_pending(remote_path: str, prefix: str = "PENDING_") -> List[str]:
     """列出 _PENDING 資料夾的特定前綴檔案"""
-    output = run("lsf", remote_path, "--include", f"{prefix}*.pdf")
-    return [line.strip() for line in output.splitlines() if line.strip()]
+    output = run("lsf", remote_path, "--include", f"{prefix}*.pdf", "--files-only")
+    return [
+        line.strip()
+        for line in output.splitlines()
+        if line.strip() and not line.strip().endswith("/")
+    ]
 
 
 def download(remote_file: str, local_path: Path) -> None:
