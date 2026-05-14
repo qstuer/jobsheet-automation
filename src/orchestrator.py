@@ -73,8 +73,9 @@ def process_one_job(source_pdf: Path, job: dict, work_dir: Path) -> dict:
     doc.close()
     log.info(f"  OCR(1x): {ocr}")
 
-    # 4 層 Asana 搜尋
-    task, tier = asana_client.find_task(ocr)
+    # 4 層 Asana 搜尋（傳入 job_type，讓 CM 單優先配 CM task，PM 單優先配 PM task）
+    job_type = job["type"]  # "CM" 或 "PM"
+    task, tier = asana_client.find_task(ocr, job_type=job_type)
 
     # 4 層全失敗 → 升級 1.5x zoom 重 OCR 再試
     if task is None:
@@ -83,20 +84,25 @@ def process_one_job(source_pdf: Path, job: dict, work_dir: Path) -> dict:
         ocr = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_FALLBACK)
         doc.close()
         log.info(f"  OCR(1.5x): {ocr}")
-        task, tier = asana_client.find_task(ocr)
+        task, tier = asana_client.find_task(ocr, job_type=job_type)
 
     log.info(f"  Asana 第 {tier} 層 {'命中' if task else '失敗'}")
 
     # ── 結果分流 ──────────────────────────────
     if task is not None:
-        order_no_in_name = asana_client.extract_order_no_from_name(task)
-        if order_no_in_name:
-            # ✅ 找到任務 + 有 Order No → SR#OrderNo.pdf
-            filename = upload_with_order_no(job_pdf, order_no_in_name)
+        # 命名優先順序：
+        #   1. Asana 任務名裡的 order_no（人手輸入，比 OCR 可靠）
+        #   2. Asana 任務標題（任務名無 order_no 時）
+        # ⚠️ 不用 OCR 的 order_no 命名：OCR 可能誤讀（如 61469664→61496664）
+        asana_order_no = asana_client.extract_order_no_from_name(task)
+
+        if asana_order_no:
+            # ✅ Asana 任務名有 Order No → SR#OrderNo.pdf
+            filename = upload_with_order_no(job_pdf, asana_order_no)
             result = {"status": "完成", "tier": tier,
-                      "order_no": order_no_in_name, "onedrive": filename}
+                      "order_no": asana_order_no, "onedrive": filename}
         else:
-            # ✅ 找到任務 + 無 Order No → 直接用任務標題
+            # ✅ 任務名無 Order No → 直接用任務標題
             filename = upload_with_task_title(job_pdf, task)
             result = {"status": "任務標題命名", "tier": tier,
                       "task_name": task.get("name"), "onedrive": filename}

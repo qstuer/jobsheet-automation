@@ -23,12 +23,19 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-# 已知專案 GID（最常用的放最前面）
+# 已知專案 GID 與 Job 類型對應
 KNOWN_PROJECT_GIDS = [
-    "1204466136743272",  # 2026 Apr（本月進行中任務）
-    "1199584308902029",  # PM Jobs
-    "1111192145849645",  # Ultrasound - CM
+    "1204466136743272",  # 2026 Apr（PM）
+    "1199584308902029",  # PM Jobs（PM）
+    "1111192145849645",  # Ultrasound - CM（CM）
 ]
+
+# 每個 project 對應的 job type
+PROJECT_JOB_TYPE: dict = {
+    "1204466136743272": "PM",
+    "1199584308902029": "PM",
+    "1111192145849645": "CM",
+}
 
 _task_cache: List[dict] = []  # 同一次 run 只抓一次
 
@@ -52,6 +59,9 @@ def _fetch_all_tasks() -> List[dict]:
                 r.raise_for_status()
                 data = r.json()
                 batch = data.get("data", [])
+                # 每個 task 標記所屬的 job type，方便後續過濾
+                for t in batch:
+                    t["_job_type"] = PROJECT_JOB_TYPE.get(gid, "unknown")
                 all_tasks.extend(batch)
                 page += 1
                 next_page = data.get("next_page")
@@ -64,6 +74,8 @@ def _fetch_all_tasks() -> List[dict]:
                 log.warning(f"  抓取 project {gid} (page {page}) 失敗: {e}")
                 break
 
+    # 未完成的任務排最前面（completed=False 優先）
+    all_tasks.sort(key=lambda t: t.get("completed", False))
     _task_cache = all_tasks
     log.info(f"  Asana 共載入 {len(all_tasks)} 個 tasks（來自 {len(KNOWN_PROJECT_GIDS)} 個 projects）")
     return _task_cache
@@ -106,10 +118,15 @@ def _verify_match(task: dict, ocr_data: dict) -> bool:
     return True
 
 
-def find_task(ocr_data: dict) -> Tuple[Optional[dict], int]:
+def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int]:
     """
     4 層 Asana 搜尋（本地過濾版，不需要 Premium）。
     每層命中後均須通過 _verify_match() 三重核對（serial + product）。
+
+    job_type: "CM" 或 "PM"（來自 Jobsheet 本身的判斷）
+      → CM 單優先搜 Ultrasound-CM project；PM 單優先搜 PM Jobs/2026 Apr
+      → 同一台機器有 CM + PM 兩個 task 時，正確配對各自的任務
+
     回傳 (matched_task_or_None, tier_used)
       tier: 1=OrderNo, 2=Serial, 3=Customer+Product, 4=Serial模糊, 0=未找到
     """
@@ -118,7 +135,16 @@ def find_task(ocr_data: dict) -> Tuple[Optional[dict], int]:
     product   = ocr_data.get("product")
     customer  = ocr_data.get("customer")
 
-    tasks = _fetch_all_tasks()
+    all_tasks = _fetch_all_tasks()
+
+    # 排序：同類型 job 的 task 排最前，然後未完成優先
+    # CM 單 → Ultrasound-CM tasks 先；PM 單 → PM tasks 先
+    def sort_key(t: dict):
+        type_match = 0 if (job_type and t.get("_job_type") == job_type) else 1
+        completed  = 1 if t.get("completed", False) else 0
+        return (type_match, completed)
+
+    tasks = sorted(all_tasks, key=sort_key)
 
     # 第 1 層：Order Number（order_no 唯一，仍做 serial + product 核對）
     if order_no:
