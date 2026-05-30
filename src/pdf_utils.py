@@ -19,9 +19,10 @@ def split_jobs(pdf_path: Path) -> List[dict]:
     PM（6頁）：頁N保留，N+1刪，N+2~N+4保留，N+5刪 → 輸出 4 頁
     """
     doc = fitz.open(pdf_path)
+    total_pages = len(doc)
     jobs = []
     cursor = 0
-    while cursor < len(doc):
+    while cursor < total_pages:
         job_type = nvidia_client.detect_cm_pm(doc, cursor)
         if job_type == "CM":
             jobs.append({
@@ -38,6 +39,20 @@ def split_jobs(pdf_path: Path) -> List[dict]:
             })
             cursor += config.PM_PAGES_PER_JOB
     doc.close()
+
+    # ── 驗算：消耗頁數必須等於 PDF 總頁數 ──────────────────────────
+    # 若不吻合，代表 CM/PM 誤判導致分頁錯位，整份 PDF 不可信
+    consumed = sum(
+        config.CM_PAGES_PER_JOB if j["type"] == "CM" else config.PM_PAGES_PER_JOB
+        for j in jobs
+    )
+    if consumed != total_pages:
+        raise ValueError(
+            f"分頁驗算失敗：偵測消耗 {consumed} 頁，但 PDF 共 {total_pages} 頁。"
+            f"（偵測結果：{[j['type'] for j in jobs]}）"
+            f"可能原因：CM/PM 誤判，請人工審查。"
+        )
+
     return jobs
 
 

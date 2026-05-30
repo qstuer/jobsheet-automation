@@ -48,7 +48,7 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
     return base64.b64encode(buf.getvalue()).decode()
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=5, max=120))
 def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
     """呼叫 K2.6，關閉 thinking 省 tokens"""
     response = get_client().chat.completions.create(
@@ -68,10 +68,30 @@ def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
 
 
 def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:
-    """讀第一頁的 JOB NATURE 欄位，判斷 CM 或 PM"""
-    img_b64 = crop_jobsheet_top(pdf_doc, page_idx)
+    """
+    讀第一頁的 JOB NATURE 欄位，判斷 CM 或 PM。
+
+    ⚠️ 使用全頁圖（0%-100%）而非裁切版，確保 JOB NATURE 欄完整可見。
+    JOB NATURE 欄位在頁面頂部約 5%-15% 位置，裁切版可能切掉部分。
+    """
+    page = pdf_doc[page_idx]
+    mat = fitz.Matrix(1.0, 1.0)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    # 只取上半部（0%-40%），確保 JOB NATURE 行完整顯示
+    w, h = img.size
+    top_half = img.crop((0, 0, w, int(h * 0.40)))
+    buf = io.BytesIO()
+    top_half.save(buf, "JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+
     answer = _call_k26(
-        prompt="Look at the JOB NATURE field on this jobsheet. Reply with exactly 'CM' or 'PM' only.",
+        prompt=(
+            "This is the top portion of a Philips medical equipment Job Sheet. "
+            "Find the 'JOB NATURE' section which has four checkboxes: CM, PM, FCO, INS. "
+            "Look for which box is ticked or circled. "
+            "Reply with ONLY the word 'CM' or 'PM'."
+        ),
         image_b64=img_b64,
         max_tokens=10,
     ).upper()

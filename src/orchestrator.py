@@ -179,7 +179,16 @@ def main() -> int:
     for filename in pdfs:
         log.info(f"=== 處理 {filename} ===")
         local_pdf = work_dir / filename
-        rclone_helper.download(f"{config.GDRIVE_INPUT}/{filename}", local_pdf)
+        try:
+            rclone_helper.download(f"{config.GDRIVE_INPUT}/{filename}", local_pdf)
+        except rclone_helper.RcloneError:
+            log.warning(f"  {filename} 下載失敗（可能已被其他 run 處理），跳過")
+            continue
+        # 驗證下載的檔案不是空的（Google Drive cache 可能回傳已刪除的檔案）
+        if not local_pdf.exists() or local_pdf.stat().st_size < 1024:
+            log.warning(f"  {filename} 下載檔案異常（大小 < 1KB），跳過")
+            local_pdf.unlink(missing_ok=True)
+            continue
         rclone_helper.delete(f"{config.GDRIVE_INPUT}/{filename}")   # ⚠️ 立刻刪 Drive 原檔
 
         try:
