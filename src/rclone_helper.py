@@ -25,7 +25,6 @@ def list_pdfs(remote_path: str, exclude_subdirs: bool = True) -> List[str]:
     if exclude_subdirs:
         args += ["--exclude", "*/**"]
     output = run(*args)
-    # 雙重保險：過濾掉結尾為 / 的項目（資料夾）
     return [
         line.strip()
         for line in output.splitlines()
@@ -56,3 +55,8 @@ def upload(local_path: Path, remote_file: str) -> None:
 def delete(remote_file: str) -> None:
     """刪除 remote 單一檔案"""
     run("delete", remote_file)
+
+
+def moveto(src: str, dst: str) -> None:
+    """搬移單一檔案（remote→remote 不需重新上傳；用 moveto 指定完整目標路徑）"""
+    run("moveto", src, dst)

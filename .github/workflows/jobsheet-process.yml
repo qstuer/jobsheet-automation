@@ -1,15 +1,14 @@
-name: Jobsheet Auto Process
+name: Jobsheet Stage B - Process
 
+# 階段 B：處理員。讀 googledrive:_SPLIT/ → OCR → Asana → 上傳 OneDrive
 on:
-  repository_dispatch:
-    types: [jobsheet-uploaded]
-  workflow_dispatch:           # 手動觸發（測試用）
+  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'    # 每 15 分鐘輪詢備援（萬一 Apps Script 漏掉）
+    - cron: '7-59/15 * * * *'    # 偏移 7 分鐘跑，讓階段 A 先切好
 
 concurrency:
   group: jobsheet-process
-  cancel-in-progress: false   # 不取消執行中的，避免處理到一半被腰斬
+  cancel-in-progress: false
 
 jobs:
   process:
@@ -45,12 +44,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Run orchestrator
+      - name: Run processor
         env:
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}
-        run: python -m src.orchestrator
+        run: python -m src.processor
 
       - name: Cleanup rclone config
         if: always()
