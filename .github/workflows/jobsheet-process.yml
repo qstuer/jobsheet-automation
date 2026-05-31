@@ -1,10 +1,11 @@
 name: Jobsheet Stage B - Process
 
-# 階段 B：處理員。讀 googledrive:_SPLIT/ → OCR → Asana → 上傳 OneDrive
+# 階段 B：處理員。由「階段 A 完成」自動接力觸發（_SPLIT 有新貨），或手動啟動。不再排程空轉。
 on:
+  workflow_run:
+    workflows: ["Jobsheet Stage A - Split"]
+    types: [completed]
   workflow_dispatch:
-  schedule:
-    - cron: '7-59/15 * * * *'    # 偏移 7 分鐘跑，讓階段 A 先切好
 
 concurrency:
   group: jobsheet-process
@@ -14,24 +15,22 @@ jobs:
   process:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
+    # 只在「手動啟動」或「階段A成功完成」時跑（避免階段A失敗還硬接力）
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-
       - name: Install rclone
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q rclone-current-linux-amd64.zip
           sudo mv rclone-*/rclone /usr/local/bin/
           rclone version
-
       - name: Restore rclone config
         env:
           RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
@@ -40,17 +39,14 @@ jobs:
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
-
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-
       - name: Run processor
         env:
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}
         run: python -m src.processor
-
       - name: Cleanup rclone config
         if: always()
         run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true

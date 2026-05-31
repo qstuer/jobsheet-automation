@@ -1,39 +1,33 @@
 name: Jobsheet Stage A - Split
 
-# 階段 A：拆刀手。掃描器上傳 → 切割每個 job → 落地 googledrive:_SPLIT/
+# 階段 A：拆刀手。只由「掃描器上傳（Apps Script 觸發）」或手動啟動，不再排程空轉。
 on:
   repository_dispatch:
-    types: [jobsheet-uploaded]   # Apps Script 偵測到新 PDF 時觸發
+    types: [jobsheet-uploaded]   # 掃描器上傳新 PDF → Apps Script 觸發
   workflow_dispatch:             # 手動觸發
-  schedule:
-    - cron: '*/15 * * * *'       # 每 15 分鐘備援輪詢
 
 concurrency:
   group: jobsheet-split
-  cancel-in-progress: false      # 不腰斬執行中的
+  cancel-in-progress: false
 
 jobs:
   split:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-
       - name: Install rclone
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q rclone-current-linux-amd64.zip
           sudo mv rclone-*/rclone /usr/local/bin/
           rclone version
-
       - name: Restore rclone config
         env:
           RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
@@ -42,15 +36,12 @@ jobs:
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
-
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-
       - name: Run splitter
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}   # 切割只需視覺判斷 CM/PM
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: python -m src.splitter
-
       - name: Cleanup rclone config
         if: always()
         run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
