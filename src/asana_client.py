@@ -1,18 +1,15 @@
-"""Asana REST API 搜尋模組（免費方案版 — 改用全域 typeahead 搜尋）
+"""Asana 配對模組（兩層架構：可靠欄位撈池 → 本機 serial 容錯比對）
 
-⚠️ /workspaces/tasks/search 需要 Premium。
-   舊版改用 /projects/{gid}/tasks，但要寫死 KNOWN_PROJECT_GIDS、每月手動更新，
-   一旦漏改當月 project，就算 OCR 完全正確也配不到任何 task。
+關鍵觀念（用戶實證）：
+  - Asana typeahead 是「子字串比對」，少字/前綴找得到，但「錯字（替換）找不到」。
+    → 所以「容錯」絕不能丟給 Asana，要放在本機用編輯距離算。
+  - 醫院名、型號是「來來去去那幾個」的可靠欄位（型號還能對照已知清單校正）。
+    → 用「醫院核心碼 + 校正後型號」去 typeahead 撈出一小池候選（這層可靠、不需容錯）。
+  - serial 是機器唯一身分證（如 0697/0698/0699 只差最後一碼）。
+    → 在候選池裡用 serial 編輯距離挑「唯一最近」那台（這層容錯字）。
 
-✅ 現版改用免費的 /workspaces/{gid}/typeahead：
-   - 跨所有 project（含當月）一次搜到候選，不需維護 GID 清單
-   - 用 OCR 讀到的 order_no / serial / serial前8碼 / customer 分別查，合併去重成候選池
-   - 再跑原本的 4 層比對 + serial+product 三重核對
-
-命名邏輯（2026-05-13 更新）：
-  - 找到任務 + 任務名含 Order No → SR#OrderNo.pdf
-  - 找到任務 + 任務名無 Order No → 直接抄整個 Asana 任務標題作為檔名
-  - 4 層全失敗 → 人工審核（存 _PENDING/待人工審查_*.pdf）
+安全閥：最近的 serial 必須在門檻內、且「唯一」（沒有兩台機器一樣近）才接受，
+        否則送 PENDING，絕不亂猜歸到隔壁機器。
 """
 import re
 import logging
@@ -24,38 +21,91 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-_typeahead_cache: dict = {}  # 同一次 run 內，相同 query 只打一次 API
+# 已知型號（正規型；比對時忽略空白與大小寫，並容許 1~2 字 OCR 誤讀）
+KNOWN_PRODUCTS = [
+    "Affiniti 30", "Affiniti 50", "Affiniti 70",
+    "EPIQ 5G", "EPIQ 7G", "EPIQ Elite",
+    "CX30", "CX50",
+]
+
+MAX_SERIAL_DIST = 3   # serial 容許的最大編輯距離
+MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
+
+_typeahead_cache: dict = {}
 
 
-def _infer_job_type(task: dict) -> str:
-    """從 task 所屬 project 名稱推斷 CM / PM（僅供配對排序用）"""
-    names = " ".join((p.get("name") or "") for p in (task.get("projects") or [])).upper()
-    if "CM" in names:
-        return "CM"
-    if "PM" in names:
-        return "PM"
-    # 月份命名的 project（如「2026 May」）放的是定期 PM
-    if re.search(r"\b20\d{2}\b", names) or re.search(
-        r"JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC", names
-    ):
-        return "PM"
-    return "unknown"
+# ── 小工具 ────────────────────────────────────────────────────
+
+def _norm(s: str) -> str:
+    """正規化：去掉非英數字、轉大寫（吃掉空白差異，如 EPIQ5G == EPIQ 5G）"""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
 
-def _typeahead(query: str, count: int = 50) -> List[dict]:
-    """免費全域搜尋：/workspaces/{gid}/typeahead?resource_type=task&query=..."""
+def _lev(a: str, b: str) -> int:
+    """編輯距離（容忍替換/插入/刪除錯字）"""
+    a, b = a.upper(), b.upper()
+    m, n = len(a), len(b)
+    if not m:
+        return n
+    if not n:
+        return m
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        cur = [i] + [0] * n
+        for j in range(1, n + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+        prev = cur
+    return prev[n]
+
+
+def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
+    """把 OCR 型號對照已知清單校正（EPLQ 5G → EPIQ 5G）。太離譜則原樣回傳。"""
+    if not ocr_product:
+        return None
+    target = _norm(ocr_product)
+    best, best_d = None, 99
+    for p in KNOWN_PRODUCTS:
+        d = _lev(target, _norm(p))
+        if d < best_d:
+            best_d, best = d, p
+    return best if best_d <= MAX_PRODUCT_DIST else ocr_product
+
+
+def hospital_core(customer: Optional[str]) -> Optional[str]:
+    """取醫院核心碼：切掉地址尾段（HKCH-02-Xray → HKCH；保留 'Trinity Medical'）"""
+    if not customer:
+        return None
+    core = re.split(r"[,/\-]", customer.strip(), 1)[0].strip()
+    return core or customer.strip()
+
+
+def extract_serial(name: str) -> Optional[str]:
+    """從 task name 抓 serial token（US 開頭 + 6 碼以上），抓不到則回 None"""
+    cands = re.findall(r"\b([A-Z]{2}[A-Z0-9]{6,})\b", (name or "").upper())
+    for c in cands:
+        if c.startswith("US"):
+            return c
+    return cands[0] if cands else None
+
+
+def _name_has_product(name: str, product_norm: str) -> bool:
+    return product_norm in _norm(name)
+
+
+# ── Asana typeahead（免費全域；只負責撈池，子字串比對）────────────
+
+def _typeahead(query: str, count: int = 60) -> List[dict]:
     query = (query or "").strip()
     if not query:
         return []
     if query in _typeahead_cache:
         return _typeahead_cache[query]
-
     headers = {"Authorization": f"Bearer {config.ASANA_TOKEN}"}
     params = {
         "resource_type": "task",
         "query": query,
         "count": count,
-        "opt_fields": "name,completed,projects.name",
+        "opt_fields": "name,completed,created_at",
     }
     url = f"{config.ASANA_BASE_URL}/workspaces/{config.ASANA_WORKSPACE_GID}/typeahead"
     tasks: List[dict] = []
@@ -63,135 +113,98 @@ def _typeahead(query: str, count: int = 50) -> List[dict]:
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         tasks = r.json().get("data", [])
-        for t in tasks:
-            t["_job_type"] = _infer_job_type(t)
     except Exception as e:
         log.warning(f"  Asana typeahead '{query}' 失敗: {e}")
     _typeahead_cache[query] = tasks
     return tasks
 
 
-def _gather_candidates(ocr_data: dict) -> List[dict]:
-    """用各識別碼分別 typeahead，合併去重成候選池"""
-    order_no  = ocr_data.get("order_no")
-    serial_no = ocr_data.get("serial_no")
-    customer  = ocr_data.get("customer")
-
+def _gather_pool(order_no, serial, hosp, product) -> List[dict]:
+    """用可靠欄位撈候選池：醫院+型號（主力）、醫院、serial、order"""
     queries: List[str] = []
+    if hosp and product:
+        queries.append(f"{hosp} {product}")
+    if hosp:
+        queries.append(hosp)
     if order_no:
         queries.append(order_no)
-    if serial_no:
-        queries.append(serial_no)
-        if len(serial_no) >= 8:
-            queries.append(serial_no[:8])   # 模糊：serial 前 8 碼
-    if customer:
-        queries.append(customer)
-
+    if serial:
+        queries.append(serial)
+        if len(serial) >= 8:
+            queries.append(serial[:8])
     pool: dict = {}
     for q in queries:
         for t in _typeahead(q):
             gid = t.get("gid")
             if gid:
                 pool[gid] = t
-    log.info(f"  Asana typeahead 候選池：{len(pool)} 個 task（查詢：{queries}）")
+    log.info(f"  候選池：{len(pool)} 個 task（查詢：{queries}）")
     return list(pool.values())
 
 
-def _name_contains(task: dict, *substrings: str) -> bool:
-    """task name 是否包含任一字串（不分大小寫）"""
-    name = task.get("name", "").upper()
-    return any(s and s.upper() in name for s in substrings if s)
-
-
-def _verify_match(task: dict, ocr_data: dict) -> bool:
-    """
-    三重核對：任何層配對成功後，都必須通過此驗證才算真正命中。
-
-    驗證邏輯：
-      1. Serial 核對（最關鍵）：每台機器 serial 唯一，task 必須含 serial 前 8 碼
-      2. Product 核對：型號必須吻合，防止同醫院不同機器誤判
-
-    例：OCR 讀到 HKCH + EPIQ 5G + US51680818
-        找到 QEH, EPIQ 5G / USN18C0835  → serial 前8碼 US51680 ≠ USN18C08 → ❌ 拒絕
-        找到 HKCH, EPIQ 5G / US51680818 → serial + product 全符            → ✅ 接受
-    """
-    serial_no = ocr_data.get("serial_no")
-    product   = ocr_data.get("product")
-    name = task.get("name", "").upper()
-
-    # 1. Serial 核對（最重要）：task 必須含 serial 前 8 碼
-    if serial_no and len(serial_no) >= 6:
-        if serial_no[:8].upper() not in name:
-            log.warning(f"    ⚠ 三重核對失敗 Serial：OCR={serial_no} ≠ task='{task.get('name')}'")
-            return False
-
-    # 2. Product 核對：task 必須含 product 型號
-    if product:
-        if product.upper() not in name:
-            log.warning(f"    ⚠ 三重核對失敗 Product：OCR={product} ≠ task='{task.get('name')}'")
-            return False
-
-    return True
-
+# ── 主配對 ────────────────────────────────────────────────────
 
 def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int]:
     """
-    4 層 Asana 搜尋（本地過濾版，不需要 Premium）。
-    每層命中後均須通過 _verify_match() 三重核對（serial + product）。
-
-    job_type: "CM" 或 "PM"（來自 Jobsheet 本身的判斷）
-      → CM 單優先搜 Ultrasound-CM project；PM 單優先搜 PM Jobs/2026 Apr
-      → 同一台機器有 CM + PM 兩個 task 時，正確配對各自的任務
-
     回傳 (matched_task_or_None, tier_used)
-      tier: 1=OrderNo, 2=Serial, 3=Customer+Product, 4=Serial模糊, 0=未找到
+      tier: 1=OrderNo精確, 2=醫院+型號撈池→serial唯一最近, 0=未找到
     """
-    order_no = ocr_data.get("order_no")
-    serial_no = ocr_data.get("serial_no")
-    product   = ocr_data.get("product")
-    customer  = ocr_data.get("customer")
+    order_no = (ocr_data.get("order_no") or "").strip()
+    serial   = (ocr_data.get("serial_no") or "").strip().upper()
+    product  = normalize_product(ocr_data.get("product"))
+    hosp     = hospital_core(ocr_data.get("customer"))
 
-    candidates = _gather_candidates(ocr_data)
+    pool = _gather_pool(order_no, serial, hosp, product)
+    if not pool:
+        return None, 0
 
-    # 排序：同類型 job 的 task 排最前，然後未完成優先
-    # CM 單 → CM project task 先；PM 單 → PM/月份 project task 先
-    def sort_key(t: dict):
-        type_match = 0 if (job_type and t.get("_job_type") == job_type) else 1
-        completed  = 1 if t.get("completed", False) else 0
-        return (type_match, completed)
-
-    tasks = sorted(candidates, key=sort_key)
-
-    # 第 1 層：Order Number（order_no 唯一，仍做 serial + product 核對）
+    # 第 1 層：order_no 精確命中（最強）
     if order_no:
-        for task in tasks:
-            if _name_contains(task, order_no) and _verify_match(task, ocr_data):
-                return task, 1
+        for t in pool:
+            if order_no in (t.get("name") or "").upper():
+                return t, 1
 
-    # 第 2 層：Serial Number 精確比對（serial 唯一，核對 product）
-    if serial_no:
-        for task in tasks:
-            if _name_contains(task, serial_no) and _verify_match(task, ocr_data):
-                return task, 2
+    # 第 2 層：型號過濾（可靠）→ serial 本機容錯比對挑唯一最近
+    cands = pool
+    if product:
+        pnorm = _norm(product)
+        filtered = [t for t in cands if _name_has_product(t.get("name", ""), pnorm)]
+        if filtered:
+            cands = filtered
 
-    # 第 3 層：Customer + Product 組合（核對 serial）
-    if customer and product:
-        for task in tasks:
-            if _name_contains(task, customer) and _name_contains(task, product):
-                if _verify_match(task, ocr_data):
-                    return task, 3
+    if not serial:
+        # 沒 serial 可比：只有當池內剛好唯一一台才敢接受
+        serials = {extract_serial(t.get("name", "")) for t in cands}
+        serials.discard(None)
+        if len(cands) == 1:
+            return cands[0], 2
+        return None, 0
 
-    # 第 4 層：Serial 前 8 碼模糊比對 + product 核對
-    # ⚠️ product-only 已移除，serial 是唯一識別
-    if serial_no and len(serial_no) >= 6:
-        serial_prefix = serial_no[:8].upper()
-        for task in tasks:
-            if serial_prefix in task.get("name", "").upper():
-                if _verify_match(task, ocr_data):
-                    return task, 4
+    # 算每個候選的 serial 編輯距離
+    scored = []
+    for t in cands:
+        ts = extract_serial(t.get("name", ""))
+        d = _lev(serial, ts) if ts else 99
+        scored.append({"d": d, "task": t, "serial": ts})
 
+    # 先依「未完成優先 + 時間最近」穩定排序，再依距離排序（距離相同時保留前述偏好）
+    scored.sort(key=lambda x: (x["task"].get("created_at") or ""), reverse=True)
+    scored.sort(key=lambda x: (x["d"], 1 if x["task"].get("completed") else 0))
+
+    best_d = scored[0]["d"]
+    # 安全閥：最近距離必須在門檻內，且「唯一一個 serial」並列最近（不會誤配隔壁機器）
+    best_serials = {s["serial"] for s in scored if s["d"] == best_d}
+    if best_d <= MAX_SERIAL_DIST and len(best_serials) == 1:
+        match = scored[0]
+        log.info(f"  ✅ serial 比對命中：OCR={serial} → {match['serial']}"
+                 f"（dist={best_d}） task='{match['task'].get('name')}'")
+        return match["task"], 2
+
+    log.info(f"  ⚠ serial 無唯一最近（best_d={best_d}, 並列={best_serials}）→ 不敢猜")
     return None, 0
 
+
+# ── 命名輔助（沿用舊版）────────────────────────────────────────
 
 def extract_order_no_from_name(task: dict) -> Optional[str]:
     """從 Asana task name 抓出 8 位 Order Number（5 或 6 開頭）"""
@@ -200,10 +213,6 @@ def extract_order_no_from_name(task: dict) -> Optional[str]:
 
 
 def get_safe_title(task: dict) -> str:
-    """
-    取得用於 OneDrive 檔名的安全標題。
-    把 Windows 不允許的字元（\ / : * ? " < > |）替換成 _
-    """
+    """OneDrive 檔名安全標題：Windows 不允許的字元換成 _"""
     title = task.get("name", "Unknown").strip()
-    safe = re.sub(r'[\\/:*?"<>|]', "_", title)
-    return safe
+    return re.sub(r'[\\/:*?"<>|]', "_", title)

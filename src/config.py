@@ -28,22 +28,28 @@ ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 
 # === OCR 設定（訂單資訊：ORDER/SERIAL/PRODUCT/CUSTOMER）===
 OCR_ZOOM_DEFAULT  = 1.0   # 預設 1x zoom（約 425 tokens/張）
-OCR_ZOOM_FALLBACK = 1.5   # 4 層全失敗後升級（約 1785 tokens/張）
+OCR_ZOOM_FALLBACK = 1.5   # 舊版單次升級用（保留相容）
 OCR_CROP_TOP      = 0.10  # 從圖片高 10% 開始裁
 OCR_CROP_BOTTOM   = 0.30  # 裁到 30%
 OCR_CONTRAST      = 2.0   # 對比加強倍數
 
+# === OCR 多輪嘗試（processor 逐輪重讀重配，配到就停）===
+OCR_RETRY_ZOOMS = [1.0, 1.5, 2.0, 2.5]
+
 # === CM/PM 偵測專用裁切（JOB NATURE 欄）===
 # 用戶實測座標：JOB NATURE 那一格在 縱向 10%-17%、橫向 70%-95%
-# 只佔整頁約 1.7% 面積 → 3x zoom 仍清晰、token 極省、回應快
 CMPM_CROP_TOP    = 0.10
 CMPM_CROP_BOTTOM = 0.17
 CMPM_CROP_LEFT   = 0.70
 CMPM_CROP_RIGHT  = 0.95
 CMPM_ZOOM        = 3.0
-# UNKNOWN 時的回退框（放寬縱向，防表頭高度有差導致切偏）
 CMPM_FALLBACK_TOP    = 0.08
 CMPM_FALLBACK_BOTTOM = 0.20
+
+# === 配對失敗的最終處置 ===
+# 多輪 OCR + Asana 都配不到時，仍上傳 OneDrive，用 OCR 猜測命名並加此前綴標記，
+# 方便人工在 OneDrive 直接看到、手動改名。
+CHECK_PREFIX = "[待核對]"
 
 # === 業務邏輯 ===
 ORDER_NO_REGEX    = r"^[56]\d{7}$"   # 8 位、5 或 6 開頭
