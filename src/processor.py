@@ -31,6 +31,10 @@ log = logging.getLogger("processor")
 
 PENDING_PREFIX = "待人工審查__"   # 舊格式殘檔，retry 用
 
+# 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
+# main() 開頭會清空。
+_USED_NAMES: set = set()
+
 
 def _safe(val: str) -> str:
     """檔名欄位淨化：去掉 Windows/OneDrive 不允許字元、空白與 / 換底線"""
@@ -41,17 +45,18 @@ def _safe(val: str) -> str:
 # ── 上傳 helpers ──────────────────────────────────────────────
 
 def _upload_with_order_no(local_pdf: Path, order_no: str) -> str:
-    filename = f"SR#{order_no}.pdf"
-    rclone_helper.upload(local_pdf, f"{config.ONEDRIVE_OUTPUT}/{filename}")
-    log.info(f"  ↑ OneDrive: {filename}")
-    return filename
+    fn = rclone_helper.upload_unique(
+        local_pdf, config.ONEDRIVE_OUTPUT, f"SR#{order_no}.pdf", _USED_NAMES)
+    log.info(f"  ↑ OneDrive: {fn}")
+    return fn
 
 
 def _upload_with_task_title(local_pdf: Path, task: dict) -> str:
-    filename = f"{asana_client.get_safe_title(task)}.pdf"
-    rclone_helper.upload(local_pdf, f"{config.ONEDRIVE_OUTPUT}/{filename}")
-    log.info(f"  ↑ OneDrive (任務標題): {filename}")
-    return filename
+    fn = rclone_helper.upload_unique(
+        local_pdf, config.ONEDRIVE_OUTPUT,
+        f"{asana_client.get_safe_title(task)}.pdf", _USED_NAMES)
+    log.info(f"  ↑ OneDrive (任務標題): {fn}")
+    return fn
 
 
 def _flagged_name(ocr: dict) -> str:
@@ -64,10 +69,10 @@ def _flagged_name(ocr: dict) -> str:
 
 def _upload_flagged(local_pdf: Path, ocr: dict) -> str:
     """配對失敗 → 仍上傳 OneDrive 並標記待核對"""
-    name = _flagged_name(ocr)
-    rclone_helper.upload(local_pdf, f"{config.ONEDRIVE_OUTPUT}/{name}")
-    log.warning(f"  ⚠ 配對失敗，仍上傳 OneDrive 並標記待核對：{name}")
-    return name
+    fn = rclone_helper.upload_unique(
+        local_pdf, config.ONEDRIVE_OUTPUT, _flagged_name(ocr), _USED_NAMES)
+    log.warning(f"  ⚠ 配對失敗，仍上傳 OneDrive 並標記待核對：{fn}")
+    return fn
 
 
 def _finalize_match(local_pdf: Path, task: dict, tier: int) -> dict:
@@ -168,6 +173,7 @@ def _retry_pending(work_dir: Path) -> list:
 def main() -> int:
     work_dir = Path(tempfile.mkdtemp(prefix="processor_"))
     log.info(f"工作目錄：{work_dir}")
+    _USED_NAMES.clear()   # 防撞名集合，每次執行重置
 
     splits = rclone_helper.list_pdfs(config.GDRIVE_SPLIT, exclude_subdirs=True)
     log.info(f"_SPLIT 待處理 job 數：{len(splits)}")
