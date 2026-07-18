@@ -19,9 +19,9 @@ ONEDRIVE_OUTPUT = "onedrive:Hong Kong Sen's Healthcare/JOBSHEETS"
 GDRIVE_FROM_BROTHER_FOLDER_ID = "1ls3TQXyr0GTxDOO3MVQgR3QFDPXFM6gn"
 GDRIVE_PENDING_FOLDER_ID      = "1Yby1chpl40PYv3Ph9xhnJd971Qwo32en"
 
-# === K2.6 (NVIDIA NIM) ===
+# === 視覺 OCR 模型 (NVIDIA NIM) ===
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-K26_MODEL       = "moonshotai/kimi-k2.6"
+K26_MODEL       = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
 
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"

@@ -46,7 +46,7 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=5, max=120))
 def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
-    """呼叫 K2.6，關閉 thinking 省 tokens"""
+    """呼叫 NVIDIA 視覺模型做單張圖 OCR"""
     response = get_client().chat.completions.create(
         model=config.K26_MODEL,
         messages=[{
@@ -58,7 +58,6 @@ def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
             ],
         }],
         max_tokens=max_tokens,
-        extra_body={"chat_template_kwargs": {"thinking": False}},
     )
     return response.choices[0].message.content.strip()
 
