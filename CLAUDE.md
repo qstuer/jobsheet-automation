@@ -155,6 +155,7 @@ GitHub Secrets：
 
 - 舊模型 `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` 的免費入口已停用。
 - 預設換為仍有免費入口、使用相同圖片格式的 `meta/llama-3.2-11b-vision-instruct`。
+- 欄位辨認會要求 NVIDIA 只回四個指定欄位的 JSON；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但欄位不齊全時不會從散文硬猜。
 - 可用 `NVIDIA_MODEL` Secret 暫時覆蓋，不需先改程式。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
 - GitHub 內的下載版本變數必須叫 `JOBSHEET_RCLONE_RELEASE`；不可改成 `RCLONE_VERSION`，否則 rclone 會誤當成自己的開關而啟動失敗。

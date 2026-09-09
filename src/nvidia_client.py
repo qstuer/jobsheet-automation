@@ -90,6 +90,43 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
     return content.strip()
 
 
+def _parse_json_object(raw: str, required_keys: Optional[set] = None) -> dict:
+    """讀取模型回覆中的 JSON 物件。
+
+    NVIDIA 有時會在正確 JSON 前後加入短說明或 markdown fence。
+    只接受真正可由 json 解析的物件，不用 eval，也不從散文猜測欄位。
+    """
+    text = raw.strip().lstrip("\ufeff")
+
+    def usable(value) -> bool:
+        return isinstance(value, dict) and (
+            required_keys is None or required_keys.issubset(value)
+        )
+
+    try:
+        candidate = json.loads(text)
+        if usable(candidate):
+            return candidate
+        # 完整回覆本身是合法 JSON，但不是指定物件（例如 list/scalar），
+        # 不可再從它的內部挖出一段內容冒充正式回覆。
+        raise NvidiaResponseError("NVIDIA OCR 回覆不是指定的 JSON 物件")
+    except json.JSONDecodeError:
+        pass
+
+    # 外層文字可能自己也含有一個 JSON 範例；逐一掃描，直到找到
+    # 真正含齊工作單四個欄位的物件，避免誤收前面的無關物件。
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            candidate, _ = decoder.raw_decode(text, match.start())
+        except json.JSONDecodeError:
+            continue
+        if usable(candidate):
+            return candidate
+
+    raise NvidiaResponseError("NVIDIA OCR 回覆沒有完整的 JSON 物件")
+
+
 def crop_job_nature(pdf_doc: fitz.Document, page_idx: int,
                     top: float, bottom: float) -> str:
     """
@@ -155,7 +192,7 @@ def ocr_jobsheet_fields(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0
     img_b64 = crop_jobsheet_top(pdf_doc, page_idx, zoom=zoom)
     prompt = (
         "Extract these fields from the Philips medical equipment jobsheet image. "
-        "Return JSON only, no markdown fences:\n"
+        "Return JSON only, no markdown fences. Use null for any field that is truly blank:\n"
         "{\n"
         '  "order_no": "8-digit number starting with 5 or 6, or null if blank",\n'
         '  "serial_no": "serial number like US622B1115 or USO16D0865",\n'
@@ -165,27 +202,28 @@ def ocr_jobsheet_fields(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0
     )
     data = None
     last_error = None
-    # 服務偶爾會在 JSON 前後加解釋。先清理 markdown；若仍不合法，
+    # 服務偶爾會在 JSON 前後加解釋。找出其中真正的 JSON；若仍不合法，
     # 同一張圖再問一次。兩次都錯才讓 Stage B 失敗並保留來源。
+    field_order = ("order_no", "serial_no", "product", "customer")
+    expected = set(field_order)
     for _ in range(2):
         raw = _call_vision(prompt=prompt, image_b64=img_b64, max_tokens=300)
-        raw = re.sub(r"^`{3}(?:json)?\s*|\s*`{3}$", "", raw,
-                     flags=re.MULTILINE).strip()
         try:
-            candidate = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            candidate = _parse_json_object(raw, required_keys=expected)
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
             continue
-        if not isinstance(candidate, dict):
-            last_error = NvidiaResponseError("NVIDIA OCR 回覆不是 JSON 物件")
-            continue
 
-        expected = {"order_no", "serial_no", "product", "customer"}
-        if not expected.issubset(candidate):
-            missing = ", ".join(sorted(expected - set(candidate)))
-            last_error = NvidiaResponseError(f"NVIDIA OCR 回覆缺少欄位：{missing}")
+        invalid_types = [
+            key for key in expected
+            if candidate.get(key) is not None and not isinstance(candidate.get(key), str)
+        ]
+        if invalid_types:
+            fields = ", ".join(sorted(invalid_types))
+            last_error = NvidiaResponseError(f"NVIDIA OCR 欄位不是文字：{fields}")
             continue
-        data = candidate
+        # 只保留預期欄位，避免模型附帶的其他單據內容進入執行紀錄。
+        data = {key: candidate[key] for key in field_order}
         break
 
     if data is None:

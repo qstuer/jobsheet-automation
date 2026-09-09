@@ -68,9 +68,67 @@ class NvidiaResponseTests(unittest.TestCase):
 
     def test_invalid_ocr_json_raises_instead_of_becoming_blank_fields(self):
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
-                patch.object(nvidia_client, "_call_vision", return_value="not json"):
+                patch.object(nvidia_client, "_call_vision", return_value="not json") as call:
             with self.assertRaises(nvidia_client.NvidiaResponseError):
                 nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+        self.assertEqual(call.call_count, 2)
+
+    def test_wrapped_ocr_json_is_accepted(self):
+        wrapped = (
+            "Here is the requested result:\n```json\n"
+            '{"order_no":"", "serial_no":"US123", '
+            '"product":"Affiniti 70", "customer":"PYNEH"}\n```'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=wrapped):
+            result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+
+        self.assertIsNone(result["order_no"])
+        self.assertEqual(result["serial_no"], "US123")
+
+    def test_unrelated_json_before_ocr_json_is_skipped(self):
+        wrapped = (
+            'Example: {"status":"ok"}\nActual: '
+            '{"order_no":null,"serial_no":"US123","product":"CX50",'
+            '"customer":"HKCH"} trailing words'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=wrapped):
+            result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+
+        self.assertEqual(result["serial_no"], "US123")
+
+    def test_non_text_ocr_field_is_rejected(self):
+        invalid = (
+            '{"order_no":12345678,"serial_no":"US123",'
+            '"product":"CX50","customer":"HKCH"}'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=invalid) as call:
+            with self.assertRaises(nvidia_client.NvidiaResponseError):
+                nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+        self.assertEqual(call.call_count, 2)
+
+    def test_json_list_is_rejected_even_if_it_contains_an_object(self):
+        invalid = (
+            '[{"order_no":null,"serial_no":"US123",'
+            '"product":"CX50","customer":"HKCH"}]'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=invalid):
+            with self.assertRaises(nvidia_client.NvidiaResponseError):
+                nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+
+    def test_unexpected_ocr_fields_are_not_returned(self):
+        response = (
+            '{"order_no":null,"serial_no":"US123","product":"CX50",'
+            '"customer":"HKCH","notes":"must not reach logs"}'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=response):
+            result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+
+        self.assertEqual(set(result), {"order_no", "serial_no", "product", "customer"})
 
 
 if __name__ == "__main__":
