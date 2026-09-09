@@ -10,7 +10,11 @@ from . import config, nvidia_client
 
 
 class SplitError(ValueError):
-    """分頁不可信（CM/PM 誤判、頁數不足、UNKNOWN）→ 整份應轉人工審查"""
+    """單據內容令分頁不可信 → 整份應轉人工審查。
+
+    只用於 CM/PM 判讀與頁數驗算；API、網路、rclone、檔案 I/O 等
+    基礎設施例外不得包成 SplitError，以免原始 PDF 被誤搬到 _SPLIT_FAILED。
+    """
 
 
 # 每種 job type 消耗的頁數；只有 CM/PM 會走自動流程
@@ -80,8 +84,10 @@ def extract_pages(source_pdf: Path, page_indices: List[int], output_pdf: Path) -
     """從原 PDF 抽出指定頁，存成新 PDF"""
     src = fitz.open(source_pdf)
     out = fitz.open()
-    for idx in page_indices:
-        out.insert_pdf(src, from_page=idx, to_page=idx)
-    out.save(output_pdf)
-    out.close()
-    src.close()
+    try:
+        for idx in page_indices:
+            out.insert_pdf(src, from_page=idx, to_page=idx)
+        out.save(output_pdf)
+    finally:
+        out.close()
+        src.close()

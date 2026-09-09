@@ -1,0 +1,154 @@
+name: Jobsheet Pipeline Failure Alert
+
+# 監看 Stage A / Stage B 的完成結果；連續失敗達門檻時建立或更新 GitHub Issue。
+# 使用內建 GITHUB_TOKEN，不需要新增 secret。
+on:
+  workflow_run:
+    workflows:
+      - Jobsheet Stage A - Split
+      - Jobsheet Stage B - Process
+    types: [completed]
+
+permissions:
+  actions: read
+  issues: write
+
+# 同一個受監控 workflow 的告警依序處理，避免同時建立重複 Issue。
+concurrency:
+  group: jobsheet-failure-alert-${{ github.event.workflow_run.workflow_id }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check consecutive failures and maintain alert issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const threshold = 3;
+            const failureConclusions = new Set([
+              'failure',
+              'timed_out',
+              'startup_failure',
+              'action_required',
+            ]);
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const triggeringRun = context.payload.workflow_run;
+            const workflowName = triggeringRun.name;
+            const issueTitle = `[Pipeline Alert] ${workflowName} consecutive failures`;
+
+            // 以 API 當下最新的 completed runs 為準。即使本告警稍晚排到 runner，
+            // 也不會拿舊事件覆蓋較新的成功/失敗狀態。
+            const {data} = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: triggeringRun.workflow_id,
+              status: 'completed',
+              per_page: 100,
+              exclude_pull_requests: true,
+            });
+
+            const runs = data.workflow_runs.sort((a, b) =>
+              (b.run_number - a.run_number) || (b.run_attempt - a.run_attempt)
+            );
+            const latest = runs[0];
+            if (!latest) {
+              core.warning(`No completed runs found for ${workflowName}`);
+              return;
+            }
+
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {owner, repo, state: 'open', per_page: 100},
+            );
+            const alertIssue = openIssues.find(issue =>
+              !issue.pull_request && issue.title === issueTitle
+            );
+
+            if (latest.conclusion === 'success') {
+              if (alertIssue) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: alertIssue.number,
+                  body: `✅ ${workflowName} 已在 [run #${latest.run_number}](${latest.html_url}) 恢復成功，告警自動關閉。`,
+                });
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: alertIssue.number,
+                  state: 'closed',
+                  state_reason: 'completed',
+                });
+              }
+              return;
+            }
+
+            // cancelled / skipped / neutral / stale 不算 pipeline 失敗，也會中斷連敗。
+            if (!failureConclusions.has(latest.conclusion)) {
+              core.info(`Latest conclusion is ${latest.conclusion}; no alert.`);
+              return;
+            }
+
+            const streak = [];
+            for (const run of runs) {
+              if (!failureConclusions.has(run.conclusion)) break;
+              streak.push(run);
+            }
+
+            if (streak.length < threshold) {
+              core.info(`${workflowName}: ${streak.length}/${threshold} consecutive failures.`);
+              return;
+            }
+
+            const runLines = streak.slice(0, 10).map(run =>
+              `- [run #${run.run_number} (attempt ${run.run_attempt})](${run.html_url}) — \`${run.conclusion}\` — ${run.created_at}`
+            );
+            const latestRunMarker = `<!-- jobsheet-alert-latest-run:${latest.id} -->`;
+            const body = [
+              latestRunMarker,
+              `@${owner}`,
+              '',
+              `**${workflowName}** 已連續 **${streak.length}** 次失敗（告警門檻：${threshold} 次）。`,
+              '',
+              `最新結果：\`${latest.conclusion}\``,
+              '',
+              '最近的連續失敗：',
+              ...runLines,
+              '',
+              '此 Issue 由 `Jobsheet Pipeline Failure Alert` 自動維護；下一次成功時會自動留言並關閉。',
+            ].join('\n');
+
+            if (!alertIssue) {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title: issueTitle,
+                body,
+              });
+              core.warning(`Created alert issue #${created.data.number}`);
+              return;
+            }
+
+            // 多個 completed 事件若排隊到同一個最新 run，只更新/留言一次。
+            if ((alertIssue.body || '').includes(latestRunMarker)) {
+              core.info(`Alert issue already reflects run ${latest.id}.`);
+              return;
+            }
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: alertIssue.number,
+              body,
+            });
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: alertIssue.number,
+              body: `⚠️ 連續失敗已增至 **${streak.length}** 次；最新為 [run #${latest.run_number}](${latest.html_url})（\`${latest.conclusion}\`）。`,
+            });

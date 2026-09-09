@@ -21,7 +21,12 @@ GDRIVE_PENDING_FOLDER_ID      = "1Yby1chpl40PYv3Ph9xhnJd971Qwo32en"
 
 # === 視覺 OCR 模型 (NVIDIA NIM) ===
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-K26_MODEL       = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+# 舊模型的免費 API 已在 2026-09 確認停用。預設改用官方仍提供的免費視覺模型；
+# 未來若再下架，可在 GitHub Secret NVIDIA_MODEL 暫時換型號，不必先改程式。
+NVIDIA_MODEL = (
+    os.environ.get("NVIDIA_MODEL")
+    or "meta/llama-3.2-11b-vision-instruct"
+)
 
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"

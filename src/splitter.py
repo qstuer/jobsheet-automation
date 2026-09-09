@@ -39,7 +39,8 @@ def _split_one(filename: str, work_dir: Path) -> dict:
     try:
         jobs = pdf_utils.split_jobs(local_pdf)
     except SplitError as e:
-        # 整份搬到 _SPLIT_FAILED，保留原檔等人工，不刪不切
+        # 只有單據內容/頁數驗算問題會進這裡。API、網路、rclone、檔案 I/O
+        # 等基礎設施例外必須繼續向外拋，保留來源 PDF 等下一輪重試。
         rclone_helper.moveto(src_remote, f"{config.GDRIVE_SPLIT_FAILED}/{filename}")
         log.warning(f"  ⚠ 切割失敗，已搬到 _SPLIT_FAILED：{e}")
         local_pdf.unlink(missing_ok=True)
@@ -67,27 +68,32 @@ def _split_one(filename: str, work_dir: Path) -> dict:
 
 
 def main() -> int:
-    work_dir = Path(tempfile.mkdtemp(prefix="splitter_"))
-    log.info(f"工作目錄：{work_dir}")
+    with tempfile.TemporaryDirectory(prefix="splitter_") as tmpdir:
+        work_dir = Path(tmpdir)
+        log.info(f"工作目錄：{work_dir}")
 
-    pdfs = rclone_helper.list_pdfs(config.GDRIVE_INPUT, exclude_subdirs=True)
-    log.info(f"待切割 PDF 數：{len(pdfs)}")
+        pdfs = rclone_helper.list_pdfs(config.GDRIVE_INPUT, exclude_subdirs=True)
+        log.info(f"待切割 PDF 數：{len(pdfs)}")
 
-    report = []
-    for filename in pdfs:
-        log.info(f"=== 切割 {filename} ===")
-        try:
-            report.append(_split_one(filename, work_dir))
-        except Exception as e:
-            # 非 SplitError 的意外（下載/上傳/rclone）→ 保留原檔，下次重試
-            log.exception(f"  處理 {filename} 發生意外，保留原檔等下次重試：{e}")
-            report.append({"file": filename, "status": "意外錯誤(保留重試)", "error": str(e)})
+        report = []
+        had_unexpected_error = False
+        for filename in pdfs:
+            log.info(f"=== 切割 {filename} ===")
+            try:
+                report.append(_split_one(filename, work_dir))
+            except Exception as e:
+                # 非 SplitError 的意外（下載/上傳/rclone）→ 保留原檔，下次重試
+                log.exception(f"  處理 {filename} 發生意外，保留原檔等下次重試：{e}")
+                report.append({"file": filename, "status": "意外錯誤(保留重試)", "error": str(e)})
+                had_unexpected_error = True
 
     log.info("=" * 60)
     log.info("切割階段完成報告")
     for row in report:
         log.info(f"  {row}")
-    return 0
+    # SplitError 已完成「轉人工」分流，不算 workflow 故障；其他例外必須讓
+    # Actions 顯示失敗，否則會出現空跑成功，連續失敗告警也無法生效。
+    return 1 if had_unexpected_error else 0
 
 
 if __name__ == "__main__":

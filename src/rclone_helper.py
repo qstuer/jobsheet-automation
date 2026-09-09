@@ -1,21 +1,38 @@
-"""rclone subprocess 包裝
-⚠️ 必須用 copyto 不是 copy（JOBSHEETS 有 18000+ 檔案，copy 會先掃描等幾分鐘）
+"""rclone subprocess 包裝。
+
+⚠️ 必須用 copyto 不是 copy（JOBSHEETS 有 18000+ 檔案，copy 會先掃描等幾分鐘）。
+⚠️ 查詢失敗不能當成「檔案不存在」，否則可能覆蓋 OneDrive 既有檔案。
 """
+import hashlib
+import json
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 class RcloneError(Exception):
     pass
 
 
-def run(*args, check=True) -> str:
-    """執行 rclone 指令並回傳 stdout"""
+def run_result(*args) -> subprocess.CompletedProcess:
+    """執行 rclone，保留 return code、stdout、stderr 給需要判斷結果的呼叫者。"""
     cmd = ["rclone"] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        raise RcloneError(f"rclone {' '.join(args)} failed:\n{result.stderr}")
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _raise_for_result(args, result: subprocess.CompletedProcess) -> None:
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "沒有錯誤內容").strip()
+    raise RcloneError(
+        f"rclone {' '.join(args)} failed (exit {result.returncode}):\n{detail}"
+    )
+
+
+def run(*args) -> str:
+    """執行 rclone 指令；失敗時拋錯，不允許靜默略過。"""
+    result = run_result(*args)
+    _raise_for_result(args, result)
     return result.stdout
 
 
@@ -23,7 +40,9 @@ def list_pdfs(remote_path: str, exclude_subdirs: bool = True) -> List[str]:
     """列出 remote 路徑下的 PDF 檔名（只列檔案，不含子資料夾）"""
     args = ["lsf", remote_path, "--include", "*.pdf", "--files-only"]
     if exclude_subdirs:
-        args += ["--exclude", "*/**"]
+        # 不混用 --include / --exclude：新版 rclone 會警告規則順序不確定，
+        # 甚至可能遞迴掃描子資料夾後回傳空清單。max-depth=1 明確只看根目錄。
+        args += ["--max-depth", "1"]
     output = run(*args)
     return [
         line.strip()
@@ -55,16 +74,56 @@ def upload(local_path: Path, remote_file: str) -> None:
     run("copyto", str(local_path), remote_file)
 
 
-def remote_exists(remote_file: str) -> bool:
-    """檢查 remote 上「單一檔案」是否存在。
+def remote_stat(remote_file: str) -> Optional[dict]:
+    """取得遠端單一檔案資料；確定不存在時回 None，其他失敗一律拋錯。
 
     用 lsjson --stat 直接查這一個路徑，不會掃整個資料夾（JOBSHEETS 有 18000+ 檔，很重要）：
-      - 存在：rclone 回一個含 Name 的 JSON 物件（exit 0）
-      - 不存在：rclone 回 directory not found（exit 3、stdout 為空）
-    任何查詢失敗一律當作「不存在」，確保上傳流程不會因為檢查而中斷。
+      - 存在：exit 0，回 JSON
+      - 路徑不存在：exit 3，回 None
+      - 登入過期、網路中斷等：拋 RcloneError，停止處理並保留來源檔
     """
-    out = run("lsjson", "--stat", remote_file, check=False)
-    return '"Name"' in (out or "")
+    args = ("lsjson", "--stat", remote_file)
+    result = run_result(*args)
+    if result.returncode == 3:
+        return None
+    _raise_for_result(args, result)
+    try:
+        data = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RcloneError(f"rclone 回傳的檔案資料無法解析：{remote_file}") from exc
+    if not isinstance(data, dict):
+        raise RcloneError(f"rclone 回傳的檔案資料格式不正確：{remote_file}")
+    return data
+
+
+def remote_exists(remote_file: str) -> bool:
+    """檢查遠端單一檔案是否存在；查詢故障時不會誤報為不存在。"""
+    return remote_stat(remote_file) is not None
+
+
+def _sha256_local(local_path: Path) -> str:
+    digest = hashlib.sha256()
+    with local_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def remote_matches(local_path: Path, remote_file: str, stat: dict = None) -> bool:
+    """比較本機與遠端檔案內容。
+
+    只在目的檔名已存在時使用。先比大小，再請 rclone 下載計算 SHA-256；
+    這讓「已上傳成功、但來源刪除失敗」的重跑能認出同一份檔案，不會再生 (1)。
+    """
+    stat = stat if stat is not None else remote_stat(remote_file)
+    if stat is None or stat.get("IsDir"):
+        return False
+    if stat.get("Size") != local_path.stat().st_size:
+        return False
+
+    output = run("hashsum", "SHA-256", "--download", remote_file).strip()
+    remote_hash = output.split(maxsplit=1)[0].lower() if output else ""
+    return bool(remote_hash) and remote_hash == _sha256_local(local_path)
 
 
 def upload_unique(local_path: Path, folder: str, filename: str,
@@ -85,18 +144,32 @@ def upload_unique(local_path: Path, folder: str, filename: str,
 
     candidate = filename
     n = 0
-    while candidate in seen or remote_exists(f"{folder}/{candidate}"):
+    while True:
+        if candidate in seen:
+            n += 1
+            candidate = f"{stem} ({n}){suffix}"
+            continue
+
+        remote_file = f"{folder}/{candidate}"
+        stat = remote_stat(remote_file)
+        if stat is None:
+            run("copyto", str(local_path), remote_file)
+            seen.add(candidate)
+            return candidate
+
+        # 上一輪可能已完成上傳，只在刪除 Google Drive 來源時失敗。
+        # 內容相同就直接沿用原檔名，不重複上傳。
+        if remote_matches(local_path, remote_file, stat=stat):
+            seen.add(candidate)
+            return candidate
+
         n += 1
         candidate = f"{stem} ({n}){suffix}"
-
-    run("copyto", str(local_path), f"{folder}/{candidate}")
-    seen.add(candidate)
-    return candidate
 
 
 def delete(remote_file: str) -> None:
     """刪除 remote 單一檔案"""
-    run("delete", remote_file)
+    run("deletefile", remote_file)
 
 
 def moveto(src: str, dst: str) -> None:

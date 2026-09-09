@@ -112,9 +112,8 @@ def _process_split_file(filename: str, work_dir: Path) -> dict:
     rclone_helper.download(remote, local)
 
     job_type = _parse_job_type(filename)
-    doc = fitz.open(local)
-    task, tier, ocr = _ocr_and_match(doc, job_type)
-    doc.close()
+    with fitz.open(local) as doc:
+        task, tier, ocr = _ocr_and_match(doc, job_type)
 
     if task is not None:
         log.info(f"  Asana 第 {tier} 層命中")
@@ -171,22 +170,25 @@ def _retry_pending(work_dir: Path) -> list:
 # ── 主程式 ────────────────────────────────────────────────────
 
 def main() -> int:
-    work_dir = Path(tempfile.mkdtemp(prefix="processor_"))
-    log.info(f"工作目錄：{work_dir}")
-    _USED_NAMES.clear()   # 防撞名集合，每次執行重置
+    with tempfile.TemporaryDirectory(prefix="processor_") as tmpdir:
+        work_dir = Path(tmpdir)
+        log.info(f"工作目錄：{work_dir}")
+        _USED_NAMES.clear()   # 防撞名集合，每次執行重置
 
-    splits = rclone_helper.list_pdfs(config.GDRIVE_SPLIT, exclude_subdirs=True)
-    log.info(f"_SPLIT 待處理 job 數：{len(splits)}")
-    main_report = []
-    for filename in splits:
-        log.info(f"=== 處理 {filename} ===")
-        try:
-            main_report.append({"file": filename, **_process_split_file(filename, work_dir)})
-        except Exception as e:
-            log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
-            main_report.append({"file": filename, "status": "處理錯誤", "error": str(e)})
+        splits = rclone_helper.list_pdfs(config.GDRIVE_SPLIT, exclude_subdirs=True)
+        log.info(f"_SPLIT 待處理 job 數：{len(splits)}")
+        main_report = []
+        had_processing_error = False
+        for filename in splits:
+            log.info(f"=== 處理 {filename} ===")
+            try:
+                main_report.append({"file": filename, **_process_split_file(filename, work_dir)})
+            except Exception as e:
+                log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
+                main_report.append({"file": filename, "status": "處理錯誤", "error": str(e)})
+                had_processing_error = True
 
-    pending_report = _retry_pending(work_dir)
+        pending_report = _retry_pending(work_dir)
 
     log.info("=" * 60)
     log.info("處理階段完成報告")
@@ -196,7 +198,9 @@ def main() -> int:
     log.info(f"重試 PENDING：{len(pending_report)} 筆")
     for row in pending_report:
         log.info(f"  {row}")
-    return 0
+    # 有 job 因 API / 網路 / rclone 等原因留待重試時，Stage B 必須呈現失敗，
+    # 讓 workflow_run 連敗告警看得到；已成功上傳或 [待核對] 分流不受影響。
+    return 1 if had_processing_error else 0
 
 
 if __name__ == "__main__":

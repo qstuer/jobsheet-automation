@@ -1,6 +1,4 @@
-"""K2.6 (NVIDIA NIM) vision API 呼叫
-對應 CLAUDE.md Section 5：OCR Tips 與已知陷阱
-"""
+"""NVIDIA 視覺辨認服務：讀取 CM/PM 圈選及單據欄位。"""
 import base64
 import io
 import json
@@ -10,16 +8,34 @@ from typing import Optional
 import fitz
 from PIL import Image, ImageEnhance
 from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from . import config
 
 _client: Optional[OpenAI] = None
 
 
+class NvidiaResponseError(RuntimeError):
+    """辨認服務回覆不完整或格式不正確；不得當成空白單據繼續處理。"""
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """只重試暫時性問題；401/403、缺少 key 等設定錯誤要立即報告。"""
+    if isinstance(exc, NvidiaResponseError):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (408, 409, 429):
+        return True
+    if isinstance(status_code, int) and status_code >= 500:
+        return True
+    return exc.__class__.__name__ in {"APIConnectionError", "APITimeoutError"}
+
+
 def get_client() -> OpenAI:
     global _client
     if _client is None:
+        if not config.NVIDIA_API_KEY:
+            raise RuntimeError("NVIDIA_API_KEY 未設定")
         _client = OpenAI(
             base_url=config.NVIDIA_BASE_URL,
             api_key=config.NVIDIA_API_KEY,
@@ -44,11 +60,16 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
     return base64.b64encode(buf.getvalue()).decode()
 
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=5, max=120))
-def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
+@retry(
+    retry=retry_if_exception(_is_retryable_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(min=5, max=120),
+    reraise=True,
+)
+def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
     """呼叫 NVIDIA 視覺模型做單張圖 OCR"""
     response = get_client().chat.completions.create(
-        model=config.K26_MODEL,
+        model=config.NVIDIA_MODEL,
         messages=[{
             "role": "user",
             "content": [
@@ -58,8 +79,15 @@ def _call_k26(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
             ],
         }],
         max_tokens=max_tokens,
+        temperature=0,
     )
-    return response.choices[0].message.content.strip()
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError) as exc:
+        raise NvidiaResponseError("NVIDIA 視覺模型回覆格式不完整") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise NvidiaResponseError("NVIDIA 視覺模型沒有回傳文字")
+    return content.strip()
 
 
 def crop_job_nature(pdf_doc: fitz.Document, page_idx: int,
@@ -92,11 +120,11 @@ _CMPM_PROMPT = (
 
 
 def _read_job_nature(img_b64: str) -> str:
-    raw = _call_k26(prompt=_CMPM_PROMPT, image_b64=img_b64, max_tokens=10).upper()
-    for token in ("FCO", "INS", "PM", "CM"):   # 先比長/特殊的，避免 CM 被 PM 誤含
-        if token in raw:
-            return token
-    return "UNKNOWN"
+    raw = _call_vision(prompt=_CMPM_PROMPT, image_b64=img_b64, max_tokens=10).upper()
+    # 只能接受一個明確答案。若模型不守指示，在解釋中同時列出 CM/PM/FCO/INS，
+    # 舊寫法會取第一個字而誤切頁；現在一律回 UNKNOWN 轉人工。
+    tokens = set(re.findall(r"\b(?:CM|PM|FCO|INS)\b", raw))
+    return tokens.pop() if len(tokens) == 1 else "UNKNOWN"
 
 
 def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:
@@ -135,12 +163,33 @@ def ocr_jobsheet_fields(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0
         '  "customer": "hospital or customer name like PYNEH, Trinity CWB, HKCH"\n'
         "}"
     )
-    raw = _call_k26(prompt=prompt, image_b64=img_b64, max_tokens=300)
-    raw = re.sub(r"^`{3}(?:json)?\s*|\s*`{3}$", "", raw, flags=re.MULTILINE).strip()
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {"order_no": None, "serial_no": None, "product": None, "customer": None}
+    data = None
+    last_error = None
+    # 服務偶爾會在 JSON 前後加解釋。先清理 markdown；若仍不合法，
+    # 同一張圖再問一次。兩次都錯才讓 Stage B 失敗並保留來源。
+    for _ in range(2):
+        raw = _call_vision(prompt=prompt, image_b64=img_b64, max_tokens=300)
+        raw = re.sub(r"^`{3}(?:json)?\s*|\s*`{3}$", "", raw,
+                     flags=re.MULTILINE).strip()
+        try:
+            candidate = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(candidate, dict):
+            last_error = NvidiaResponseError("NVIDIA OCR 回覆不是 JSON 物件")
+            continue
+
+        expected = {"order_no", "serial_no", "product", "customer"}
+        if not expected.issubset(candidate):
+            missing = ", ".join(sorted(expected - set(candidate)))
+            last_error = NvidiaResponseError(f"NVIDIA OCR 回覆缺少欄位：{missing}")
+            continue
+        data = candidate
+        break
+
+    if data is None:
+        raise NvidiaResponseError("NVIDIA OCR 連續兩次回覆格式不正確") from last_error
 
     for key in list(data.keys()):
         val = data.get(key)

@@ -1,5 +1,5 @@
 """
-本機 K2.6 OCR 準確度對照測試
+本機 NVIDIA 視覺辨認準確度對照測試
 
 用法：
   1. 把 5-10 張歷史 jobsheet PDF 放到 tests/sample_pdfs/

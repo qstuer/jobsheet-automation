@@ -6,6 +6,12 @@ on:
     types: [jobsheet-uploaded]   # 掃描器上傳新 PDF → Apps Script 觸發
   workflow_dispatch:             # 手動觸發
 
+permissions:
+  contents: read
+
+env:
+  RCLONE_VERSION: '1.75.0'
+
 concurrency:
   group: jobsheet-split
   cancel-in-progress: false
@@ -16,17 +22,18 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: pip
       - name: Install rclone
         run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip -q rclone-current-linux-amd64.zip
-          sudo mv rclone-*/rclone /usr/local/bin/
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/
           rclone version
       - name: Restore rclone config
         env:
@@ -38,9 +45,12 @@ jobs:
           rclone listremotes
       - name: Install Python dependencies
         run: pip install -r requirements.txt
+      - name: Show queue before processing
+        run: python -m src.healthcheck
       - name: Run splitter
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
         run: python -m src.splitter
       - name: Cleanup rclone config
         if: always()

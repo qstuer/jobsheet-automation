@@ -13,6 +13,7 @@
 """
 import re
 import logging
+import time
 from typing import Optional, List, Tuple
 
 import requests
@@ -32,6 +33,10 @@ MAX_SERIAL_DIST = 3   # serial 容許的最大編輯距離
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 
 _typeahead_cache: dict = {}
+
+
+class AsanaError(RuntimeError):
+    """Asana 連線或權限故障；必須保留 PDF 等下次重試。"""
 
 
 # ── 小工具 ────────────────────────────────────────────────────
@@ -100,6 +105,9 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
         return []
     if query in _typeahead_cache:
         return _typeahead_cache[query]
+    if not config.ASANA_TOKEN:
+        raise AsanaError("ASANA_TOKEN 未設定")
+
     headers = {"Authorization": f"Bearer {config.ASANA_TOKEN}"}
     params = {
         "resource_type": "task",
@@ -108,13 +116,52 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
         "opt_fields": "name,completed,created_at",
     }
     url = f"{config.ASANA_BASE_URL}/workspaces/{config.ASANA_WORKSPACE_GID}/typeahead"
-    tasks: List[dict] = []
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        tasks = r.json().get("data", [])
-    except Exception as e:
-        log.warning(f"  Asana typeahead '{query}' 失敗: {e}")
+    response = None
+    for attempt in range(1, 5):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+        except requests.RequestException as exc:
+            if attempt == 4:
+                raise AsanaError(f"Asana 查詢 '{query}' 連線失敗") from exc
+            delay = min(2 ** attempt, 30)
+            log.warning(f"  Asana 連線失敗，{delay} 秒後重試（{attempt}/4）")
+            time.sleep(delay)
+            continue
+
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt == 4:
+                raise AsanaError(
+                    f"Asana 查詢 '{query}' 失敗：HTTP {response.status_code}"
+                )
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = max(1.0, min(float(retry_after), 120.0))
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 30)
+            log.warning(
+                f"  Asana 暫時無法服務（HTTP {response.status_code}），"
+                f"{delay:g} 秒後重試（{attempt}/4）"
+            )
+            time.sleep(delay)
+            continue
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise AsanaError(
+                f"Asana 查詢 '{query}' 失敗：HTTP {response.status_code}"
+            ) from exc
+
+        tasks = payload.get("data")
+        if not isinstance(tasks, list):
+            raise AsanaError(f"Asana 查詢 '{query}' 回傳格式不正確")
+        break
+    else:  # pragma: no cover - 迴圈只會 break 或 raise
+        raise AsanaError(f"Asana 查詢 '{query}' 失敗")
+
+    # 只快取成功結果。故障不能快取成空清單，否則同一輪會把服務故障
+    # 誤認成「真的沒有符合任務」。
     _typeahead_cache[query] = tasks
     return tasks
 

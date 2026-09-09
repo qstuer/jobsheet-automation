@@ -1,0 +1,30 @@
+name: Jobsheet Code Check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Check Python syntax
+        run: python -m compileall -q src tests
+      - name: Check Apps Script syntax
+        run: node --check < apps_script/trigger.gs
