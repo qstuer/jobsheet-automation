@@ -10,7 +10,9 @@ permissions:
   contents: read
 
 env:
-  RCLONE_VERSION: '1.75.0'
+  # 不可命名為 RCLONE_VERSION；rclone 會把 RCLONE_* 環境變數
+  # 當成自己的命令選項，將 1.75.0 誤當成布林值而拒絕啟動。
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
 
 concurrency:
   group: jobsheet-split
@@ -31,9 +33,9 @@ jobs:
       - name: Install rclone
         run: |
           curl --fail --location --output rclone.zip \
-            "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
           unzip -q rclone.zip
-          sudo mv "rclone-v${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
           rclone version
       - name: Restore rclone config
         env:

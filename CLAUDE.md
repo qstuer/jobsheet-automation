@@ -157,6 +157,7 @@ GitHub Secrets：
 - 預設換為仍有免費入口、使用相同圖片格式的 `meta/llama-3.2-11b-vision-instruct`。
 - 可用 `NVIDIA_MODEL` Secret 暫時覆蓋，不需先改程式。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
+- GitHub 內的下載版本變數必須叫 `JOBSHEET_RCLONE_RELEASE`；不可改成 `RCLONE_VERSION`，否則 rclone 會誤當成自己的開關而啟動失敗。
 - Python 套件固定在 `requirements.txt`，避免數月後自動升級而失效。
 - 舊版 `src/orchestrator.py` 會過早刪原檔，已移除；不要從歷史版本恢復使用。
 
