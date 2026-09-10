@@ -220,11 +220,8 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             cands = filtered
 
     if not serial:
-        # 沒 serial 可比：只有當池內剛好唯一一台才敢接受
-        serials = {extract_serial(t.get("name", "")) for t in cands}
-        serials.discard(None)
-        if len(cands) == 1:
-            return cands[0], 2
+        # serial 是設備身分證；沒有訂單號又讀不到 serial 時，即使候選池只有
+        # 一個也不能只靠醫院/型號自動歸檔，交給 [待核對]。
         return None, 0
 
     # 算每個候選的 serial 編輯距離

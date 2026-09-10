@@ -184,20 +184,27 @@ def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:
     return result
 
 
-def ocr_jobsheet_fields(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) -> dict:
+def ocr_jobsheet_fields(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        zoom: float = config.OCR_ZOOM_DEFAULT,
+) -> dict:
     """
     提取 ORDER NO / SERIAL NO / PRODUCT / CUSTOMER
     常見誤讀：9→G, O→0, 0→D, l→1, S→5, C450→CX50
     """
     img_b64 = crop_jobsheet_top(pdf_doc, page_idx, zoom=zoom)
     prompt = (
-        "Extract these fields from the Philips medical equipment jobsheet image. "
-        "Return JSON only, no markdown fences. Use null for any field that is truly blank:\n"
+        "Read the handwritten values directly from the four labelled boxes in this jobsheet image. "
+        "Treat this image independently: never invent, autocomplete, or reuse values from typical "
+        "equipment, previous images, or the field descriptions. Preserve every visible letter and "
+        "digit exactly. If a value is blank or not readable, use null. "
+        "Return JSON only, with no markdown fences:\n"
         "{\n"
-        '  "order_no": "8-digit number starting with 5 or 6, or null if blank",\n'
-        '  "serial_no": "serial number like US622B1115 or USO16D0865",\n'
-        '  "product": "product model like EPIQ Elite, EPIQ 5G, Affiniti 50, CX50",\n'
-        '  "customer": "hospital or customer name like PYNEH, Trinity CWB, HKCH"\n'
+        '  "order_no": "text written below ORDER NO., or null",\n'
+        '  "serial_no": "text written below SERIAL NO., or null",\n'
+        '  "product": "text written below PRODUCT, or null",\n'
+        '  "customer": "text written in Customer Name, or null"\n'
         "}"
     )
     data = None

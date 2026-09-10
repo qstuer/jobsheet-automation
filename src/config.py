@@ -32,14 +32,16 @@ NVIDIA_MODEL = (
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 
 # === OCR 設定（訂單資訊：ORDER/SERIAL/PRODUCT/CUSTOMER）===
-OCR_ZOOM_DEFAULT  = 1.0   # 預設 1x zoom（約 425 tokens/張）
-OCR_ZOOM_FALLBACK = 1.5   # 舊版單次升級用（保留相容）
+OCR_ZOOM_DEFAULT  = 2.0   # 手寫細字至少 2x，避免低解像度下用猜的
+OCR_ZOOM_FALLBACK = 2.5   # 舊版單次升級用（保留相容）
 OCR_CROP_TOP      = 0.10  # 從圖片高 10% 開始裁
 OCR_CROP_BOTTOM   = 0.30  # 裁到 30%
 OCR_CONTRAST      = 2.0   # 對比加強倍數
 
-# === OCR 多輪嘗試（processor 逐輪重讀重配，配到就停）===
-OCR_RETRY_ZOOMS = [1.0, 1.5, 2.0, 2.5]
+# === OCR 多輪交叉核對 ===
+# 同一個 Asana 工作至少要在兩個不同解像度都命中才接受；只命中一次便標成待核對。
+OCR_RETRY_ZOOMS = [2.0, 2.5, 3.0]
+OCR_MATCH_CONFIRMATIONS = 2
 
 # === CM/PM 偵測專用裁切（JOB NATURE 欄）===
 # 用戶實測座標：JOB NATURE 那一格在 縱向 10%-17%、橫向 70%-95%

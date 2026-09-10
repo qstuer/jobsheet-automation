@@ -9,7 +9,7 @@ if "fitz" not in sys.modules and importlib.util.find_spec("fitz") is None:
 
 import requests
 
-from src import asana_client, nvidia_client
+from src import asana_client, config, nvidia_client, processor
 
 
 class AsanaFailureTests(unittest.TestCase):
@@ -129,6 +129,88 @@ class NvidiaResponseTests(unittest.TestCase):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         self.assertEqual(set(result), {"order_no", "serial_no", "product", "customer"})
+
+    def test_ocr_prompt_contains_no_realistic_example_values(self):
+        response = (
+            '{"order_no":null,"serial_no":null,"product":null,"customer":null}'
+        )
+        with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=response) as call:
+            nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
+
+        prompt = call.call_args.kwargs["prompt"]
+        for old_example in ("US622B1115", "USO16D0865", "PYNEH", "EPIQ Elite"):
+            self.assertNotIn(old_example, prompt)
+
+
+class ProcessorConsensusTests(unittest.TestCase):
+    def setUp(self):
+        self.ocr_a = {
+            "order_no": None,
+            "serial_no": "SERIAL-A",
+            "product": "MODEL-A",
+            "customer": "CUSTOMER-A",
+        }
+
+    def test_same_task_must_match_twice(self):
+        task = {"gid": "task-1", "name": "Task 1"}
+        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
+                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
+                patch.object(nvidia_client, "ocr_jobsheet_fields",
+                             side_effect=[self.ocr_a, self.ocr_a]) as ocr, \
+                patch.object(asana_client, "find_task", return_value=(task, 2)):
+            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertEqual(matched, task)
+        self.assertEqual(tier, 2)
+        self.assertEqual(ocr.call_count, 2)
+
+    def test_single_match_is_not_accepted(self):
+        task = {"gid": "task-1", "name": "Task 1"}
+        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
+                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
+                patch.object(nvidia_client, "ocr_jobsheet_fields",
+                             side_effect=[self.ocr_a, self.ocr_a, self.ocr_a]), \
+                patch.object(asana_client, "find_task",
+                             side_effect=[(task, 2), (None, 0), (None, 0)]):
+            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertIsNone(matched)
+        self.assertEqual(tier, 0)
+
+    def test_two_different_tasks_are_not_accepted(self):
+        tasks = [
+            ({"gid": "task-1", "name": "Task 1"}, 2),
+            ({"gid": "task-2", "name": "Task 2"}, 2),
+            (None, 0),
+        ]
+        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
+                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
+                patch.object(nvidia_client, "ocr_jobsheet_fields",
+                             side_effect=[self.ocr_a, self.ocr_a, self.ocr_a]), \
+                patch.object(asana_client, "find_task", side_effect=tasks):
+            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertIsNone(matched)
+        self.assertEqual(tier, 0)
+
+
+class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_unique_candidate_without_serial_is_not_auto_matched(self):
+        ocr = {
+            "order_no": None,
+            "serial_no": None,
+            "product": "EPIQ Elite",
+            "customer": "Hospital",
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[{
+            "gid": "only-task",
+            "name": "Hospital, EPIQ Elite / US12345678",
+        }]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertIsNone(task)
+        self.assertEqual(tier, 0)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 > GitHub：<https://github.com/qstuer/jobsheet-automation>
 > 已實證：2026-05-31，一份 20 頁掃描（1 份 CM、3 份 PM）全自動切成 4 份並正確歸檔。
 > 本次翻新：修正新版 rclone 看不到 PDF、移除假成功、加入冷卻及連敗告警、替換已停用的辨認入口、補上安全重跑及測試。
+> 2026-09-10 實檔複驗：切頁結果逐頁正確；同時發現舊 OCR 提示會把範例值誤當答案，已移除所有真實風格範例，並改為兩次獨立辨認一致才可自動配對。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -83,7 +84,7 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 3. 在 Asana 找候選工作，再用機身編號作安全核對。
 4. 上傳 OneDrive，成功後才刪 `_SPLIT/` 來源。
 
-辨認會依次嘗試 1.0、1.5、2.0、2.5 倍清晰度；配對成功便停止。
+辨認會用 2.0、2.5、3.0 倍清晰度交叉核對。同一個 Asana 工作至少要在兩個清晰度都命中才接受；只命中一次、兩次命中不同工作，或讀不到機身編號，一律標成 `[待核對]`，不會自動歸錯設備。
 
 命名次序：
 
@@ -104,7 +105,7 @@ Asana 只找出一小批候選，最後核對在本機完成：
 1. 用醫院、產品、機身編號和訂單號分別找候選。
 2. 校正常見型號小錯字，例如 `EPLQ 5G` 可校正為 `EPIQ 5G`。
 3. 比較機身編號，容許少量辨認錯字。
-4. 只有一個最接近而且差距在安全範圍內才接受；並列或差太遠一律 `[待核對]`。
+4. 只有一個最接近而且差距在安全範圍內，並在另一個清晰度再次命中同一工作，才接受；並列、差太遠或只有一次命中一律 `[待核對]`。
 
 已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/Elite`、`CX30/CX50`。
 
@@ -156,6 +157,7 @@ GitHub Secrets：
 - 舊模型 `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` 的免費入口已停用。
 - 預設換為仍有免費入口、使用相同圖片格式的 `meta/llama-3.2-11b-vision-instruct`。
 - 欄位辨認會要求 NVIDIA 只回四個指定欄位的 JSON；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但欄位不齊全時不會從散文硬猜。
+- 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
 - 可用 `NVIDIA_MODEL` Secret 暫時覆蓋，不需先改程式。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
 - GitHub 內的下載版本變數必須叫 `JOBSHEET_RCLONE_RELEASE`；不可改成 `RCLONE_VERSION`，否則 rclone 會誤當成自己的開關而啟動失敗。
@@ -176,6 +178,7 @@ python -m src.healthcheck
 - `_SPLIT_FAILED` 有檔：人工看頁數和 CM/PM 圈選。
 - GitHub 很快顯示成功但入口完全沒動：看 `Show queue before processing` 是否真的列出檔案；若是 0，檢查 rclone 列檔。
 - GitHub 3 至 4 秒便結束且 Python 未開始：這是 GitHub 工作層問題，不是 PDF 問題；原檔不會進 `_SPLIT_FAILED`。
+- Google Drive 回 `403 rateLimitExceeded`：先停止手動連續查詢並稍後再試，不要反覆啟動流程。若日常運行也經常出現，才建立自己的 Google OAuth client，更新本機 rclone 及 GitHub `RCLONE_CONFIG`；`client_secret` 只可由使用者放進設定，不能寫入 repo。
 
 修好後可安全重跑。不要手動刪入口原檔。
 
@@ -220,7 +223,7 @@ python -m compileall -q src tests
 6. 單檔傳送用 `rclone copyto`，不要用 `copy` 掃描有 18,000 多檔的資料夾。
 7. 根目錄列檔用 `--max-depth 1`，不要混用 `--include` 和 `--exclude`。
 8. 不確定業務規則時先問；可先做不改資料的檢查。
-9. 改完先展示 diff；獲准後可 commit，但不要自行 push。
+9. 改完先展示 diff；獲准後可 commit。除非使用者明確授權，否則不要自行 push。
 
 ## 13. 官方參考
 

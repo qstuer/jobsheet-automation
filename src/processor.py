@@ -3,7 +3,7 @@
 階段 B — 處理員（Processor）
 
 對 _SPLIT/ 裡每一份「單一 job PDF」：
-    → 多輪 OCR（zoom ladder，逐輪重讀重配，配到就停）
+    → 多輪 OCR（不同清晰度交叉核對，同一個 Asana 工作命中兩次才接受）
     → Asana 兩層配對（醫院+型號撈池 → 本機 serial 容錯）
     → 命名後上傳 onedrive:.../JOBSHEETS/ → 刪 _SPLIT 那份
 
@@ -88,16 +88,40 @@ def _finalize_match(local_pdf: Path, task: dict, tier: int) -> dict:
 # ── 多輪 OCR + 配對 ───────────────────────────────────────────
 
 def _ocr_and_match(doc, job_type):
-    """依 zoom ladder 逐輪重讀重配，配到就停。回傳 (task, tier, last_ocr)"""
+    """以不同清晰度重讀；同一個 Asana 工作命中足夠次數才接受。
+
+    單次 OCR 即使剛好命中真實 Asana 工作，也可能只是模型猜中常見字串。
+    因此不能像舊版一樣第一次命中便停止；沒有交叉確認便送 [待核對]。
+    回傳 (task, tier, last_ocr)。
+    """
     last_ocr = {}
+    matches = {}
     for i, zoom in enumerate(config.OCR_RETRY_ZOOMS, 1):
         ocr = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=zoom)
         log.info(f"  OCR 第{i}輪({zoom}x): {ocr}")
         last_ocr = ocr
         task, tier = asana_client.find_task(ocr, job_type=job_type)
         if task is not None:
-            return task, tier, ocr
+            gid = task.get("gid")
+            if not gid:
+                log.warning(f"  第{i}輪候選工作缺少 gid，不接受")
+                continue
+            record = matches.setdefault(gid, {"count": 0, "task": task, "tier": tier})
+            record["count"] += 1
+            # 保留最強命中層級（1 比 2 強）。
+            record["tier"] = min(record["tier"], tier)
+            if record["count"] >= config.OCR_MATCH_CONFIRMATIONS:
+                log.info(
+                    f"  同一個 Asana 工作已由 {record['count']} 輪 OCR 交叉確認"
+                )
+                return record["task"], record["tier"], ocr
+            log.info(
+                f"  第{i}輪命中候選，但仍需另一個清晰度確認，繼續…"
+            )
+            continue
         log.info(f"  第{i}輪未命中，繼續下一輪…")
+    if matches:
+        log.warning("  候選只命中一次或不同輪命中不同工作，不敢自動歸檔")
     return None, 0, last_ocr
 
 
