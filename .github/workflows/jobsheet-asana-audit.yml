@@ -1,0 +1,58 @@
+name: Jobsheet - Private Asana Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Download private audit data
+        run: >-
+          rclone copyto
+          "googledrive:From_BrotherDevice/.jobsheet-control/urgent-audit.json"
+          /tmp/jobsheet-asana-audit.json
+      - name: Search Asana names and descriptions
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ secrets.ASANA_WORKSPACE_GID }}
+        run: python -m src.asana_audit
+      - name: Return result to private Google Drive
+        run: >-
+          rclone copyto
+          /tmp/jobsheet-asana-audit-results.json
+          "googledrive:From_BrotherDevice/.jobsheet-control/urgent-audit-results.json"
+      - name: Cleanup credentials and private data
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          shred -u /tmp/jobsheet-asana-audit.json /tmp/jobsheet-asana-audit-results.json 2>/dev/null || true
