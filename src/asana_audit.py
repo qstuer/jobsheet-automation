@@ -29,6 +29,24 @@ def _digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _request_typeahead(query: str) -> list[dict]:
+    """免費帳戶可用的候選搜尋；要求一併回傳描述供本機比對電話。"""
+    url = f"{config.ASANA_BASE_URL}/workspaces/{config.ASANA_WORKSPACE_GID}/typeahead"
+    headers = {"Authorization": f"Bearer {config.ASANA_TOKEN}"}
+    params = {
+        "resource_type": "task",
+        "query": query,
+        "count": 100,
+        "opt_fields": TASK_FIELDS,
+    }
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json().get("data")
+    if not isinstance(data, list):
+        raise RuntimeError("Asana 候選搜尋回傳格式不正確")
+    return data
+
+
 def _request_search(query: str) -> list[dict]:
     if not config.ASANA_TOKEN or not config.ASANA_WORKSPACE_GID:
         raise RuntimeError("Asana 設定未提供")
@@ -60,6 +78,10 @@ def _request_search(query: str) -> list[dict]:
                 delay = min(2 ** attempt, 30)
             time.sleep(delay)
             continue
+        # Asana 全文搜尋只供付費帳戶使用。免費帳戶回 402 時改用 typeahead
+        # 撈候選，之後仍會在本機用 serial、電話、asset 和醫院逐項評分。
+        if response.status_code == 402:
+            return _request_typeahead(query)
         response.raise_for_status()
         payload = response.json()
         data = payload.get("data")
@@ -115,10 +137,20 @@ def audit_cases(cases: list[dict], recent_after: str) -> list[dict]:
     search_cache: dict[str, list[dict]] = {}
     results = []
     for case in cases:
+        hospitals = case.get("hospital_candidates", [])
+        product = case.get("product") or ""
+        broad_queries = []
+        for hospital in hospitals:
+            if product:
+                broad_queries.append(f"{hospital} {product}")
+            broad_queries.append(hospital)
+        if product:
+            broad_queries.append(product)
         queries = list(dict.fromkeys(
             case.get("serial_candidates", [])
             + case.get("phone_candidates", [])
             + case.get("asset_candidates", [])
+            + broad_queries
         ))
         tasks: dict[str, dict] = {}
         for query in queries:
