@@ -82,6 +82,9 @@ PM：通常 6 張掃描頁，標準結果為工作單 + 3 頁 checklist
 入口：`python -m src.processor`
 GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
+手動測試可填 `jobsheet_file`，精確指定 `_SPLIT` 內一份 PDF。此模式只處理
+該檔，也不會順帶重試 `_PENDING`；留空或 Stage A 自動接力才維持正常批次。
+
 流程：
 
 1. 讀 `_SPLIT/` 的單一工作 PDF。

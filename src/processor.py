@@ -15,6 +15,7 @@
 最後處理舊格式的 _PENDING 殘檔：能配才正名上傳，配不到繼續保留。
 """
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -29,6 +30,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("processor")
 
 PENDING_PREFIX = "待人工審查__"   # 舊格式殘檔，retry 用
+TARGET_FILE_ENV = "JOBSHEET_TARGET_FILE"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -215,6 +217,18 @@ def main() -> int:
 
         splits = rclone_helper.list_pdfs(config.GDRIVE_SPLIT, exclude_subdirs=True)
         log.info(f"_SPLIT 待處理 job 數：{len(splits)}")
+        target = os.environ.get(TARGET_FILE_ENV, "").strip()
+        if target:
+            # 手動測試時必須精確指定 _SPLIT 根目錄內的一個 PDF；不接受
+            # 路徑或模糊名稱，避免誤處理同一批其他工作單。
+            if Path(target).name != target or Path(target).suffix.lower() != ".pdf":
+                log.error("指定的測試檔名不安全，只接受 _SPLIT 內的單一 PDF 檔名")
+                return 1
+            if target not in splits:
+                log.error("指定的測試工作單目前不在 _SPLIT，沒有處理任何檔案")
+                return 1
+            splits = [target]
+            log.info(f"單檔安全模式：本次只處理 {target}")
         main_report = []
         had_processing_error = False
         for filename in splits:
@@ -226,7 +240,9 @@ def main() -> int:
                 main_report.append({"file": filename, "status": "處理錯誤", "error": str(e)})
                 had_processing_error = True
 
-        pending_report = _retry_pending(work_dir)
+        # 單檔安全模式不能順帶重試其他歷史 PENDING；普通自動批次才保留
+        # 舊檔重試行為。
+        pending_report = [] if target else _retry_pending(work_dir)
 
     log.info("=" * 60)
     log.info("處理階段完成報告")

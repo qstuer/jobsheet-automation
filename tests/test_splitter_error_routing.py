@@ -1,5 +1,6 @@
 """Stage A 錯誤分流的回歸測試。"""
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -50,11 +51,36 @@ class SplitterErrorRoutingTests(unittest.TestCase):
             self.assertEqual(splitter.main(), 1)
 
     def test_stage_b_returns_failure_for_processing_error(self):
-        with patch.object(processor.rclone_helper, "list_pdfs", return_value=["job_CM.pdf"]), \
+        with patch.dict(os.environ, {processor.TARGET_FILE_ENV: ""}), \
+                patch.object(processor.rclone_helper, "list_pdfs", return_value=["job_CM.pdf"]), \
                 patch.object(processor, "_process_split_file",
                              side_effect=RuntimeError("API down")), \
                 patch.object(processor, "_retry_pending", return_value=[]):
             self.assertEqual(processor.main(), 1)
+
+    def test_stage_b_single_file_mode_does_not_touch_other_queues(self):
+        files = ["one_PM.pdf", "two_PM.pdf"]
+        with patch.dict(os.environ, {processor.TARGET_FILE_ENV: "two_PM.pdf"}), \
+                patch.object(processor.rclone_helper, "list_pdfs", return_value=files), \
+                patch.object(processor, "_process_split_file",
+                             return_value={"status": "完成"}) as process, \
+                patch.object(processor, "_retry_pending") as retry_pending:
+            self.assertEqual(processor.main(), 0)
+
+        process.assert_called_once()
+        self.assertEqual(process.call_args.args[0], "two_PM.pdf")
+        retry_pending.assert_not_called()
+
+    def test_stage_b_missing_single_file_fails_without_processing(self):
+        with patch.dict(os.environ, {processor.TARGET_FILE_ENV: "missing_PM.pdf"}), \
+                patch.object(processor.rclone_helper, "list_pdfs",
+                             return_value=["one_PM.pdf"]), \
+                patch.object(processor, "_process_split_file") as process, \
+                patch.object(processor, "_retry_pending") as retry_pending:
+            self.assertEqual(processor.main(), 1)
+
+        process.assert_not_called()
+        retry_pending.assert_not_called()
 
 
 class VariableLengthSplitTests(unittest.TestCase):

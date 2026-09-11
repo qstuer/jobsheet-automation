@@ -6,6 +6,11 @@ on:
     workflows: ["Jobsheet Stage A - Split"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      jobsheet_file:
+        description: '只處理 _SPLIT 內這一份 PDF；留空才處理全部'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -59,6 +64,8 @@ jobs:
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}
+          # 手動測試可指定一份；Stage A 自動接力時此值為空，維持正常批次。
+          JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}
         run: python -m src.processor
       - name: Cleanup rclone config
         if: always()

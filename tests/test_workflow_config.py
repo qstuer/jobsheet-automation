@@ -37,6 +37,12 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}", split_text)
         self.assertNotIn("secrets.NVIDIA_MODEL", split_text)
 
+    def test_stage_b_manual_run_can_target_exactly_one_pdf(self):
+        workflow = ROOT / ".github" / "workflows" / "jobsheet-process.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("jobsheet_file:", text)
+        self.assertIn("JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}", text)
+
 
 if __name__ == "__main__":
     unittest.main()
