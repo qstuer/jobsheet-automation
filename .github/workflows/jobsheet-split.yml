@@ -52,7 +52,8 @@ jobs:
       - name: Run splitter
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
+          # 模型名稱不是密鑰；Stage A/B 共用同一個 Actions variable。
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
         run: python -m src.splitter
       - name: Cleanup rclone config
         if: always()

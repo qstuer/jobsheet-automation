@@ -6,7 +6,7 @@
 > 本次翻新：修正新版 rclone 看不到 PDF、移除假成功、加入冷卻及連敗告警、替換已停用的辨認入口、補上安全重跑及測試。
 > 2026-09-10 實檔複驗：切頁結果逐頁正確；同時發現舊 OCR 提示會把範例值誤當答案，已移除所有真實風格範例，並改為兩次獨立辨認一致才可自動配對。
 > 2026-09-11 翻新：用 52 頁實檔找出「短 PM」會令固定 6 頁規則錯位；改為尋找下一張工作單作邊界、按頁面內容去除背頁。辨認新增日期/電話/asset 交叉核對，不確定的名稱不再送 OneDrive。
-> 2026-09-12 模型更新：圖片辨認首選 `moonshotai/kimi-k3`；按官方方式逐步接收答案，加入 45 秒網路時限、90 秒整體時限及嚴格 JSON 驗證。Kimi 免費入口若無回應，同一批只等待一次，隨後使用已知可工作的 Llama 後備。
+> 2026-09-12 模型更新：圖片辨認首選 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`，使用官方不思考 OCR 設定及嚴格 JSON 驗證；任何首選模型失聯時，同一批只等待一次，隨後使用已知可工作的 Llama 後備。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -157,16 +157,17 @@ GitHub Secrets：
 | `NVIDIA_API_KEY` | 是 | 視覺辨認服務 API key |
 | `ASANA_TOKEN` | 是 | Asana 存取權杖 |
 | `ASANA_WORKSPACE_GID` | 是 | Asana workspace 編號 |
-| `NVIDIA_MODEL`（Actions variable） | 否 | 臨時換辨認模型；不填使用程式預設 Kimi K3 |
+| `NVIDIA_MODEL`（Actions variable） | 否 | 臨時換辨認模型；不填使用程式預設 Nemotron 3 Nano Omni |
 
 不要把值寫進 repo、日誌或文件。
 
 2026-09-12 官方狀態檢查：
 
 - 舊模型 `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` 的免費入口已停用。
-- 預設使用仍有免費入口、支援圖片及結構化輸出的 `moonshotai/kimi-k3`。
-- Kimi K3 會先推理再回答；程式使用低推理強度、足夠輸出空間、逐步接收答案及嚴格 JSON 驗證，不能只沿用舊 Llama 的極小輸出上限。
-- 2026-09-12 實際用假圖片檢查兩次，Kimi 免費入口均在回傳任何資料前超時。程式因此加入 `meta/llama-3.2-11b-vision-instruct` 後備：一批內 Kimi 只試一次，失聯後其餘圖片直接用後備，不會每份重等。
+- 預設使用有免費入口、支援圖片、OCR 及 JSON 輸出的 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`。
+- Jobsheet 是抄錄工作，不需要長篇推理；程式依官方 instruct 設定關閉 thinking，使用 `top_k=1`、1024 輸出上限及較穩定的低溫度。
+- 2026-09-12 用新舊 key 實際測試 Kimi K3，均在回傳任何資料前超時；這只證明 Kimi 免費入口當時不可用，不代表 key 本身無效。
+- 後備為曾成功取得 HTTP 200 的 `meta/llama-3.2-11b-vision-instruct`：一批內首選模型只試一次，失聯後其餘圖片直接用後備，不會每份重等。
 - 每次 NVIDIA 網路等待最多 45 秒，SDK 不做隱藏重試；後備模型最多短重試 1 次，全部失敗時檔案保留在 `_SPLIT`。
 - 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
 - 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
@@ -244,7 +245,7 @@ python -m compileall -q src tests
 
 ## 13. 官方參考
 
-- 現用 NVIDIA 模型：<https://build.nvidia.com/moonshotai/kimi-k3>
+- 現用 NVIDIA 模型：<https://build.nvidia.com/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning>
 - 舊 NVIDIA 模型：<https://build.nvidia.com/nvidia/llama-3.1-nemotron-nano-vl-8b-v1>
 - Asana 搜尋：<https://developers.asana.com/reference/typeaheadforworkspace>
 - Asana 限流：<https://developers.asana.com/docs/rate-limits>

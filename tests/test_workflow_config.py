@@ -31,6 +31,12 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}", text)
         self.assertNotIn("secrets.NVIDIA_MODEL", text)
 
+        split_text = (ROOT / ".github" / "workflows" / "jobsheet-split.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}", split_text)
+        self.assertNotIn("secrets.NVIDIA_MODEL", split_text)
+
 
 if __name__ == "__main__":
     unittest.main()

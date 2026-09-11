@@ -120,6 +120,58 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertNotIn("response_format", request)
         self.assertEqual(request["timeout"], config.NVIDIA_REQUEST_TIMEOUT_SECONDS)
 
+    def test_nemotron_uses_official_instruct_settings(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"ok":true}')
+        )])
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+        with patch.object(nvidia_client, "get_client", return_value=client), \
+                patch.object(config, "NVIDIA_MODEL", model):
+            self.assertEqual(
+                '{"ok":true}',
+                nvidia_client._call_vision(
+                    "prompt", "image", max_tokens=128, expects_json=True
+                ),
+            )
+
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["model"], model)
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertEqual(request["seed"], 0)
+        self.assertEqual(
+            request["max_tokens"], config.NEMOTRON_INSTRUCT_MAX_TOKENS
+        )
+        self.assertEqual(request["extra_body"], {
+            "top_k": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+        })
+        self.assertNotIn("stream", request)
+
+    def test_any_primary_model_can_use_fallback(self):
+        class APITimeoutError(Exception):
+            pass
+
+        nvidia_client._unavailable_models.clear()
+        try:
+            with patch.object(config, "NVIDIA_MODEL", "nvidia/primary"), \
+                    patch.object(config, "NVIDIA_FALLBACK_MODEL", "meta/fallback"), \
+                    patch.object(
+                        nvidia_client,
+                        "_call_vision_once",
+                        side_effect=[APITimeoutError("timeout"), "PM"],
+                    ) as call:
+                self.assertEqual(nvidia_client._call_vision("p", "i"), "PM")
+
+            self.assertEqual(
+                [item.args[2] for item in call.call_args_list],
+                ["nvidia/primary", "meta/fallback"],
+            )
+        finally:
+            nvidia_client._unavailable_models.clear()
+
     def test_kimi_timeout_uses_fallback_once_per_process(self):
         class APITimeoutError(Exception):
             pass

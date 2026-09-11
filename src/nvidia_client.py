@@ -68,7 +68,12 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
 def _call_vision_once(prompt: str, image_b64: str, model: str,
                       max_tokens: int, expects_json: bool) -> str:
     """向一個指定模型發出一次請求；重試和後備由外層控制。"""
-    is_kimi_k3 = model.strip().lower() == "moonshotai/kimi-k3"
+    normalized_model = model.strip().lower()
+    is_kimi_k3 = normalized_model == "moonshotai/kimi-k3"
+    is_nemotron_omni = (
+        normalized_model
+        == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    )
     request = dict(
         model=model,
         messages=[{
@@ -84,11 +89,23 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
             if is_kimi_k3 and expects_json
             else max(max_tokens, config.KIMI_TEXT_MAX_TOKENS)
             if is_kimi_k3
+            else max(max_tokens, config.NEMOTRON_INSTRUCT_MAX_TOKENS)
+            if is_nemotron_omni
             else max_tokens
         ),
-        temperature=1 if is_kimi_k3 else 0,
+        temperature=0.2 if is_nemotron_omni else 1 if is_kimi_k3 else 0,
         timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
     )
+    if is_nemotron_omni:
+        # Nemotron 官方的 instruct/OCR 設定：不產生推理文字、固定取最可能
+        # 的 token。模型只抄錄畫面內容，最後仍由本機嚴格驗證 JSON。
+        request.update(
+            seed=0,
+            extra_body={
+                "top_k": 1,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
     if is_kimi_k3:
         # OCR 不需要長篇推理；low 可縮短免費入口的等待，同時保留推理能力。
         # NVIDIA 的 Kimi 範例使用串流；若等待整份答案，免費入口可能在回覆
@@ -126,22 +143,22 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
                  allow_fallback: bool = True) -> str:
     """呼叫 NVIDIA 視覺模型做單張圖 OCR。
 
-    Kimi K3 永遠會先推理，因此不能沿用舊 Llama 的極小輸出上限。詳細欄位
-    JSON 工作會預留較多輸出空間，最後仍由本機 parser 嚴格驗證格式。若
-    Kimi 入口失聯，同一次執行只等一次，隨後改用已知可工作的後備模型。
+    首選模型失聯時，同一次執行只等待一次，隨後改用已知可工作的後備
+    模型。失聯的模型會在本批工作內停用，避免每張單據都重等 45 秒。
     """
     primary = config.NVIDIA_MODEL.strip()
     models = [primary]
-    if allow_fallback and primary.lower() == "moonshotai/kimi-k3":
-        models.append(config.NVIDIA_FALLBACK_MODEL)
+    fallback = config.NVIDIA_FALLBACK_MODEL.strip()
+    if allow_fallback and fallback and primary.lower() != fallback.lower():
+        models.append(fallback)
 
     last_error = None
     for model in models:
         if model in _unavailable_models:
             continue
-        # Kimi 現時的主要故障是完全不回資料；一批內只試一次。較快的後備
-        # 模型保留一次短重試，以容許偶發網路錯誤。
-        attempts = 1 if model.lower() == "moonshotai/kimi-k3" else 2
+        # 首選模型一批內先試一次；後備模型保留一次短重試，以容許偶發
+        # 網路錯誤。下一批執行會重新嘗試首選模型。
+        attempts = 1 if model == primary and len(models) > 1 else 2
         for attempt in range(attempts):
             try:
                 return _call_vision_once(

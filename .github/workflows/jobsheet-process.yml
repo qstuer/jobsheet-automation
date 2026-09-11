@@ -55,7 +55,7 @@ jobs:
       - name: Run processor
         env:
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
-          # 模型名稱不是敏感資料；未設定 variable 時使用 src/config.py 的 Kimi K3。
+          # 模型名稱不是敏感資料；未設定 variable 時使用 src/config.py 的 Nemotron。
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}

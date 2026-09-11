@@ -21,19 +21,23 @@ GDRIVE_PENDING_FOLDER_ID      = "1Yby1chpl40PYv3Ph9xhnJd971Qwo32en"
 
 # === 視覺 OCR 模型 (NVIDIA NIM) ===
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-# Kimi K3 在 2026-09 的 NVIDIA 免費入口支援圖片及結構化輸出。
+# Nemotron 3 Nano Omni 是 NVIDIA 的圖片/OCR 模型，支援 JSON 輸出。
 # 模型名稱不是密鑰；GitHub 可用 Actions variable NVIDIA_MODEL 暫時覆蓋。
 NVIDIA_MODEL = (
     os.environ.get("NVIDIA_MODEL")
-    or "moonshotai/kimi-k3"
+    or "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 )
 NVIDIA_FALLBACK_MODEL = "meta/llama-3.2-11b-vision-instruct"
 # 免費入口不可無限等待。OpenAI SDK 的內建重試關掉，由本程式明確控制，
 # 讓一個失聯請求不會再拖住整批工作單數分鐘。
 NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
 
+# 官方建議純指令工作用 1024 輸出 token、top_k=1 並關閉 thinking。
+# Jobsheet 只要忠實抄錄，不需要模型展示推理過程。
+NEMOTRON_INSTRUCT_MAX_TOKENS = 1024
+
 # Kimi K3 會先推理再給最後答案；過小的 max_tokens 可能只留下推理、沒有
-# JSON/CM/PM 結果。簡單圈選和詳細欄位各保留足夠但有限的輸出空間。
+# JSON/CM/PM 結果。保留相容設定，供 Actions variable 臨時改回 Kimi 時使用。
 KIMI_TEXT_MAX_TOKENS = 1024
 KIMI_JSON_MAX_TOKENS = 4096
 KIMI_STREAM_MAX_SECONDS = 90.0
