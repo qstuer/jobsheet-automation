@@ -39,6 +39,9 @@ def get_client() -> OpenAI:
         _client = OpenAI(
             base_url=config.NVIDIA_BASE_URL,
             api_key=config.NVIDIA_API_KEY,
+            timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
+            # SDK 自己再重試會令實際等待時間失控；下方 tenacity 統一處理。
+            max_retries=0,
         )
     return _client
 
@@ -62,13 +65,19 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
 
 @retry(
     retry=retry_if_exception(_is_retryable_error),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(min=5, max=120),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(min=2, max=5),
     reraise=True,
 )
-def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
-    """呼叫 NVIDIA 視覺模型做單張圖 OCR"""
-    response = get_client().chat.completions.create(
+def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
+                 expects_json: bool = False) -> str:
+    """呼叫 NVIDIA 視覺模型做單張圖 OCR。
+
+    Kimi K3 永遠會先推理，因此不能沿用舊 Llama 的極小輸出上限。詳細欄位
+    JSON 工作會預留較多輸出空間，最後仍由本機 parser 嚴格驗證格式。
+    """
+    is_kimi_k3 = config.NVIDIA_MODEL.strip().lower() == "moonshotai/kimi-k3"
+    request = dict(
         model=config.NVIDIA_MODEL,
         messages=[{
             "role": "user",
@@ -78,9 +87,21 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300) -> str:
                  "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
             ],
         }],
-        max_tokens=max_tokens,
-        temperature=0,
+        max_tokens=(
+            max(max_tokens, config.KIMI_JSON_MAX_TOKENS)
+            if is_kimi_k3 and expects_json
+            else max(max_tokens, config.KIMI_TEXT_MAX_TOKENS)
+            if is_kimi_k3
+            else max_tokens
+        ),
+        temperature=1 if is_kimi_k3 else 0,
+        timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
     )
+    if is_kimi_k3:
+        # OCR 不需要長篇推理；low 可縮短免費入口的等待，同時保留推理能力。
+        request.update(reasoning_effort="low", seed=0)
+
+    response = get_client().chat.completions.create(**request)
     try:
         content = response.choices[0].message.content
     except (AttributeError, IndexError) as exc:
@@ -234,7 +255,12 @@ def ocr_jobsheet_fields(
     # 其餘缺項在本機補空值，避免格式小差異令整條 pipeline 失敗。
     expected = {"order_no", "serial_candidates", "product_raw", "customer_raw"}
     for _ in range(2):
-        raw = _call_vision(prompt=prompt, image_b64=img_b64, max_tokens=300)
+        raw = _call_vision(
+            prompt=prompt,
+            image_b64=img_b64,
+            max_tokens=300,
+            expects_json=True,
+        )
         try:
             candidate = _parse_json_object(raw, required_keys=expected)
         except (json.JSONDecodeError, NvidiaResponseError) as exc:

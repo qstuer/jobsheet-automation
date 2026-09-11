@@ -1,0 +1,28 @@
+name: NVIDIA Model Check
+
+# 只供人工驗證圖片模型；不讀 Google Drive，也不連接 Asana/OneDrive。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Read a synthetic image with the configured model
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL:   ${{ vars.NVIDIA_MODEL }}
+        run: python -m src.nvidia_smoke_test

@@ -25,6 +25,12 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertEqual(1, text.count("github.rest.issues.createComment"))
         self.assertIn("without a new comment", text)
 
+    def test_model_name_uses_non_secret_repository_variable(self):
+        workflow = ROOT / ".github" / "workflows" / "jobsheet-process.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}", text)
+        self.assertNotIn("secrets.NVIDIA_MODEL", text)
+
 
 if __name__ == "__main__":
     unittest.main()

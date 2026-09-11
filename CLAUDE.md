@@ -1,11 +1,12 @@
 # Jobsheet 自動化歸檔 — 系統手冊
 
-> 最後全面檢查：2026-09-11
+> 最後全面檢查：2026-09-12
 > GitHub：<https://github.com/qstuer/jobsheet-automation>
 > 已實證：2026-05-31，一份 20 頁掃描（1 份 CM、3 份 PM）全自動切成 4 份並正確歸檔。
 > 本次翻新：修正新版 rclone 看不到 PDF、移除假成功、加入冷卻及連敗告警、替換已停用的辨認入口、補上安全重跑及測試。
 > 2026-09-10 實檔複驗：切頁結果逐頁正確；同時發現舊 OCR 提示會把範例值誤當答案，已移除所有真實風格範例，並改為兩次獨立辨認一致才可自動配對。
 > 2026-09-11 翻新：用 52 頁實檔找出「短 PM」會令固定 6 頁規則錯位；改為尋找下一張工作單作邊界、按頁面內容去除背頁。辨認新增日期/電話/asset 交叉核對，不確定的名稱不再送 OneDrive。
+> 2026-09-12 模型更新：圖片辨認改用 `moonshotai/kimi-k3`；加入 45 秒請求時限、受控重試及嚴格 JSON 驗證，避免免費入口失聯或回覆格式錯誤時拖住整批。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -156,17 +157,19 @@ GitHub Secrets：
 | `NVIDIA_API_KEY` | 是 | 視覺辨認服務 API key |
 | `ASANA_TOKEN` | 是 | Asana 存取權杖 |
 | `ASANA_WORKSPACE_GID` | 是 | Asana workspace 編號 |
-| `NVIDIA_MODEL` | 否 | 臨時換辨認模型；不填用程式預設 |
+| `NVIDIA_MODEL`（Actions variable） | 否 | 臨時換辨認模型；不填使用程式預設 Kimi K3 |
 
 不要把值寫進 repo、日誌或文件。
 
-2026-09-10 官方狀態檢查：
+2026-09-12 官方狀態檢查：
 
 - 舊模型 `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` 的免費入口已停用。
-- 預設換為仍有免費入口、使用相同圖片格式的 `meta/llama-3.2-11b-vision-instruct`。
+- 預設使用仍有免費入口、支援圖片及結構化輸出的 `moonshotai/kimi-k3`。
+- Kimi K3 會先推理再回答；程式使用低推理強度、足夠輸出空間及嚴格 JSON 驗證，不能只沿用舊 Llama 的極小輸出上限。
+- 每次 NVIDIA 請求最多等待 45 秒，SDK 不做隱藏重試；程式最多重試 2 次，檔案仍失敗便保留在 `_SPLIT`。
 - 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
 - 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
-- 可用 `NVIDIA_MODEL` Secret 暫時覆蓋，不需先改程式。
+- 可用 GitHub Actions variable `NVIDIA_MODEL` 暫時覆蓋，不需先改程式；模型名稱不是密鑰，不放 Secrets。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
 - GitHub 內的下載版本變數必須叫 `JOBSHEET_RCLONE_RELEASE`；不可改成 `RCLONE_VERSION`，否則 rclone 會誤當成自己的開關而啟動失敗。
 - Python 套件固定在 `requirements.txt`，避免數月後自動升級而失效。
@@ -204,6 +207,8 @@ python -m compileall -q src tests
 
 歷史 PDF 辨認抽查：將測試 PDF 放入 `tests/sample_pdfs/`，設定本機 `NVIDIA_API_KEY`，執行 `python -m tests.test_ocr_local`。
 
+只測 NVIDIA 模型能否看圖及回傳合格 JSON：在 GitHub Actions 手動執行 `NVIDIA Model Check`。它只讀一張程式即時產生的假資料圖片，不會讀 Google Drive、Asana 或 OneDrive。
+
 ## 11. 程式地圖
 
 | 檔案 | 責任 |
@@ -221,6 +226,7 @@ python -m compileall -q src tests
 | `.github/workflows/jobsheet-process.yml` | Stage B |
 | `.github/workflows/jobsheet-failure-alert.yml` | 連敗 Issue 告警 |
 | `.github/workflows/quality-check.yml` | 每次改程式自動測試 |
+| `.github/workflows/nvidia-model-check.yml` | 手動、無客戶資料的 NVIDIA 圖片連線測試 |
 
 ## 12. 接手時不可破壞的原則
 
@@ -237,7 +243,7 @@ python -m compileall -q src tests
 
 ## 13. 官方參考
 
-- 現用 NVIDIA 模型：<https://build.nvidia.com/meta/llama-3.2-11b-vision-instruct>
+- 現用 NVIDIA 模型：<https://build.nvidia.com/moonshotai/kimi-k3>
 - 舊 NVIDIA 模型：<https://build.nvidia.com/nvidia/llama-3.1-nemotron-nano-vl-8b-v1>
 - Asana 搜尋：<https://developers.asana.com/reference/typeaheadforworkspace>
 - Asana 限流：<https://developers.asana.com/docs/rate-limits>

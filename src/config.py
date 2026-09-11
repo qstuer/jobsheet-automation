@@ -21,12 +21,20 @@ GDRIVE_PENDING_FOLDER_ID      = "1Yby1chpl40PYv3Ph9xhnJd971Qwo32en"
 
 # === 視覺 OCR 模型 (NVIDIA NIM) ===
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-# 舊模型的免費 API 已在 2026-09 確認停用。預設改用官方仍提供的免費視覺模型；
-# 未來若再下架，可在 GitHub Secret NVIDIA_MODEL 暫時換型號，不必先改程式。
+# Kimi K3 在 2026-09 的 NVIDIA 免費入口支援圖片及結構化輸出。
+# 模型名稱不是密鑰；GitHub 可用 Actions variable NVIDIA_MODEL 暫時覆蓋。
 NVIDIA_MODEL = (
     os.environ.get("NVIDIA_MODEL")
-    or "meta/llama-3.2-11b-vision-instruct"
+    or "moonshotai/kimi-k3"
 )
+# 免費入口不可無限等待。OpenAI SDK 的內建重試關掉，由本程式明確控制，
+# 讓一個失聯請求不會再拖住整批工作單數分鐘。
+NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
+
+# Kimi K3 會先推理再給最後答案；過小的 max_tokens 可能只留下推理、沒有
+# JSON/CM/PM 結果。簡單圈選和詳細欄位各保留足夠但有限的輸出空間。
+KIMI_TEXT_MAX_TOKENS = 512
+KIMI_JSON_MAX_TOKENS = 2048
 
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"

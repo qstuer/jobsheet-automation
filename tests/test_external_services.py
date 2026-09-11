@@ -74,6 +74,46 @@ class NvidiaResponseTests(unittest.TestCase):
                 nvidia_client._call_vision("prompt", "image")
         get_client.assert_called_once()
 
+    def test_client_has_bounded_timeout_and_no_hidden_retries(self):
+        nvidia_client._client = None
+        try:
+            with patch.object(nvidia_client.config, "NVIDIA_API_KEY", "test-key"), \
+                    patch.object(nvidia_client, "OpenAI") as openai:
+                nvidia_client.get_client()
+
+            openai.assert_called_once_with(
+                base_url=config.NVIDIA_BASE_URL,
+                api_key="test-key",
+                timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        finally:
+            nvidia_client._client = None
+
+    def test_kimi_uses_reasoning_space_for_json(self):
+        response = MagicMock()
+        response.choices[0].message.content = '{"ok":true}'
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch.object(nvidia_client, "get_client", return_value=client), \
+                patch.object(config, "NVIDIA_MODEL", "moonshotai/kimi-k3"):
+            self.assertEqual(
+                '{"ok":true}',
+                nvidia_client._call_vision(
+                    "prompt", "image", max_tokens=300, expects_json=True
+                ),
+            )
+
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["model"], "moonshotai/kimi-k3")
+        self.assertEqual(request["temperature"], 1)
+        self.assertEqual(request["reasoning_effort"], "low")
+        self.assertEqual(request["seed"], 0)
+        self.assertEqual(request["max_tokens"], config.KIMI_JSON_MAX_TOKENS)
+        self.assertNotIn("response_format", request)
+        self.assertEqual(request["timeout"], config.NVIDIA_REQUEST_TIMEOUT_SECONDS)
+
     def test_multiple_job_type_words_are_rejected(self):
         with patch.object(
                 nvidia_client, "_call_vision",
@@ -157,6 +197,7 @@ class NvidiaResponseTests(unittest.TestCase):
             nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         prompt = call.call_args.kwargs["prompt"]
+        self.assertTrue(call.call_args.kwargs["expects_json"])
         for old_example in ("US622B1115", "USO16D0865", "PYNEH", "EPIQ Elite"):
             self.assertNotIn(old_example, prompt)
 
