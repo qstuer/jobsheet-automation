@@ -35,6 +35,8 @@ def main() -> int:
         _make_test_image(),
         max_tokens=128,
         expects_json=True,
+        # 這個檢查專門驗證設定中的模型，不能由後備模型冒充成功。
+        allow_fallback=False,
     )
     result = nvidia_client._parse_json_object(raw, required_keys={"code"})
     if result.get("code") != EXPECTED_CODE:

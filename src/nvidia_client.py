@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import logging
 import re
 import time
 from typing import Optional
@@ -9,11 +10,11 @@ from typing import Optional
 import fitz
 from PIL import Image, ImageEnhance
 from openai import OpenAI
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-
 from . import config
 
 _client: Optional[OpenAI] = None
+_unavailable_models: set[str] = set()
+log = logging.getLogger(__name__)
 
 
 class NvidiaResponseError(RuntimeError):
@@ -41,7 +42,7 @@ def get_client() -> OpenAI:
             base_url=config.NVIDIA_BASE_URL,
             api_key=config.NVIDIA_API_KEY,
             timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
-            # SDK 自己再重試會令實際等待時間失控；下方 tenacity 統一處理。
+            # SDK 自己再重試會令實際等待時間失控；下方程式統一處理。
             max_retries=0,
         )
     return _client
@@ -64,22 +65,12 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
     return base64.b64encode(buf.getvalue()).decode()
 
 
-@retry(
-    retry=retry_if_exception(_is_retryable_error),
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(min=2, max=5),
-    reraise=True,
-)
-def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
-                 expects_json: bool = False) -> str:
-    """呼叫 NVIDIA 視覺模型做單張圖 OCR。
-
-    Kimi K3 永遠會先推理，因此不能沿用舊 Llama 的極小輸出上限。詳細欄位
-    JSON 工作會預留較多輸出空間，最後仍由本機 parser 嚴格驗證格式。
-    """
-    is_kimi_k3 = config.NVIDIA_MODEL.strip().lower() == "moonshotai/kimi-k3"
+def _call_vision_once(prompt: str, image_b64: str, model: str,
+                      max_tokens: int, expects_json: bool) -> str:
+    """向一個指定模型發出一次請求；重試和後備由外層控制。"""
+    is_kimi_k3 = model.strip().lower() == "moonshotai/kimi-k3"
     request = dict(
-        model=config.NVIDIA_MODEL,
+        model=model,
         messages=[{
             "role": "user",
             "content": [
@@ -128,6 +119,49 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
     if not isinstance(content, str) or not content.strip():
         raise NvidiaResponseError("NVIDIA 視覺模型沒有回傳文字")
     return content.strip()
+
+
+def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
+                 expects_json: bool = False,
+                 allow_fallback: bool = True) -> str:
+    """呼叫 NVIDIA 視覺模型做單張圖 OCR。
+
+    Kimi K3 永遠會先推理，因此不能沿用舊 Llama 的極小輸出上限。詳細欄位
+    JSON 工作會預留較多輸出空間，最後仍由本機 parser 嚴格驗證格式。若
+    Kimi 入口失聯，同一次執行只等一次，隨後改用已知可工作的後備模型。
+    """
+    primary = config.NVIDIA_MODEL.strip()
+    models = [primary]
+    if allow_fallback and primary.lower() == "moonshotai/kimi-k3":
+        models.append(config.NVIDIA_FALLBACK_MODEL)
+
+    last_error = None
+    for model in models:
+        if model in _unavailable_models:
+            continue
+        # Kimi 現時的主要故障是完全不回資料；一批內只試一次。較快的後備
+        # 模型保留一次短重試，以容許偶發網路錯誤。
+        attempts = 1 if model.lower() == "moonshotai/kimi-k3" else 2
+        for attempt in range(attempts):
+            try:
+                return _call_vision_once(
+                    prompt, image_b64, model, max_tokens, expects_json
+                )
+            except Exception as exc:
+                if not _is_retryable_error(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(2)
+        _unavailable_models.add(model)
+        if model == primary and len(models) > 1:
+            log.warning(
+                "主要 NVIDIA 圖片模型本次無回應，改用安全後備模型"
+            )
+
+    if last_error is not None:
+        raise last_error
+    raise NvidiaResponseError("沒有可用的 NVIDIA 圖片模型")
 
 
 def _parse_json_object(raw: str, required_keys: Optional[set] = None) -> dict:

@@ -120,6 +120,29 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertNotIn("response_format", request)
         self.assertEqual(request["timeout"], config.NVIDIA_REQUEST_TIMEOUT_SECONDS)
 
+    def test_kimi_timeout_uses_fallback_once_per_process(self):
+        class APITimeoutError(Exception):
+            pass
+
+        nvidia_client._unavailable_models.clear()
+        try:
+            with patch.object(config, "NVIDIA_MODEL", "moonshotai/kimi-k3"), \
+                    patch.object(config, "NVIDIA_FALLBACK_MODEL", "meta/fallback"), \
+                    patch.object(
+                        nvidia_client,
+                        "_call_vision_once",
+                        side_effect=[APITimeoutError("timeout"), "PM", "CM"],
+                    ) as call:
+                self.assertEqual(nvidia_client._call_vision("p", "i"), "PM")
+                self.assertEqual(nvidia_client._call_vision("p", "i"), "CM")
+
+            models = [item.args[2] for item in call.call_args_list]
+            self.assertEqual(models, [
+                "moonshotai/kimi-k3", "meta/fallback", "meta/fallback"
+            ])
+        finally:
+            nvidia_client._unavailable_models.clear()
+
     def test_multiple_job_type_words_are_rejected(self):
         with patch.object(
                 nvidia_client, "_call_vision",

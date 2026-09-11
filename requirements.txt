@@ -3,4 +3,3 @@ openai==2.54.0
 PyMuPDF==1.28.2
 Pillow==12.3.0
 requests==2.34.2
-tenacity==9.1.4

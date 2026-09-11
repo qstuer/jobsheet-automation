@@ -27,6 +27,7 @@ NVIDIA_MODEL = (
     os.environ.get("NVIDIA_MODEL")
     or "moonshotai/kimi-k3"
 )
+NVIDIA_FALLBACK_MODEL = "meta/llama-3.2-11b-vision-instruct"
 # 免費入口不可無限等待。OpenAI SDK 的內建重試關掉，由本程式明確控制，
 # 讓一個失聯請求不會再拖住整批工作單數分鐘。
 NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
