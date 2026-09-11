@@ -11,9 +11,10 @@
 安全閥：最近的 serial 必須在門檻內、且「唯一」（沒有兩台機器一樣近）才接受，
         否則送 PENDING，絕不亂猜歸到隔壁機器。
 """
-import re
 import logging
+import re
 import time
+from datetime import date
 from typing import Optional, List, Tuple
 
 import requests
@@ -29,7 +30,7 @@ KNOWN_PRODUCTS = [
     "CX30", "CX50",
 ]
 
-MAX_SERIAL_DIST = 3   # serial 容許的最大編輯距離
+MAX_SERIAL_DIST = 1   # serial 錯一字才可考慮，而且仍須其他欄位交叉支持
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 
 _typeahead_cache: dict = {}
@@ -113,7 +114,12 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
         "resource_type": "task",
         "query": query,
         "count": count,
-        "opt_fields": "name,completed,created_at",
+        # notes 供電話/asset 交叉核對；日期用來選同一部機器最近三個月的工作。
+        # completed 只作資料顯示，不再把未完成工作排在已完成工作之前。
+        "opt_fields": (
+            "name,notes,completed,created_at,modified_at,completed_at,"
+            "due_on,start_on"
+        ),
     }
     url = f"{config.ASANA_BASE_URL}/workspaces/{config.ASANA_WORKSPACE_GID}/typeahead"
     response = None
@@ -122,7 +128,7 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
             response = requests.get(url, headers=headers, params=params, timeout=20)
         except requests.RequestException as exc:
             if attempt == 4:
-                raise AsanaError(f"Asana 查詢 '{query}' 連線失敗") from exc
+                raise AsanaError("Asana 候選查詢連線失敗") from exc
             delay = min(2 ** attempt, 30)
             log.warning(f"  Asana 連線失敗，{delay} 秒後重試（{attempt}/4）")
             time.sleep(delay)
@@ -131,7 +137,7 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
         if response.status_code == 429 or response.status_code >= 500:
             if attempt == 4:
                 raise AsanaError(
-                    f"Asana 查詢 '{query}' 失敗：HTTP {response.status_code}"
+                    f"Asana 候選查詢失敗：HTTP {response.status_code}"
                 )
             retry_after = response.headers.get("Retry-After")
             try:
@@ -150,15 +156,15 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
             payload = response.json()
         except (requests.RequestException, ValueError) as exc:
             raise AsanaError(
-                f"Asana 查詢 '{query}' 失敗：HTTP {response.status_code}"
+                f"Asana 候選查詢失敗：HTTP {response.status_code}"
             ) from exc
 
         tasks = payload.get("data")
         if not isinstance(tasks, list):
-            raise AsanaError(f"Asana 查詢 '{query}' 回傳格式不正確")
+            raise AsanaError("Asana 候選查詢回傳格式不正確")
         break
     else:  # pragma: no cover - 迴圈只會 break 或 raise
-        raise AsanaError(f"Asana 查詢 '{query}' 失敗")
+        raise AsanaError("Asana 候選查詢失敗")
 
     # 只快取成功結果。故障不能快取成空清單，否則同一輪會把服務故障
     # 誤認成「真的沒有符合任務」。
@@ -166,8 +172,9 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
     return tasks
 
 
-def _gather_pool(order_no, serial, hosp, product) -> List[dict]:
-    """用可靠欄位撈候選池：醫院+型號（主力）、醫院、serial、order"""
+def _gather_pool(order_no, serials, hosp, product,
+                 phones=None, assets=None) -> List[dict]:
+    """用可見欄位撈候選池；真正的取捨在本機評分，不交給 Asana 猜。"""
     queries: List[str] = []
     if hosp and product:
         queries.append(f"{hosp} {product}")
@@ -175,18 +182,161 @@ def _gather_pool(order_no, serial, hosp, product) -> List[dict]:
         queries.append(hosp)
     if order_no:
         queries.append(order_no)
-    if serial:
+    for serial in serials or []:
         queries.append(serial)
         if len(serial) >= 8:
             queries.append(serial[:8])
+    # 免費帳戶的 typeahead 主要搜標題，不用電話/asset 逐一打 API；這兩項
+    # 留待候選回來後比對 notes，可顯著減少一疊單據造成的 Asana 查詢量。
+    queries = list(dict.fromkeys(q for q in queries if q))
     pool: dict = {}
     for q in queries:
         for t in _typeahead(q):
             gid = t.get("gid")
             if gid:
                 pool[gid] = t
-    log.info(f"  候選池：{len(pool)} 個 task（查詢：{queries}）")
+    log.info(f"  候選池：{len(pool)} 個 task（使用 {len(queries)} 組可見欄位查詢）")
     return list(pool.values())
+
+
+def _clean_candidates(values, fallback=None) -> List[str]:
+    items = []
+    for value in list(values or []) + ([fallback] if fallback else []):
+        value = (value or "").strip().upper()
+        if value and value not in items:
+            items.append(value)
+    return items
+
+
+def _task_serials(task: dict) -> List[str]:
+    """由標題與描述找像 serial 的 token；必須同時含字母及數字。"""
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}".upper()
+    tokens = re.findall(r"\b[A-Z]{1,4}[A-Z0-9]{5,}\b", text)
+    return list(dict.fromkeys(
+        token for token in tokens
+        if any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token)
+    ))
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    text = value.strip()
+    iso = re.search(r"(?<!\d)(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)", text)
+    if iso:
+        parts = [int(part) for part in iso.groups()]
+        try:
+            return date(parts[0], parts[1], parts[2])
+        except ValueError:
+            return None
+    local = re.search(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?!\d)", text)
+    if local:
+        day, month, year = (int(part) for part in local.groups())
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+    return None
+
+
+def _task_dates(task: dict) -> List[date]:
+    values = [
+        task.get("due_on"), task.get("start_on"), task.get("completed_at"),
+        task.get("created_at"), task.get("modified_at"),
+    ]
+    notes = task.get("notes") or ""
+    values.extend(re.findall(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|"
+                             r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", notes))
+    parsed = [_parse_date(value) for value in values]
+    return list(dict.fromkeys(value for value in parsed if value))
+
+
+def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
+                     hosp: Optional[str], product: Optional[str]) -> dict:
+    name = task.get("name") or ""
+    notes = task.get("notes") or ""
+    haystack_norm = _norm(f"{name}\n{notes}")
+    digits = re.sub(r"\D", "", f"{name}\n{notes}")
+    task_serials = _task_serials(task)
+
+    best_dist = 99
+    if serials and task_serials:
+        best_dist = min(_lev(_norm(left), _norm(right))
+                        for left in serials for right in task_serials)
+
+    score = 0
+    support = set()
+    reasons = []
+    if best_dist == 0:
+        score += 100
+        reasons.append("serial exact")
+    elif best_dist == 1:
+        score += 55
+        reasons.append("serial differs by 1")
+
+    phones = [re.sub(r"\D", "", value)
+              for value in ocr_data.get("phone_candidates", [])]
+    if any(len(value) >= 6 and value in digits for value in phones):
+        score += 45
+        support.add("phone")
+        reasons.append("phone")
+
+    assets = [re.sub(r"\D", "", value)
+              for value in ocr_data.get("asset_candidates", [])]
+    if any(len(value) >= 4 and value in digits for value in assets):
+        score += 35
+        support.add("asset")
+        reasons.append("asset")
+
+    hospital_ok = bool(hosp and _norm(name).startswith(_norm(hosp)))
+    product_ok = bool(product and _norm(product) in _norm(name))
+    if hospital_ok:
+        score += 20
+        reasons.append("hospital prefix")
+    if product_ok:
+        score += 15
+        reasons.append("product")
+    if hospital_ok and product_ok:
+        support.add("hospital+product")
+
+    location = ocr_data.get("location_raw") or ""
+    if len(_norm(location)) >= 3 and _norm(location) in haystack_norm:
+        score += 5
+        reasons.append("location")
+
+    service_date = None
+    if ocr_data.get("date_source") == "ACTION_DATE":
+        service_date = _parse_date(ocr_data.get("service_date_raw"))
+    task_dates = _task_dates(task)
+    date_delta = None
+    if service_date and task_dates:
+        date_delta = min(abs((candidate - service_date).days) for candidate in task_dates)
+        if date_delta <= 3:
+            score += 50
+            support.add("date")
+            reasons.append("date within 3 days")
+        elif date_delta <= 14:
+            score += 40
+            support.add("date")
+            reasons.append("date within 14 days")
+        elif date_delta <= 31:
+            score += 25
+            support.add("date")
+            reasons.append("date within 31 days")
+        elif date_delta <= 93:
+            score += 10
+            reasons.append("date within 3 months")
+
+    return {
+        "task": task,
+        "score": score,
+        "serial_dist": best_dist,
+        "support": support,
+        "reasons": reasons,
+        "date_delta": date_delta,
+    }
 
 
 # ── 主配對 ────────────────────────────────────────────────────
@@ -196,55 +346,65 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     回傳 (matched_task_or_None, tier_used)
       tier: 1=OrderNo精確, 2=醫院+型號撈池→serial唯一最近, 0=未找到
     """
-    order_no = (ocr_data.get("order_no") or "").strip()
-    serial   = (ocr_data.get("serial_no") or "").strip().upper()
+    order_raw = (ocr_data.get("order_no") or "").strip()
+    order_digits = re.sub(r"\D", "", order_raw)
+    order_no = order_digits if re.fullmatch(config.ORDER_NO_REGEX, order_digits) else ""
+    serials = _clean_candidates(
+        ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
+    )
     product  = normalize_product(ocr_data.get("product"))
     hosp     = hospital_core(ocr_data.get("customer"))
+    phones = _clean_candidates(ocr_data.get("phone_candidates"))
+    assets = _clean_candidates(ocr_data.get("asset_candidates"))
 
-    pool = _gather_pool(order_no, serial, hosp, product)
+    pool = _gather_pool(order_no, serials, hosp, product, phones, assets)
     if not pool:
         return None, 0
 
     # 第 1 層：order_no 精確命中（最強）
     if order_no:
-        for t in pool:
-            if order_no in (t.get("name") or "").upper():
-                return t, 1
+        exact_orders = [
+            task for task in pool
+            if re.search(rf"(?<!\d){re.escape(order_no)}(?!\d)", task.get("name") or "")
+        ]
+        if len(exact_orders) == 1:
+            return exact_orders[0], 1
+        if len(exact_orders) > 1:
+            log.warning("  同一 order number 命中多個 Asana 工作，不自動選擇")
+            return None, 0
 
-    # 第 2 層：型號過濾（可靠）→ serial 本機容錯比對挑唯一最近
-    cands = pool
-    if product:
-        pnorm = _norm(product)
-        filtered = [t for t in cands if _name_has_product(t.get("name", ""), pnorm)]
-        if filtered:
-            cands = filtered
-
-    if not serial:
+    if not serials:
         # serial 是設備身分證；沒有訂單號又讀不到 serial 時，即使候選池只有
-        # 一個也不能只靠醫院/型號自動歸檔，交給 [待核對]。
+        # 一個也不能只靠醫院/型號自動歸檔，留在 _PENDING。
         return None, 0
 
-    # 算每個候選的 serial 編輯距離
-    scored = []
-    for t in cands:
-        ts = extract_serial(t.get("name", ""))
-        d = _lev(serial, ts) if ts else 99
-        scored.append({"d": d, "task": t, "serial": ts})
+    scored = [_candidate_score(task, ocr_data, serials, hosp, product) for task in pool]
+    scored.sort(key=lambda row: (row["score"], -row["serial_dist"]), reverse=True)
+    best = scored[0]
+    runner_score = scored[1]["score"] if len(scored) > 1 else -1
+    gap = best["score"] - runner_score
 
-    # 先依「未完成優先 + 時間最近」穩定排序，再依距離排序（距離相同時保留前述偏好）
-    scored.sort(key=lambda x: (x["task"].get("created_at") or ""), reverse=True)
-    scored.sort(key=lambda x: (x["d"], 1 if x["task"].get("completed") else 0))
+    # 同一設備在 Asana 會有很多歷史工作；完成狀態不是新舊依據。
+    # serial 完全一致仍須日期/電話/asset，或醫院+型號一起支持；若有並列歷史
+    # 工作，分數亦必須拉開。serial 錯一字時要求至少兩組額外證據。
+    strong = best["support"]
+    if best["serial_dist"] == 0:
+        supported = bool(strong & {"date", "phone", "asset", "hospital+product"})
+        unambiguous = len(scored) == 1 or gap >= 10
+        if supported and unambiguous:
+            log.info(f"  ✅ Asana 多欄核對命中（{', '.join(best['reasons'])}）")
+            return best["task"], 2
+    elif best["serial_dist"] <= MAX_SERIAL_DIST:
+        supported = len(strong & {"date", "phone", "asset", "hospital+product"}) >= 2
+        unambiguous = len(scored) == 1 or gap >= 15
+        if supported and unambiguous:
+            log.info(f"  ✅ serial 一字模糊但多欄核對命中（{', '.join(best['reasons'])}）")
+            return best["task"], 2
 
-    best_d = scored[0]["d"]
-    # 安全閥：最近距離必須在門檻內，且「唯一一個 serial」並列最近（不會誤配隔壁機器）
-    best_serials = {s["serial"] for s in scored if s["d"] == best_d}
-    if best_d <= MAX_SERIAL_DIST and len(best_serials) == 1:
-        match = scored[0]
-        log.info(f"  ✅ serial 比對命中：OCR={serial} → {match['serial']}"
-                 f"（dist={best_d}） task='{match['task'].get('name')}'")
-        return match["task"], 2
-
-    log.info(f"  ⚠ serial 無唯一最近（best_d={best_d}, 並列={best_serials}）→ 不敢猜")
+    log.info(
+        f"  ⚠ 候選證據不足或仍有並列（serial距離={best['serial_dist']}, "
+        f"額外證據={sorted(strong)}, 分差={gap}）→ 不敢猜"
+    )
     return None, 0
 
 

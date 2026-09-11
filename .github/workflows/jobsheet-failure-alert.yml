@@ -134,7 +134,7 @@ jobs:
               return;
             }
 
-            // 多個 completed 事件若排隊到同一個最新 run，只更新/留言一次。
+            // 多個 completed 事件若排隊到同一個最新 run，只更新一次。
             if ((alertIssue.body || '').includes(latestRunMarker)) {
               core.info(`Alert issue already reflects run ${latest.id}.`);
               return;
@@ -146,9 +146,6 @@ jobs:
               issue_number: alertIssue.number,
               body,
             });
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: alertIssue.number,
-              body: `⚠️ 連續失敗已增至 **${streak.length}** 次；最新為 [run #${latest.run_number}](${latest.html_url})（\`${latest.conclusion}\`）。`,
-            });
+            // 只靜默更新 Issue 本文，不為每一次後續失敗新增留言。
+            // GitHub 通常會為新留言寄電郵；舊做法因此在持續故障時不斷洗信箱。
+            core.warning(`Updated alert issue #${alertIssue.number} without a new comment.`);

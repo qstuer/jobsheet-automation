@@ -1,10 +1,11 @@
 # Jobsheet 自動化歸檔 — 系統手冊
 
-> 最後全面檢查：2026-09-10
+> 最後全面檢查：2026-09-11
 > GitHub：<https://github.com/qstuer/jobsheet-automation>
 > 已實證：2026-05-31，一份 20 頁掃描（1 份 CM、3 份 PM）全自動切成 4 份並正確歸檔。
 > 本次翻新：修正新版 rclone 看不到 PDF、移除假成功、加入冷卻及連敗告警、替換已停用的辨認入口、補上安全重跑及測試。
 > 2026-09-10 實檔複驗：切頁結果逐頁正確；同時發現舊 OCR 提示會把範例值誤當答案，已移除所有真實風格範例，並改為兩次獨立辨認一致才可自動配對。
+> 2026-09-11 翻新：用 52 頁實檔找出「短 PM」會令固定 6 頁規則錯位；改為尋找下一張工作單作邊界、按頁面內容去除背頁。辨認新增日期/電話/asset 交叉核對，不確定的名稱不再送 OneDrive。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -36,8 +37,8 @@ GitHub 沒有定時空跑。平時由 Apps Script 發現 PDF 後通知 GitHub；
 |---|---|---|
 | `googledrive:From_BrotherDevice/` | 原始掃描 PDF | Stage A 切頁 |
 | `googledrive:From_BrotherDevice/_SPLIT/` | 已切成單一工作的 PDF | Stage B 辨認及上傳 |
-| `googledrive:From_BrotherDevice/_SPLIT_FAILED/` | 單據內容或頁數無法安全判斷 | 人工檢查 |
-| `googledrive:From_BrotherDevice/_PENDING/` | 舊版暫存區；新版不再新增 | Stage B 嘗試清理 |
+| `googledrive:From_BrotherDevice/_SPLIT_FAILED/` | 找不到可信工作單邊界 | 人工檢查原始整批掃描 |
+| `googledrive:From_BrotherDevice/_PENDING/` | 已切好，但名稱未能可靠核對 | 人工核對；不會進 OneDrive |
 
 最終位置：`onedrive:Hong Kong Sen's Healthcare/JOBSHEETS/`
 
@@ -53,22 +54,24 @@ GitHub 工作：`.github/workflows/jobsheet-split.yml`
 1. 只看 `From_BrotherDevice/` 最外層 PDF，不掃子資料夾。
 2. 下載一份原始 PDF。
 3. 讀每份工作的第一頁 `JOB NATURE` 圈選，判斷 CM 或 PM。
-4. 依固定頁數切頁，再驗算總頁數。
-5. 上傳每份切頁 PDF 到 `_SPLIT/`。
-6. 全部上傳成功後才刪原始 PDF。
+4. 先看標準長度位置；若不是下一張工作單，按雙面掃描的 2 頁步幅向前找真正邊界。
+5. 在每段內保留工作單正面及所有有內容的 checklist，去掉空白背頁。
+6. 上傳每份切頁 PDF 到 `_SPLIT/`。
+7. 全部上傳成功後才刪原始 PDF。
 
 頁數規則：
 
 ```text
-CM：共 2 頁，只保留第 1 頁
-PM：共 6 頁，保留第 1、3、4、5 頁
+CM：通常 2 張掃描頁，保留工作單正面
+PM：通常 6 張掃描頁，標準結果為工作單 + 3 頁 checklist
+短 PM：現場若少附 checklist，可為 2 或 4 張掃描頁；保留其中所有真正有內容的頁
 ```
 
 `JOB NATURE` 是手畫圈選，四個選項是 `CM | PM | FCO | INS`。自動流程只接受一個明確的 CM 或 PM。
 
 ### 甚麼才會進 `_SPLIT_FAILED`
 
-只限單據本身不能安全切頁：圈選讀不清、讀到 FCO/INS、所需頁數超出剩餘頁數，或最後頁數加總不符。程式中這類情況叫 `SplitError`。
+只限單據本身不能安全切頁：起始圈選讀不清、讀到 FCO/INS、6 頁範圍內找不到可信的下一張工作單邊界，或最後頁數不能按雙面掃描完整收尾。程式中這類情況叫 `SplitError`。
 
 以下不是單據問題，絕不能搬去 `_SPLIT_FAILED`：GitHub 工作未開始、NVIDIA/Google Drive/網路故障、rclone 登入過期、PDF 讀寫失敗或程式意外。這些情況會讓 Stage A 顯示失敗，原始 PDF 留在入口，修好後可安全重跑。
 
@@ -80,19 +83,21 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 流程：
 
 1. 讀 `_SPLIT/` 的單一工作 PDF。
-2. 辨認訂單號、機身編號、產品型號和醫院名稱。
-3. 在 Asana 找候選工作，再用機身編號作安全核對。
+2. 忠實抄錄訂單號、機身編號候選、型號、醫院/位置、電話、asset 及服務日期。
+3. 在 Asana 找候選工作，再用上述欄位交叉核對。
 4. 上傳 OneDrive，成功後才刪 `_SPLIT/` 來源。
 
-辨認會用 2.0、2.5、3.0 倍清晰度交叉核對。同一個 Asana 工作至少要在兩個清晰度都命中才接受；只命中一次、兩次命中不同工作，或讀不到機身編號，一律標成 `[待核對]`，不會自動歸錯設備。
+辨認會用 2.0、2.5、3.0 倍清晰度交叉核對。同一個 Asana 工作至少要在兩個清晰度都命中才接受；只命中一次、兩次命中不同工作，或證據不足，一律移到 Google Drive `_PENDING`，不會自動歸錯設備。
+
+視覺模型只負責照字抄錄，提示詞明確禁止猜醫院、補全機身編號或沿用先前圖片。Actions 日誌只記「哪些欄位看得到」，不印電話、asset、serial 或客戶內容。
 
 命名次序：
 
 1. Asana 名稱有 8 位訂單號：`SR#訂單號.pdf`。
 2. 找到 Asana 工作但沒有訂單號：使用完整 Asana 工作名稱。
-3. 無法可靠配對：仍上傳 OneDrive，但加 `[待核對]`。
+3. 無法可靠配對：不碰 OneDrive，完整檔留在 `_PENDING`。
 
-`[待核對]` 代表單據已送達但名稱需人看，不是系統故障。Asana 連不上、權限失效或回覆錯誤才是系統故障：來源會保留，Stage B 顯示失敗，不會偽裝成配對不到。
+舊版建立的 `[待核對]` 名稱只為歷史相容，新流程不再新增。Asana 連不上、權限失效或回覆錯誤屬系統故障：來源保留在 `_SPLIT`，Stage B 顯示失敗，不會偽裝成配對不到。
 
 ### 重跑不製造重複檔
 
@@ -102,10 +107,12 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
 Asana 只找出一小批候選，最後核對在本機完成：
 
-1. 用醫院、產品、機身編號和訂單號分別找候選。
+1. 用醫院、產品、機身編號和訂單號分別找候選；電話與 asset 在候選的 Asana 描述中核對。
 2. 校正常見型號小錯字，例如 `EPLQ 5G` 可校正為 `EPIQ 5G`。
-3. 比較機身編號，容許少量辨認錯字。
-4. 只有一個最接近而且差距在安全範圍內，並在另一個清晰度再次命中同一工作，才接受；並列、差太遠或只有一次命中一律 `[待核對]`。
+3. 機身編號完全相同仍須日期、電話、asset 或「醫院+型號」支持，避免挑到同一設備的舊工作。
+4. 機身編號只可容許 1 個字的辨認差異；此時至少還要兩組證據支持。
+5. 完成/未完成都可以是正確工作，不能再用「未完成優先」挑選；以單據最近三個月的服務日期為主。
+6. 候選並列、證據不足，或另一個清晰度沒有再次命中同一工作，一律留在 `_PENDING`。
 
 已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/Elite`、`CX30/CX50`。
 
@@ -134,7 +141,7 @@ Apps Script 的 Project Settings → Script properties：
 
 ## 7. 告警
 
-`.github/workflows/jobsheet-failure-alert.yml` 分別監看 Stage A、Stage B。失敗、超時、啟動失敗或需要人工批准都計入；連續 3 次便建立 `[Pipeline Alert] ...` Issue，繼續失敗會更新，下一次成功自動關閉。它只用 GitHub 內建權限，不需新增密鑰。
+`.github/workflows/jobsheet-failure-alert.yml` 分別監看 Stage A、Stage B。失敗、超時、啟動失敗或需要人工批准都計入；連續 3 次便建立 `[Pipeline Alert] ...` Issue，繼續失敗只靜默更新同一個 Issue，不再每次留言洗 Gmail；下一次成功才留言並自動關閉。它只用 GitHub 內建權限，不需新增密鑰。
 
 如果 GitHub 連告警工作都無法啟動，Issue 當下也不會建立。因此 Apps Script 會在設定 `ALERT_EMAIL` 後做第二層檢查：某階段連敗 3 次寄一次；恢復後重設。若連續 3 次連 GitHub 狀態也讀不到，會寄另一封通知。寄信失敗不阻止正常處理。
 
@@ -156,7 +163,7 @@ GitHub Secrets：
 
 - 舊模型 `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` 的免費入口已停用。
 - 預設換為仍有免費入口、使用相同圖片格式的 `meta/llama-3.2-11b-vision-instruct`。
-- 欄位辨認會要求 NVIDIA 只回四個指定欄位的 JSON；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但欄位不齊全時不會從散文硬猜。
+- 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
 - 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
 - 可用 `NVIDIA_MODEL` Secret 暫時覆蓋，不需先改程式。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
@@ -176,6 +183,7 @@ python -m src.healthcheck
 - `等待切割` 有檔：手動啟動 `Jobsheet Stage A - Split`。
 - `等待辨認及上傳` 有檔：手動啟動 `Jobsheet Stage B - Process`。
 - `_SPLIT_FAILED` 有檔：人工看頁數和 CM/PM 圈選。
+- `_PENDING` 有檔：切頁已完成，但 Asana 名稱證據不足；先人工核對，不要搬進 OneDrive 猜名。
 - GitHub 很快顯示成功但入口完全沒動：看 `Show queue before processing` 是否真的列出檔案；若是 0，檢查 rclone 列檔。
 - GitHub 3 至 4 秒便結束且 Python 未開始：這是 GitHub 工作層問題，不是 PDF 問題；原檔不會進 `_SPLIT_FAILED`。
 - Google Drive 回 `403 rateLimitExceeded`：先停止手動連續查詢並稍後再試，不要反覆啟動流程。若日常運行也經常出現，才建立自己的 Google OAuth client，更新本機 rclone 及 GitHub `RCLONE_CONFIG`；`client_secret` 只可由使用者放進設定，不能寫入 repo。
@@ -200,10 +208,10 @@ python -m compileall -q src tests
 | 檔案 | 責任 |
 |---|---|
 | `src/splitter.py` | Stage A：切頁、上傳 `_SPLIT`、成功後刪原檔 |
-| `src/pdf_utils.py` | CM/PM 頁數規則、驗算、抽頁 |
+| `src/pdf_utils.py` | 工作單邊界、頁面內容判斷、驗算及抽頁 |
 | `src/processor.py` | Stage B：辨認、Asana 配對、OneDrive 上傳 |
 | `src/nvidia_client.py` | 圖片裁切及 NVIDIA 呼叫 |
-| `src/asana_client.py` | Asana 候選搜尋及機身編號核對 |
+| `src/asana_client.py` | Asana 候選搜尋及 serial/日期/電話/asset 多欄核對 |
 | `src/rclone_helper.py` | 雲端列檔、下載、上傳、比較、刪除 |
 | `src/healthcheck.py` | 只讀列出四個位置現況 |
 | `src/config.py` | 路徑、模型、裁切範圍及業務常數 |
@@ -220,10 +228,11 @@ python -m compileall -q src tests
 3. 不在全部切頁上傳成功前刪原始 PDF。
 4. 不在 OneDrive 上傳成功前刪 `_SPLIT` 來源。
 5. 不把 Asana 故障當成找不到工作。
-6. 單檔傳送用 `rclone copyto`，不要用 `copy` 掃描有 18,000 多檔的資料夾。
-7. 根目錄列檔用 `--max-depth 1`，不要混用 `--include` 和 `--exclude`。
-8. 不確定業務規則時先問；可先做不改資料的檢查。
-9. 改完先展示 diff；獲准後可 commit。除非使用者明確授權，否則不要自行 push。
+6. 名稱未可靠確認時不碰 OneDrive，留在 `_PENDING`。
+7. 單檔傳送用 `rclone copyto`，不要用 `copy` 掃描有 18,000 多檔的資料夾。
+8. 根目錄列檔用 `--max-depth 1`，不要混用 `--include` 和 `--exclude`。
+9. 不確定業務規則時先問；可先做不改資料的檢查。
+10. 改完先展示 diff；獲准後可 commit。除非使用者明確授權，否則不要自行 push。
 
 ## 13. 官方參考
 

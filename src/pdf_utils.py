@@ -1,5 +1,8 @@
-"""PDF 切割與 Job 偵測
-對應 CLAUDE.md Section 3 的頁面結構規則
+"""PDF 切割與 Job 偵測。
+
+掃描器是雙面掃描，所以每份工作單通常佔偶數張掃描頁；PM 標準為 6 張，
+但 checklist 缺頁時亦可能只有 2 或 4 張。切割以「下一張有 CM/PM 圈選的
+工作單」作真正邊界，再以頁面墨量去掉空白頁與背頁。
 """
 from pathlib import Path
 from typing import List
@@ -24,27 +27,80 @@ _PAGES_PER_TYPE = {
 }
 
 
+def page_has_meaningful_content(pdf_doc: fitz.Document, page_idx: int) -> bool:
+    """用低解像度墨量分開表格/checklist 與空白背頁。
+
+    這一步完全在本機計算，不用視覺模型。工作單及 checklist 的深色像素比例
+    明顯高於背頁；門檻集中放在 config，方便日後用新掃描樣本校準。
+    """
+    pix = pdf_doc[page_idx].get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csGRAY)
+    samples = memoryview(pix.samples)
+    if not samples:
+        return False
+    dark = sum(value < config.CONTENT_DARK_PIXEL_THRESHOLD for value in samples)
+    return (dark / len(samples)) >= config.CONTENT_MIN_DARK_RATIO
+
+
+def _find_job_end(pdf_doc: fitz.Document, cursor: int, job_type: str,
+                  detect) -> int:
+    """找本 job 的右邊界（不含）。
+
+    先檢查標準長度；若標準位置不是下一張工作單，就按雙面掃描的 2 頁步幅
+    往前找。最後一份不足標準長度時，只要剩餘頁數仍為偶數便以 EOF 收尾。
+    """
+    total_pages = len(pdf_doc)
+    nominal = _PAGES_PER_TYPE[job_type]
+    nominal_end = cursor + nominal
+
+    if nominal_end == total_pages:
+        return nominal_end
+    if nominal_end < total_pages and detect(nominal_end) in _PAGES_PER_TYPE:
+        return nominal_end
+
+    # PM checklist 可能少一組或兩組；越接近標準長度的邊界優先。
+    for offset in range(nominal - 2, 1, -2):
+        candidate = cursor + offset
+        if candidate < total_pages and detect(candidate) in _PAGES_PER_TYPE:
+            return candidate
+
+    remaining = total_pages - cursor
+    if 0 < remaining < nominal and remaining % 2 == 0:
+        return total_pages
+
+    raise SplitError(
+        f"第 {cursor + 1} 頁判為 {job_type}，但在其後 {min(nominal, remaining)} 頁內"
+        "找不到可信的下一張工作單邊界，請人工審查。"
+    )
+
+
 def split_jobs(pdf_path: Path) -> List[dict]:
     """
-    讀取 PDF，依序判斷每個 Job 是 CM (2頁) 或 PM (6頁)。
+    讀取 PDF，依序判斷每個 Job 是 CM 或 PM。
     回傳 jobs 列表，每個 job 包含：
       { "start": int, "type": "CM"/"PM", "keep_pages": [int, ...] }
 
-    CM（2頁）：頁N保留，N+1刪 → 輸出 1 頁
-    PM（6頁）：頁N保留，N+1刪，N+2~N+4保留，N+5刪 → 輸出 4 頁
+    CM：保留工作單正面。
+    PM：保留工作單正面及邊界內所有有實際內容的 checklist；空白背頁刪除。
 
     防呆（任何一條不過 → raise SplitError，整份轉人工，不產生垃圾）：
       1. detect 回 UNKNOWN / FCO / INS → 視為起始頁判讀不可信
-      2. 該 job 所需頁數超出剩餘頁數 → 分頁錯位
+      2. 標準邊界或較短的雙面掃描邊界都找不到 → 分頁不可信
       3. 全部走完後 cursor 必須剛好等於總頁數
     """
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     try:
         jobs: List[dict] = []
+        detection_cache = {}
+
+        def detect(page_idx: int) -> str:
+            if page_idx not in detection_cache:
+                detection_cache[page_idx] = nvidia_client.detect_cm_pm(doc, page_idx)
+            return detection_cache[page_idx]
+
         cursor = 0
         while cursor < total_pages:
-            job_type = nvidia_client.detect_cm_pm(doc, cursor)
+            job_type = detect(cursor)
 
             if job_type not in _PAGES_PER_TYPE:
                 raise SplitError(
@@ -53,20 +109,24 @@ def split_jobs(pdf_path: Path) -> List[dict]:
                     f"（目前偵測：{[j['type'] for j in jobs]}）"
                 )
 
-            need = _PAGES_PER_TYPE[job_type]
-            if cursor + need > total_pages:
-                raise SplitError(
-                    f"第 {cursor + 1} 頁判為 {job_type} 需 {need} 頁，"
-                    f"但只剩 {total_pages - cursor} 頁 → 分頁錯位，請人工審查。"
-                )
-
+            end = _find_job_end(doc, cursor, job_type, detect)
             if job_type == "CM":
                 keep = [cursor]
             else:  # PM
-                keep = [cursor + off for off in config.PM_KEEP_OFFSETS]
+                keep = [cursor]
+                keep.extend(
+                    page_idx for page_idx in range(cursor + 1, end)
+                    if page_has_meaningful_content(doc, page_idx)
+                )
 
-            jobs.append({"start": cursor, "type": job_type, "keep_pages": keep})
-            cursor += need
+            jobs.append({
+                "start": cursor,
+                "end": end,
+                "type": job_type,
+                "input_pages": end - cursor,
+                "keep_pages": keep,
+            })
+            cursor = end
     finally:
         doc.close()
 

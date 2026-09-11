@@ -48,6 +48,24 @@ class AsanaFailureTests(unittest.TestCase):
 
 
 class NvidiaResponseTests(unittest.TestCase):
+    @staticmethod
+    def _payload(**overrides):
+        data = {
+            "order_no": None,
+            "serial_candidates": ["US123"],
+            "product_raw": "CX50",
+            "customer_raw": "HKCH",
+            "location_raw": None,
+            "phone_candidates": [],
+            "asset_candidates": [],
+            "service_date_raw": "10/09/2026",
+            "date_source": "ACTION_DATE",
+            "unreadable_fields": [],
+        }
+        data.update(overrides)
+        import json
+        return json.dumps(data)
+
     def test_configuration_error_is_not_retried(self):
         with patch.object(
                 nvidia_client, "get_client",
@@ -76,8 +94,8 @@ class NvidiaResponseTests(unittest.TestCase):
     def test_wrapped_ocr_json_is_accepted(self):
         wrapped = (
             "Here is the requested result:\n```json\n"
-            '{"order_no":"", "serial_no":"US123", '
-            '"product":"Affiniti 70", "customer":"PYNEH"}\n```'
+            + self._payload(order_no="", product_raw="Affiniti 70", customer_raw="PYNEH")
+            + "\n```"
         )
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=wrapped):
@@ -89,8 +107,8 @@ class NvidiaResponseTests(unittest.TestCase):
     def test_unrelated_json_before_ocr_json_is_skipped(self):
         wrapped = (
             'Example: {"status":"ok"}\nActual: '
-            '{"order_no":null,"serial_no":"US123","product":"CX50",'
-            '"customer":"HKCH"} trailing words'
+            + self._payload()
+            + " trailing words"
         )
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=wrapped):
@@ -99,10 +117,7 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertEqual(result["serial_no"], "US123")
 
     def test_non_text_ocr_field_is_rejected(self):
-        invalid = (
-            '{"order_no":12345678,"serial_no":"US123",'
-            '"product":"CX50","customer":"HKCH"}'
-        )
+        invalid = self._payload(order_no=12345678)
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=invalid) as call:
             with self.assertRaises(nvidia_client.NvidiaResponseError):
@@ -110,29 +125,32 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
 
     def test_json_list_is_rejected_even_if_it_contains_an_object(self):
-        invalid = (
-            '[{"order_no":null,"serial_no":"US123",'
-            '"product":"CX50","customer":"HKCH"}]'
-        )
+        invalid = f"[{self._payload()}]"
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=invalid):
             with self.assertRaises(nvidia_client.NvidiaResponseError):
                 nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
     def test_unexpected_ocr_fields_are_not_returned(self):
-        response = (
-            '{"order_no":null,"serial_no":"US123","product":"CX50",'
-            '"customer":"HKCH","notes":"must not reach logs"}'
-        )
+        import json
+        response_data = json.loads(self._payload())
+        response_data["notes"] = "must not reach logs"
+        response = json.dumps(response_data)
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=response):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
-        self.assertEqual(set(result), {"order_no", "serial_no", "product", "customer"})
+        self.assertEqual(set(result), {
+            "order_no", "serial_candidates", "product_raw", "customer_raw",
+            "location_raw", "phone_candidates", "asset_candidates",
+            "service_date_raw", "date_source", "unreadable_fields",
+            "serial_no", "product", "customer",
+        })
 
     def test_ocr_prompt_contains_no_realistic_example_values(self):
-        response = (
-            '{"order_no":null,"serial_no":null,"product":null,"customer":null}'
+        response = self._payload(
+            serial_candidates=[], product_raw=None, customer_raw=None,
+            service_date_raw=None, date_source=None,
         )
         with patch.object(nvidia_client, "crop_jobsheet_top", return_value="image"), \
                 patch.object(nvidia_client, "_call_vision", return_value=response) as call:
@@ -211,6 +229,56 @@ class AsanaMatchSafetyTests(unittest.TestCase):
 
         self.assertIsNone(task)
         self.assertEqual(tier, 0)
+
+    def test_completed_recent_task_beats_future_incomplete_task(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": ["SZN22B1280"],
+            "serial_no": "SZN22B1280",
+            "product": "EPIQ Elite",
+            "customer": "KWH-6F",
+            "phone_candidates": [],
+            "asset_candidates": [],
+            "service_date_raw": "10/09/2026",
+            "date_source": "ACTION_DATE",
+            "location_raw": "6F",
+        }
+        tasks = [
+            {"gid": "current", "name": "KWH, EPIQ Elite, SZN22B1280",
+             "completed": True, "due_on": "2026-09-10"},
+            {"gid": "future", "name": "KWH, EPIQ Elite, SZN22B1280",
+             "completed": False, "due_on": "2027-03-10"},
+        ]
+        with patch.object(asana_client, "_gather_pool", return_value=tasks):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertEqual("current", task["gid"])
+        self.assertEqual(2, tier)
+
+    def test_one_character_serial_error_needs_two_supporting_signals(self):
+        base = {
+            "order_no": None,
+            "serial_candidates": ["SZN22B128O"],
+            "serial_no": "SZN22B128O",
+            "product": "EPIQ Elite",
+            "customer": "KWH-6F",
+            "phone_candidates": [],
+            "asset_candidates": [],
+            "service_date_raw": None,
+            "date_source": None,
+            "location_raw": None,
+        }
+        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZN22B1280"}
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, _ = asana_client.find_task(base, job_type="PM")
+        self.assertIsNone(task)
+
+        supported = dict(base, service_date_raw="10/09/2026", date_source="ACTION_DATE")
+        task_row["due_on"] = "2026-09-10"
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(supported, job_type="PM")
+        self.assertEqual("task", task["gid"])
+        self.assertEqual(2, tier)
 
 
 if __name__ == "__main__":

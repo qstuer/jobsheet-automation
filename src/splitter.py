@@ -5,7 +5,7 @@
 只做一件事：把掃描器上傳的多 job PDF 切成單一 job PDF，落地到 Google Drive。
     googledrive:From_BrotherDevice/*.pdf
       → 視覺判斷每個 job 的 CM/PM（JOB NATURE 圈選）
-      → 按頁數規則切割 + 頁數驗算
+      → 以每張工作單作邊界切割 + 去除空白背頁
       → 單一 job PDF 上傳 googledrive:From_BrotherDevice/_SPLIT/
       → 全部成功才刪原檔
 
@@ -46,7 +46,10 @@ def _split_one(filename: str, work_dir: Path) -> dict:
         local_pdf.unlink(missing_ok=True)
         return {"file": filename, "status": "切割失敗(已轉人工)", "reason": str(e)}
 
-    log.info(f"  切出 {len(jobs)} 個 job：{[j['type'] for j in jobs]}")
+    log.info(
+        f"  切出 {len(jobs)} 個 job："
+        f"{[(j['type'], j['input_pages'], len(j['keep_pages'])) for j in jobs]}"
+    )
 
     # ── 逐 job 抽頁 → 上傳 _SPLIT ──
     stem = Path(filename).stem

@@ -31,11 +31,11 @@ NVIDIA_MODEL = (
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 
-# === OCR 設定（訂單資訊：ORDER/SERIAL/PRODUCT/CUSTOMER）===
+# === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
 OCR_ZOOM_DEFAULT  = 2.0   # 手寫細字至少 2x，避免低解像度下用猜的
 OCR_ZOOM_FALLBACK = 2.5   # 舊版單次升級用（保留相容）
 OCR_CROP_TOP      = 0.10  # 從圖片高 10% 開始裁
-OCR_CROP_BOTTOM   = 0.30  # 裁到 30%
+OCR_CROP_BOTTOM   = 0.56  # 裁到 56%，把聯絡電話、日期及 asset 一併納入
 OCR_CONTRAST      = 2.0   # 對比加強倍數
 
 # === OCR 多輪交叉核對 ===
@@ -54,12 +54,16 @@ CMPM_FALLBACK_TOP    = 0.08
 CMPM_FALLBACK_BOTTOM = 0.20
 
 # === 配對失敗的最終處置 ===
-# 多輪 OCR + Asana 都配不到時，仍上傳 OneDrive，用 OCR 猜測命名並加此前綴標記，
-# 方便人工在 OneDrive 直接看到、手動改名。
-CHECK_PREFIX = "[待核對]"
+# 不可靠的名稱不得進 OneDrive；原檔留在 Google Drive _PENDING 等人工核對。
+CHECK_PREFIX = "[待核對]"  # 只保留給舊檔名相容，不再用於新上傳
 
 # === 業務邏輯 ===
 ORDER_NO_REGEX    = r"^[56]\d{7}$"   # 8 位、5 或 6 開頭
 CM_PAGES_PER_JOB  = 2                 # CM Job 共 2 頁，保留第 1 頁
 PM_PAGES_PER_JOB  = 6                 # PM Job 共 6 頁，保留第 1,3,4,5 頁
 PM_KEEP_OFFSETS   = [0, 2, 3, 4]     # 相對於 Job 起始頁的偏移
+
+# 掃描器通常把正面、背面成對掃入。PM 標準為 6 張掃描頁，但現場可能只附
+# 一部分 checklist；切頁時最多向前找 6 頁內的下一張工作單作邊界。
+CONTENT_DARK_PIXEL_THRESHOLD = 200
+CONTENT_MIN_DARK_RATIO = 0.03

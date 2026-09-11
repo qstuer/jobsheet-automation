@@ -4,16 +4,15 @@
 
 對 _SPLIT/ 裡每一份「單一 job PDF」：
     → 多輪 OCR（不同清晰度交叉核對，同一個 Asana 工作命中兩次才接受）
-    → Asana 兩層配對（醫院+型號撈池 → 本機 serial 容錯）
+    → Asana 多欄配對（serial + 日期/電話/asset/醫院/型號）
     → 命名後上傳 onedrive:.../JOBSHEETS/ → 刪 _SPLIT 那份
 
 命名：
   找到任務 + 任務名含 Order No → SR#OrderNo.pdf
   找到任務 + 任務名無 Order No → Asana 任務標題.pdf
-  多輪全失敗            → 仍上傳 OneDrive，用 OCR 猜測命名 + [待核對] 前綴標記
-                          （不再卡 PENDING；人工在 OneDrive 直接看到並手動改）
+  多輪全失敗            → 留在 Google Drive _PENDING，不碰 OneDrive
 
-最後處理舊的 _PENDING 殘檔：能配就正名上傳，配不到也標記上傳，一律不再 lingering。
+最後處理舊格式的 _PENDING 殘檔：能配才正名上傳，配不到繼續保留。
 """
 import logging
 import re
@@ -47,7 +46,7 @@ def _safe(val: str) -> str:
 def _upload_with_order_no(local_pdf: Path, order_no: str) -> str:
     fn = rclone_helper.upload_unique(
         local_pdf, config.ONEDRIVE_OUTPUT, f"SR#{order_no}.pdf", _USED_NAMES)
-    log.info(f"  ↑ OneDrive: {fn}")
+    log.info("  ↑ OneDrive 上傳完成（已用 Asana 訂單號命名）")
     return fn
 
 
@@ -55,23 +54,7 @@ def _upload_with_task_title(local_pdf: Path, task: dict) -> str:
     fn = rclone_helper.upload_unique(
         local_pdf, config.ONEDRIVE_OUTPUT,
         f"{asana_client.get_safe_title(task)}.pdf", _USED_NAMES)
-    log.info(f"  ↑ OneDrive (任務標題): {fn}")
-    return fn
-
-
-def _flagged_name(ocr: dict) -> str:
-    """配不到時，用 OCR 猜測拼出檔名，加 [待核對] 前綴"""
-    parts = [ocr.get("customer"), ocr.get("product"),
-             ocr.get("serial_no"), ocr.get("order_no")]
-    body = "_".join(_safe(p) for p in parts if p) or "Unknown"
-    return f"{config.CHECK_PREFIX}{body}.pdf"
-
-
-def _upload_flagged(local_pdf: Path, ocr: dict) -> str:
-    """配對失敗 → 仍上傳 OneDrive 並標記待核對"""
-    fn = rclone_helper.upload_unique(
-        local_pdf, config.ONEDRIVE_OUTPUT, _flagged_name(ocr), _USED_NAMES)
-    log.warning(f"  ⚠ 配對失敗，仍上傳 OneDrive 並標記待核對：{fn}")
+    log.info("  ↑ OneDrive 上傳完成（已用 Asana 任務標題命名）")
     return fn
 
 
@@ -91,14 +74,22 @@ def _ocr_and_match(doc, job_type):
     """以不同清晰度重讀；同一個 Asana 工作命中足夠次數才接受。
 
     單次 OCR 即使剛好命中真實 Asana 工作，也可能只是模型猜中常見字串。
-    因此不能像舊版一樣第一次命中便停止；沒有交叉確認便送 [待核對]。
+    因此不能像舊版一樣第一次命中便停止；沒有交叉確認便留在 _PENDING。
     回傳 (task, tier, last_ocr)。
     """
     last_ocr = {}
     matches = {}
     for i, zoom in enumerate(config.OCR_RETRY_ZOOMS, 1):
         ocr = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=zoom)
-        log.info(f"  OCR 第{i}輪({zoom}x): {ocr}")
+        # Actions log 不可印電話、asset、serial 或客戶內容；只記錄哪些欄位看得到。
+        visible_fields = [
+            key for key in (
+                "order_no", "serial_candidates", "product_raw", "customer_raw",
+                "location_raw", "phone_candidates", "asset_candidates", "service_date_raw",
+            )
+            if ocr.get(key)
+        ]
+        log.info(f"  OCR 第{i}輪({zoom}x)：已讀到 {visible_fields}")
         last_ocr = ocr
         task, tier = asana_client.find_task(ocr, job_type=job_type)
         if task is not None:
@@ -130,6 +121,25 @@ def _parse_job_type(filename: str):
     return m.group(1) if m else None
 
 
+def _move_to_pending_unique(local_pdf: Path, source_remote: str,
+                            filename: str) -> str:
+    """不覆蓋既有待核對檔；內容相同則只清掉重複的 _SPLIT 來源。"""
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    number = 0
+    while True:
+        candidate = filename if number == 0 else f"{stem} ({number}){suffix}"
+        destination = f"{config.GDRIVE_PENDING}/{candidate}"
+        stat = rclone_helper.remote_stat(destination)
+        if stat is None:
+            rclone_helper.moveto(source_remote, destination)
+            return candidate
+        if rclone_helper.remote_matches(local_pdf, destination, stat=stat):
+            rclone_helper.delete(source_remote)
+            return candidate
+        number += 1
+
+
 def _process_split_file(filename: str, work_dir: Path) -> dict:
     remote = f"{config.GDRIVE_SPLIT}/{filename}"
     local = work_dir / filename
@@ -143,16 +153,20 @@ def _process_split_file(filename: str, work_dir: Path) -> dict:
         log.info(f"  Asana 第 {tier} 層命中")
         result = _finalize_match(local, task, tier)
     else:
-        log.info("  多輪 OCR 全部配不到 → 標記上傳")
-        name = _upload_flagged(local, ocr)
-        result = {"status": "配對失敗(已標記上傳)", "onedrive": name}
+        # 名稱未確認時絕不把猜測結果送到正式 OneDrive。保留完整 PDF 在私人
+        # Google Drive，之後可人工核對或用改良後的 matcher 重試。
+        log.warning("  ⚠ 多輪核對仍不確定 → 留在 Google Drive _PENDING")
+        pending_name = _move_to_pending_unique(local, remote, filename)
+        result = {"status": "等待人工核對", "pending": pending_name}
+        local.unlink(missing_ok=True)
+        return result
 
     rclone_helper.delete(remote)
     local.unlink(missing_ok=True)
     return result
 
 
-# ── 舊 PENDING 殘檔重試（一律清空，不再 lingering）──────────────
+# ── 舊 PENDING 殘檔重試（配不到就繼續保留）────────────────────
 
 def _retry_pending(work_dir: Path) -> list:
     log.info("--- 重試舊 _PENDING 殘檔 ---")
@@ -174,20 +188,20 @@ def _retry_pending(work_dir: Path) -> list:
         }
         task, tier = asana_client.find_task(ocr_synth, job_type=job_type)
 
-        remote = f"{config.GDRIVE_PENDING}/{filename}"
-        local = work_dir / filename
-        rclone_helper.download(remote, local)
         if task is not None:
+            remote = f"{config.GDRIVE_PENDING}/{filename}"
+            local = work_dir / filename
+            rclone_helper.download(remote, local)
             order_no = asana_client.extract_order_no_from_name(task)
             onedrive = (_upload_with_order_no(local, order_no) if order_no
                         else _upload_with_task_title(local, task))
             report.append({"file": filename, "status": "完成", "tier": tier, "onedrive": onedrive})
-            log.info(f"  ✓ {filename} → {onedrive}")
+            log.info("  ✓ 舊 PENDING 檔已可靠配對並上傳")
+            rclone_helper.delete(remote)
+            local.unlink(missing_ok=True)
         else:
-            onedrive = _upload_flagged(local, ocr_synth)
-            report.append({"file": filename, "status": "配對失敗(已標記上傳)", "onedrive": onedrive})
-        rclone_helper.delete(remote)   # 一律清掉，不再 lingering
-        local.unlink(missing_ok=True)
+            report.append({"file": filename, "status": "仍待人工核對"})
+            log.warning("  ⚠ 一份舊 PENDING 檔仍無法可靠配對，繼續保留")
     return report
 
 
@@ -218,12 +232,12 @@ def main() -> int:
     log.info("處理階段完成報告")
     log.info("=" * 60)
     for row in main_report:
-        log.info(f"  {row}")
+        log.info(f"  {row.get('file')}：{row.get('status')}")
     log.info(f"重試 PENDING：{len(pending_report)} 筆")
     for row in pending_report:
-        log.info(f"  {row}")
+        log.info(f"  舊 PENDING：{row.get('status')}")
     # 有 job 因 API / 網路 / rclone 等原因留待重試時，Stage B 必須呈現失敗，
-    # 讓 workflow_run 連敗告警看得到；已成功上傳或 [待核對] 分流不受影響。
+    # 讓 workflow_run 連敗告警看得到；已成功上傳或 _PENDING 分流不受影響。
     return 1 if had_processing_error else 0
 
 

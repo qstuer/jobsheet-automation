@@ -12,6 +12,7 @@ if "fitz" not in sys.modules and importlib.util.find_spec("fitz") is None:
     sys.modules["fitz"] = MagicMock()
 
 from src import config, processor, rclone_helper, splitter
+from src import pdf_utils
 from src.pdf_utils import SplitError
 
 
@@ -54,6 +55,58 @@ class SplitterErrorRoutingTests(unittest.TestCase):
                              side_effect=RuntimeError("API down")), \
                 patch.object(processor, "_retry_pending", return_value=[]):
             self.assertEqual(processor.main(), 1)
+
+
+class VariableLengthSplitTests(unittest.TestCase):
+    def test_fifty_two_page_batch_finds_eleven_real_job_boundaries(self):
+        starts = {0: "PM", 6: "PM", 12: "CM", 14: "PM", 20: "PM",
+                  24: "PM", 30: "PM", 36: "PM", 38: "PM", 44: "PM",
+                  46: "PM"}
+        meaningful = {
+            2, 3, 4, 8, 9, 10, 16, 17, 18, 21, 22, 26, 27, 28,
+            32, 33, 34, 40, 41, 42, 48, 49, 50,
+        }
+        fake_doc = MagicMock()
+        fake_doc.__len__.return_value = 52
+
+        with patch.object(pdf_utils.fitz, "open", return_value=fake_doc), \
+                patch.object(pdf_utils.nvidia_client, "detect_cm_pm",
+                             side_effect=lambda _doc, page: starts.get(page, "UNKNOWN")), \
+                patch.object(pdf_utils, "page_has_meaningful_content",
+                             side_effect=lambda _doc, page: page in meaningful):
+            jobs = pdf_utils.split_jobs(Path("scan.pdf"))
+
+        self.assertEqual(
+            [6, 6, 2, 6, 4, 6, 6, 2, 6, 2, 6],
+            [job["input_pages"] for job in jobs],
+        )
+        self.assertEqual(
+            [4, 4, 1, 4, 3, 4, 4, 1, 4, 1, 4],
+            [len(job["keep_pages"]) for job in jobs],
+        )
+
+
+class ProcessorPendingTests(unittest.TestCase):
+    def test_uncertain_match_moves_only_to_pending_and_never_onedrive(self):
+        filename = "scan__job1_PM.pdf"
+        fake_open = MagicMock()
+        fake_open.return_value.__enter__.return_value = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(processor.rclone_helper, "download"), \
+                patch.object(processor.fitz, "open", fake_open), \
+                patch.object(processor, "_ocr_and_match",
+                             return_value=(None, 0, {})), \
+                patch.object(processor.rclone_helper, "remote_stat", return_value=None), \
+                patch.object(processor.rclone_helper, "moveto") as moveto, \
+                patch.object(processor.rclone_helper, "upload_unique") as upload:
+            result = processor._process_split_file(filename, Path(tmpdir))
+
+        moveto.assert_called_once_with(
+            f"{config.GDRIVE_SPLIT}/{filename}",
+            f"{config.GDRIVE_PENDING}/{filename}",
+        )
+        upload.assert_not_called()
+        self.assertEqual("等待人工核對", result["status"])
 
 
 class RcloneListTests(unittest.TestCase):

@@ -45,8 +45,8 @@ def get_client() -> OpenAI:
 
 def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) -> str:
     """
-    裁切第 N 頁的 10%-30% 區域（全寬），加強對比，回傳 base64 JPEG。
-    供 ocr_jobsheet_fields 讀 ORDER / PRODUCT / SERIAL / CUSTOMER 用。
+    裁切第 N 頁的 10%-56% 區域（全寬），加強對比，回傳 base64 JPEG。
+    除訂單/設備/醫院外，也涵蓋聯絡電話、資產編號與服務日期。
     """
     page = pdf_doc[page_idx]
     mat = fitz.Matrix(zoom, zoom)
@@ -190,29 +190,49 @@ def ocr_jobsheet_fields(
         zoom: float = config.OCR_ZOOM_DEFAULT,
 ) -> dict:
     """
-    提取 ORDER NO / SERIAL NO / PRODUCT / CUSTOMER
+    忠實抄錄 ORDER / SERIAL / PRODUCT / CUSTOMER / LOCATION / PHONE / ASSET / DATE。
+
+    視覺模型只負責「看字」，不負責挑 Asana 工作或修正常見值。模糊字元以
+    candidates 保存，讓後面的 Asana 比對用日期、電話與 asset 交叉確認。
     常見誤讀：9→G, O→0, 0→D, l→1, S→5, C450→CX50
     """
     img_b64 = crop_jobsheet_top(pdf_doc, page_idx, zoom=zoom)
     prompt = (
-        "Read the handwritten values directly from the four labelled boxes in this jobsheet image. "
+        "You are a strict transcription reader, not a matching or guessing system. "
+        "Read only values visibly written in the labelled boxes of this one jobsheet image. "
         "Treat this image independently: never invent, autocomplete, or reuse values from typical "
-        "equipment, previous images, or the field descriptions. Preserve every visible letter and "
-        "digit exactly. If a value is blank or not readable, use null. "
+        "equipment, hospitals, previous images, or the field labels themselves. Do not normalize "
+        "hospital abbreviations or product names. Preserve visible letters, digits and punctuation. "
+        "For an ambiguous serial, phone or asset number, list at most three readings that are each "
+        "actually supported by the handwriting. Never create alternatives merely to fill the list. "
+        "The service date must come from the ACTION DATE / service-date box, not a printed form date. "
+        "Use null or [] when blank or unreadable. "
         "Return JSON only, with no markdown fences:\n"
         "{\n"
-        '  "order_no": "text written below ORDER NO., or null",\n'
-        '  "serial_no": "text written below SERIAL NO., or null",\n'
-        '  "product": "text written below PRODUCT, or null",\n'
-        '  "customer": "text written in Customer Name, or null"\n'
+        '  "order_no": "raw text below ORDER NO., or null",\n'
+        '  "serial_candidates": ["raw visible reading"],\n'
+        '  "product_raw": "raw text below PRODUCT, or null",\n'
+        '  "customer_raw": "raw text in Customer Name, or null",\n'
+        '  "location_raw": "raw department, ward, floor or room text, or null",\n'
+        '  "phone_candidates": ["raw telephone reading"],\n'
+        '  "asset_candidates": ["raw equipment/asset number reading"],\n'
+        '  "service_date_raw": "raw ACTION DATE / service date, or null",\n'
+        '  "date_source": "ACTION_DATE, OTHER, or null",\n'
+        '  "unreadable_fields": ["field label"]\n'
         "}"
     )
     data = None
     last_error = None
     # 服務偶爾會在 JSON 前後加解釋。找出其中真正的 JSON；若仍不合法，
     # 同一張圖再問一次。兩次都錯才讓 Stage B 失敗並保留來源。
-    field_order = ("order_no", "serial_no", "product", "customer")
-    expected = set(field_order)
+    field_order = (
+        "order_no", "serial_candidates", "product_raw", "customer_raw",
+        "location_raw", "phone_candidates", "asset_candidates",
+        "service_date_raw", "date_source", "unreadable_fields",
+    )
+    # 模型偶爾省略可選的 location/unreadable 欄位；核心四項齊全便可讀，
+    # 其餘缺項在本機補空值，避免格式小差異令整條 pipeline 失敗。
+    expected = {"order_no", "serial_candidates", "product_raw", "customer_raw"}
     for _ in range(2):
         raw = _call_vision(prompt=prompt, image_b64=img_b64, max_tokens=300)
         try:
@@ -221,16 +241,30 @@ def ocr_jobsheet_fields(
             last_error = exc
             continue
 
-        invalid_types = [
-            key for key in expected
-            if candidate.get(key) is not None and not isinstance(candidate.get(key), str)
-        ]
+        list_fields = {
+            "serial_candidates", "phone_candidates", "asset_candidates",
+            "unreadable_fields",
+        }
+        invalid_types = []
+        for key in field_order:
+            value = candidate.get(key)
+            if key in list_fields:
+                if value is not None and (
+                    not isinstance(value, list)
+                    or any(not isinstance(item, str) for item in value)
+                ):
+                    invalid_types.append(key)
+            elif value is not None and not isinstance(value, str):
+                invalid_types.append(key)
         if invalid_types:
             fields = ", ".join(sorted(invalid_types))
             last_error = NvidiaResponseError(f"NVIDIA OCR 欄位不是文字：{fields}")
             continue
-        # 只保留預期欄位，避免模型附帶的其他單據內容進入執行紀錄。
-        data = {key: candidate[key] for key in field_order}
+        # 只保留預期欄位，避免模型附帶的其他內容進入後續流程。
+        data = {
+            key: candidate.get(key, [] if key in list_fields else None)
+            for key in field_order
+        }
         break
 
     if data is None:
@@ -240,4 +274,25 @@ def ocr_jobsheet_fields(
         val = data.get(key)
         if isinstance(val, str) and val.strip().lower() in ("", "null", "none", "n/a"):
             data[key] = None
+        elif val is None and key in {
+            "serial_candidates", "phone_candidates", "asset_candidates", "unreadable_fields"
+        }:
+            data[key] = []
+        elif isinstance(val, list):
+            cleaned = []
+            for item in val:
+                item = item.strip()
+                if item and item.lower() not in ("null", "none", "n/a") and item not in cleaned:
+                    cleaned.append(item)
+            data[key] = cleaned[:3] if key != "unreadable_fields" else cleaned
+
+    if data.get("date_source"):
+        data["date_source"] = data["date_source"].strip().upper().replace(" ", "_")
+        if data["date_source"] not in {"ACTION_DATE", "OTHER"}:
+            data["date_source"] = None
+
+    # 相容欄位由原始抄錄派生，不作任何猜測或自動修正。
+    data["serial_no"] = next(iter(data["serial_candidates"]), None)
+    data["product"] = data["product_raw"]
+    data["customer"] = data["customer_raw"]
     return data
