@@ -167,6 +167,7 @@ GitHub Secrets：
 - 預設使用有免費入口、支援圖片、OCR 及 JSON 輸出的 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`。
 - Jobsheet 是抄錄工作，不需要長篇推理；程式依官方 instruct 設定關閉 thinking，使用 `top_k=1`、1024 輸出上限及較穩定的低溫度。
 - 2026-09-12 用新舊 key 實際測試 Kimi K3，均在回傳任何資料前超時；這只證明 Kimi 免費入口當時不可用，不代表 key 本身無效。
+- 2026-09-12 GitHub `NVIDIA Model Check` run 34628392304：新 key 呼叫 Nemotron 成功，正確讀出假圖片的六位數字並通過 JSON 驗證；測試沒有讀取 Google Drive、Asana 或 OneDrive。
 - 後備為曾成功取得 HTTP 200 的 `meta/llama-3.2-11b-vision-instruct`：一批內首選模型只試一次，失聯後其餘圖片直接用後備，不會每份重等。
 - 每次 NVIDIA 網路等待最多 45 秒，SDK 不做隱藏重試；後備模型最多短重試 1 次，全部失敗時檔案保留在 `_SPLIT`。
 - 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
