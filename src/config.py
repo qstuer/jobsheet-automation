@@ -67,3 +67,10 @@ PM_KEEP_OFFSETS   = [0, 2, 3, 4]     # 相對於 Job 起始頁的偏移
 # 一部分 checklist；切頁時最多向前找 6 頁內的下一張工作單作邊界。
 CONTENT_DARK_PIXEL_THRESHOLD = 200
 CONTENT_MIN_DARK_RATIO = 0.03
+
+# 工作單首頁的固定印刷版面會彼此相似，checklist 則明顯不同。先做本機版面
+# 比對，通過後才讓視覺模型讀 CM/PM，可避免模型在 checklist 上猜到 PM。
+JOBSHEET_LAYOUT_WIDTH = 96
+JOBSHEET_LAYOUT_HEIGHT = 128
+JOBSHEET_LAYOUT_DARK_THRESHOLD = 210
+JOBSHEET_LAYOUT_MIN_DICE = 0.35

@@ -70,6 +70,9 @@ class VariableLengthSplitTests(unittest.TestCase):
         fake_doc.__len__.return_value = 52
 
         with patch.object(pdf_utils.fitz, "open", return_value=fake_doc), \
+                patch.object(pdf_utils, "_page_layout_signature", return_value=(True,)), \
+                patch.object(pdf_utils, "page_looks_like_jobsheet",
+                             side_effect=lambda _doc, page, _ref: page in starts), \
                 patch.object(pdf_utils.nvidia_client, "detect_cm_pm",
                              side_effect=lambda _doc, page: starts.get(page, "UNKNOWN")), \
                 patch.object(pdf_utils, "page_has_meaningful_content",
@@ -84,6 +87,22 @@ class VariableLengthSplitTests(unittest.TestCase):
             [4, 4, 1, 4, 3, 4, 4, 1, 4, 1, 4],
             [len(job["keep_pages"]) for job in jobs],
         )
+
+    def test_checklist_candidate_is_rejected_before_calling_vision(self):
+        fake_doc = MagicMock()
+        fake_doc.__len__.return_value = 8
+        with patch.object(pdf_utils.fitz, "open", return_value=fake_doc), \
+                patch.object(pdf_utils, "_page_layout_signature", return_value=(True,)), \
+                patch.object(pdf_utils, "page_looks_like_jobsheet",
+                             side_effect=lambda _doc, page, _ref: page == 4), \
+                patch.object(pdf_utils.nvidia_client, "detect_cm_pm",
+                             side_effect=lambda _doc, page: "PM") as vision, \
+                patch.object(pdf_utils, "page_has_meaningful_content", return_value=False):
+            jobs = pdf_utils.split_jobs(Path("scan.pdf"))
+
+        self.assertEqual([0, 4], [job["start"] for job in jobs])
+        self.assertEqual([4, 4], [job["input_pages"] for job in jobs])
+        self.assertEqual([0, 4], [call.args[1] for call in vision.call_args_list])
 
 
 class ProcessorPendingTests(unittest.TestCase):

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List
 
 import fitz
+from PIL import Image
 
 from . import config, nvidia_client
 
@@ -39,6 +40,24 @@ def page_has_meaningful_content(pdf_doc: fitz.Document, page_idx: int) -> bool:
         return False
     dark = sum(value < config.CONTENT_DARK_PIXEL_THRESHOLD for value in samples)
     return (dark / len(samples)) >= config.CONTENT_MIN_DARK_RATIO
+
+
+def _page_layout_signature(page: fitz.Page) -> tuple[bool, ...]:
+    """把頁面縮成粗略黑白版面指紋；忽略手寫細節，保留表格位置。"""
+    pix = page.get_pixmap(matrix=fitz.Matrix(0.75, 0.75), colorspace=fitz.csGRAY)
+    image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    image = image.resize((config.JOBSHEET_LAYOUT_WIDTH, config.JOBSHEET_LAYOUT_HEIGHT))
+    return tuple(value < config.JOBSHEET_LAYOUT_DARK_THRESHOLD for value in image.getdata())
+
+
+def page_looks_like_jobsheet(pdf_doc: fitz.Document, page_idx: int,
+                             reference: tuple[bool, ...]) -> bool:
+    """確認候選頁使用同一款 Jobsheet 首頁版面，不讓 checklist 冒充邊界。"""
+    candidate = _page_layout_signature(pdf_doc[page_idx])
+    overlap = sum(left and right for left, right in zip(reference, candidate))
+    dark_count = sum(reference) + sum(candidate)
+    similarity = (2 * overlap / dark_count) if dark_count else 0.0
+    return similarity >= config.JOBSHEET_LAYOUT_MIN_DICE
 
 
 def _find_job_end(pdf_doc: fitz.Document, cursor: int, job_type: str,
@@ -92,9 +111,19 @@ def split_jobs(pdf_path: Path) -> List[dict]:
     try:
         jobs: List[dict] = []
         detection_cache = {}
+        layout_cache = {}
+        reference_layout = _page_layout_signature(doc[0])
 
         def detect(page_idx: int) -> str:
             if page_idx not in detection_cache:
+                if page_idx != 0:
+                    if page_idx not in layout_cache:
+                        layout_cache[page_idx] = page_looks_like_jobsheet(
+                            doc, page_idx, reference_layout
+                        )
+                    if not layout_cache[page_idx]:
+                        detection_cache[page_idx] = "NOT_JOBSHEET"
+                        return detection_cache[page_idx]
                 detection_cache[page_idx] = nvidia_client.detect_cm_pm(doc, page_idx)
             return detection_cache[page_idx]
 
