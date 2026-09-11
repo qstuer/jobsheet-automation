@@ -33,8 +33,9 @@ NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
 
 # Kimi K3 會先推理再給最後答案；過小的 max_tokens 可能只留下推理、沒有
 # JSON/CM/PM 結果。簡單圈選和詳細欄位各保留足夠但有限的輸出空間。
-KIMI_TEXT_MAX_TOKENS = 512
-KIMI_JSON_MAX_TOKENS = 2048
+KIMI_TEXT_MAX_TOKENS = 1024
+KIMI_JSON_MAX_TOKENS = 4096
+KIMI_STREAM_MAX_SECONDS = 90.0
 
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"

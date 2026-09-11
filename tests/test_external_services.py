@@ -2,6 +2,7 @@
 import importlib.util
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 if "fitz" not in sys.modules and importlib.util.find_spec("fitz") is None:
@@ -91,10 +92,14 @@ class NvidiaResponseTests(unittest.TestCase):
             nvidia_client._client = None
 
     def test_kimi_uses_reasoning_space_for_json(self):
-        response = MagicMock()
-        response.choices[0].message.content = '{"ok":true}'
+        first = SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content='{"ok":')
+        )])
+        second = SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content='true}')
+        )])
         client = MagicMock()
-        client.chat.completions.create.return_value = response
+        client.chat.completions.create.return_value = [first, second]
 
         with patch.object(nvidia_client, "get_client", return_value=client), \
                 patch.object(config, "NVIDIA_MODEL", "moonshotai/kimi-k3"):
@@ -110,6 +115,7 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertEqual(request["temperature"], 1)
         self.assertEqual(request["reasoning_effort"], "low")
         self.assertEqual(request["seed"], 0)
+        self.assertTrue(request["stream"])
         self.assertEqual(request["max_tokens"], config.KIMI_JSON_MAX_TOKENS)
         self.assertNotIn("response_format", request)
         self.assertEqual(request["timeout"], config.NVIDIA_REQUEST_TIMEOUT_SECONDS)

@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import re
+import time
 from typing import Optional
 
 import fitz
@@ -99,13 +100,31 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
     )
     if is_kimi_k3:
         # OCR 不需要長篇推理；low 可縮短免費入口的等待，同時保留推理能力。
-        request.update(reasoning_effort="low", seed=0)
+        # NVIDIA 的 Kimi 範例使用串流；若等待整份答案，免費入口可能在回覆
+        # headers 前已超時。只收集最後 content，reasoning_content 不進日誌。
+        request.update(reasoning_effort="low", seed=0, stream=True)
 
     response = get_client().chat.completions.create(**request)
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError) as exc:
-        raise NvidiaResponseError("NVIDIA 視覺模型回覆格式不完整") from exc
+    if is_kimi_k3:
+        started = time.monotonic()
+        parts = []
+        for chunk in response:
+            if time.monotonic() - started > config.KIMI_STREAM_MAX_SECONDS:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+                raise NvidiaResponseError("NVIDIA Kimi 串流超過時間限制")
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = getattr(choice, "delta", None)
+                piece = getattr(delta, "content", None)
+                if isinstance(piece, str):
+                    parts.append(piece)
+        content = "".join(parts)
+    else:
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError) as exc:
+            raise NvidiaResponseError("NVIDIA 視覺模型回覆格式不完整") from exc
     if not isinstance(content, str) or not content.strip():
         raise NvidiaResponseError("NVIDIA 視覺模型沒有回傳文字")
     return content.strip()
