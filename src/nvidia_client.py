@@ -143,8 +143,9 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
                  allow_fallback: bool = True) -> str:
     """呼叫 NVIDIA 視覺模型做單張圖 OCR。
 
-    首選模型失聯時，同一次執行只等待一次，隨後改用已知可工作的後備
-    模型。失聯的模型會在本批工作內停用，避免每張單據都重等 45 秒。
+    Kimi 失聯時只等待一次（避免它再次長時間掛起）；目前使用的 Nemotron
+    遇到 503/timeout 會短重試一次，才改用後備模型。失聯的模型會在本批
+    工作內停用，避免每張單據都重等。
     """
     primary = config.NVIDIA_MODEL.strip()
     models = [primary]
@@ -156,9 +157,12 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
     for model in models:
         if model in _unavailable_models:
             continue
-        # 首選模型一批內先試一次；後備模型保留一次短重試，以容許偶發
-        # 網路錯誤。下一批執行會重新嘗試首選模型。
-        attempts = 1 if model == primary and len(models) > 1 else 2
+        # Kimi 曾實測長時間不回覆，因此維持一次即後備；Nemotron 的偶發
+        # 503 通常短重試即可恢復，不應因一次暫時故障立刻落到舊 Llama。
+        is_primary_kimi = (
+            model == primary and model.strip().lower() == "moonshotai/kimi-k3"
+        )
+        attempts = 1 if is_primary_kimi and len(models) > 1 else 2
         for attempt in range(attempts):
             try:
                 return _call_vision_once(
@@ -281,7 +285,8 @@ def ocr_jobsheet_fields(
         zoom: float = config.OCR_ZOOM_DEFAULT,
 ) -> dict:
     """
-    忠實抄錄 ORDER / SERIAL / PRODUCT / CUSTOMER / LOCATION / PHONE / ASSET / DATE。
+    忠實抄錄 ORDER / SERIAL / PRODUCT / CUSTOMER / LOCATION / PHONE / ASSET /
+    HAWO(WO) / DATE。
 
     視覺模型只負責「看字」，不負責挑 Asana 工作或修正常見值。模糊字元以
     candidates 保存，讓後面的 Asana 比對用日期、電話與 asset 交叉確認。
@@ -294,7 +299,7 @@ def ocr_jobsheet_fields(
         "Treat this image independently: never invent, autocomplete, or reuse values from typical "
         "equipment, hospitals, previous images, or the field labels themselves. Do not normalize "
         "hospital abbreviations or product names. Preserve visible letters, digits and punctuation. "
-        "For an ambiguous serial, phone or asset number, list at most three readings that are each "
+        "For an ambiguous serial, phone, asset or HAWO/WO number, list at most three readings that are each "
         "actually supported by the handwriting. Never create alternatives merely to fill the list. "
         "The service date must come from the ACTION DATE / service-date box, not a printed form date. "
         "Use null or [] when blank or unreadable. "
@@ -307,6 +312,7 @@ def ocr_jobsheet_fields(
         '  "location_raw": "raw department, ward, floor or room text, or null",\n'
         '  "phone_candidates": ["raw telephone reading"],\n'
         '  "asset_candidates": ["raw equipment/asset number reading"],\n'
+        '  "work_order_candidates": ["raw HAWO or WO service reference visibly written in FAULT SYMPTOM or ACTION TAKEN"],\n'
         '  "service_date_raw": "raw ACTION DATE / service date, or null",\n'
         '  "date_source": "ACTION_DATE, OTHER, or null",\n'
         '  "unreadable_fields": ["field label"]\n'
@@ -319,7 +325,8 @@ def ocr_jobsheet_fields(
     field_order = (
         "order_no", "serial_candidates", "product_raw", "customer_raw",
         "location_raw", "phone_candidates", "asset_candidates",
-        "service_date_raw", "date_source", "unreadable_fields",
+        "work_order_candidates", "service_date_raw", "date_source",
+        "unreadable_fields",
     )
     # 模型偶爾省略可選的 location/unreadable 欄位；核心四項齊全便可讀，
     # 其餘缺項在本機補空值，避免格式小差異令整條 pipeline 失敗。
@@ -339,7 +346,7 @@ def ocr_jobsheet_fields(
 
         list_fields = {
             "serial_candidates", "phone_candidates", "asset_candidates",
-            "unreadable_fields",
+            "work_order_candidates", "unreadable_fields",
         }
         invalid_types = []
         for key in field_order:
@@ -371,7 +378,8 @@ def ocr_jobsheet_fields(
         if isinstance(val, str) and val.strip().lower() in ("", "null", "none", "n/a"):
             data[key] = None
         elif val is None and key in {
-            "serial_candidates", "phone_candidates", "asset_candidates", "unreadable_fields"
+            "serial_candidates", "phone_candidates", "asset_candidates",
+            "work_order_candidates", "unreadable_fields"
         }:
             data[key] = []
         elif isinstance(val, list):

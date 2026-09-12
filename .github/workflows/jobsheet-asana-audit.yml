@@ -44,7 +44,7 @@ jobs:
       - name: Search Asana names and descriptions
         env:
           ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
-          ASANA_WORKSPACE_GID: ${{ secrets.ASANA_WORKSPACE_GID }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
         run: python -m src.asana_audit
       - name: Return result to private Google Drive
         run: >-

@@ -63,7 +63,8 @@ jobs:
           # 模型名稱不是敏感資料；未設定 variable 時使用 src/config.py 的 Nemotron。
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
-          ASANA_WORKSPACE_GID:  ${{ secrets.ASANA_WORKSPACE_GID }}
+          # Workspace 編號不是密鑰。未設定 variable 時，程式使用已核對的預設 workspace。
+          ASANA_WORKSPACE_GID:  ${{ vars.ASANA_WORKSPACE_GID }}
           # 手動測試可指定一份；Stage A 自動接力時此值為空，維持正常批次。
           JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}
         run: python -m src.processor

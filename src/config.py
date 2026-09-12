@@ -4,7 +4,12 @@ import os
 # === API Keys (從環境變數讀，GitHub Actions 從 Secrets 注入) ===
 NVIDIA_API_KEY      = os.environ.get("NVIDIA_API_KEY", "")
 ASANA_TOKEN         = os.environ.get("ASANA_TOKEN", "")
-ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "462226775624951")
+# 這個 workspace 編號已用目前連接的 Asana 帳戶實際核對。它不是密鑰；
+# Actions variable 可在日後搬 workspace 時覆蓋，空值則必須回到已核對的預設值。
+ASANA_WORKSPACE_GID = (
+    os.environ.get("ASANA_WORKSPACE_GID")
+    or "462226775624951"
+)
 
 # === rclone 路徑 ===
 GDRIVE_INPUT   = "googledrive:From_BrotherDevice"

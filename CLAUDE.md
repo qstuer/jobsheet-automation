@@ -88,7 +88,7 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 流程：
 
 1. 讀 `_SPLIT/` 的單一工作 PDF。
-2. 忠實抄錄訂單號、機身編號候選、型號、醫院/位置、電話、asset 及服務日期。
+2. 忠實抄錄訂單號、機身編號候選、型號、醫院/位置、電話、asset、HAWO/WO 及服務日期。
 3. 在 Asana 找候選工作，再用上述欄位交叉核對。
 4. 上傳 OneDrive，成功後才刪 `_SPLIT/` 來源。
 
@@ -112,9 +112,9 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
 Asana 只找出一小批候選，最後核對在本機完成：
 
-1. 用醫院、產品、機身編號和訂單號分別找候選；電話與 asset 在候選的 Asana 描述中核對。
+1. 用醫院、產品、機身編號、訂單號及 HAWO/WO 分別找候選；電話與 asset 在候選的 Asana 描述中核對。
 2. 校正常見型號小錯字，例如 `EPLQ 5G` 可校正為 `EPIQ 5G`。
-3. 機身編號完全相同仍須日期、電話、asset 或「醫院+型號」支持，避免挑到同一設備的舊工作。
+3. 機身編號完全相同仍須日期、電話、asset、HAWO/WO 或「醫院+型號」支持，避免挑到同一設備的舊工作。
 4. 機身編號只可容許 1 個字的辨認差異；此時至少還要兩組證據支持。
 5. 完成/未完成都可以是正確工作，不能再用「未完成優先」挑選；以單據最近三個月的服務日期為主。
 6. 候選並列、證據不足，或另一個清晰度沒有再次命中同一工作，一律留在 `_PENDING`。
@@ -159,8 +159,8 @@ GitHub Secrets：
 | `RCLONE_CONFIG` | 是 | Google Drive / OneDrive 的 rclone 登入設定（base64） |
 | `NVIDIA_API_KEY` | 是 | 視覺辨認服務 API key |
 | `ASANA_TOKEN` | 是 | Asana 存取權杖 |
-| `ASANA_WORKSPACE_GID` | 是 | Asana workspace 編號 |
 | `NVIDIA_MODEL`（Actions variable） | 否 | 臨時換辨認模型；不填使用程式預設 Nemotron 3 Nano Omni |
+| `ASANA_WORKSPACE_GID`（Actions variable） | 否 | 日後搬 Asana workspace 才覆蓋；不填使用已核對的目前 workspace |
 
 不要把值寫進 repo、日誌或文件。
 
@@ -171,9 +171,9 @@ GitHub Secrets：
 - Jobsheet 是抄錄工作，不需要長篇推理；程式依官方 instruct 設定關閉 thinking，使用 `top_k=1`、1024 輸出上限及較穩定的低溫度。
 - 2026-09-12 用新舊 key 實際測試 Kimi K3，均在回傳任何資料前超時；這只證明 Kimi 免費入口當時不可用，不代表 key 本身無效。
 - 2026-09-12 GitHub `NVIDIA Model Check` run 34628392304：新 key 呼叫 Nemotron 成功，正確讀出假圖片的六位數字並通過 JSON 驗證；測試沒有讀取 Google Drive、Asana 或 OneDrive。
-- 後備為曾成功取得 HTTP 200 的 `meta/llama-3.2-11b-vision-instruct`：一批內首選模型只試一次，失聯後其餘圖片直接用後備，不會每份重等。
-- 每次 NVIDIA 網路等待最多 45 秒，SDK 不做隱藏重試；後備模型最多短重試 1 次，全部失敗時檔案保留在 `_SPLIT`。
-- 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
+- 後備為曾成功取得 HTTP 200 的 `meta/llama-3.2-11b-vision-instruct`：Nemotron 遇到暫時性 503/timeout 會短重試一次才用後備；曾長時間掛起的 Kimi 維持一次即後備。
+- 每次 NVIDIA 網路等待最多 45 秒，SDK 不做隱藏重試；全部模型失敗時檔案保留在 `_SPLIT`。
+- 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、HAWO/WO、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
 - 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
 - 可用 GitHub Actions variable `NVIDIA_MODEL` 暫時覆蓋，不需先改程式；模型名稱不是密鑰，不放 Secrets。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。

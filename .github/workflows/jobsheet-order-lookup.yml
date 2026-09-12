@@ -45,7 +45,7 @@ jobs:
       - name: Look up orders in Asana
         env:
           ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
-          ASANA_WORKSPACE_GID: ${{ secrets.ASANA_WORKSPACE_GID }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
         run: python -m src.order_lookup
       - name: Return result to private Google Drive
         run: >-

@@ -59,6 +59,7 @@ class NvidiaResponseTests(unittest.TestCase):
             "location_raw": None,
             "phone_candidates": [],
             "asset_candidates": [],
+            "work_order_candidates": [],
             "service_date_raw": "10/09/2026",
             "date_source": "ACTION_DATE",
             "unreadable_fields": [],
@@ -150,7 +151,7 @@ class NvidiaResponseTests(unittest.TestCase):
         })
         self.assertNotIn("stream", request)
 
-    def test_any_primary_model_can_use_fallback(self):
+    def test_primary_model_retries_before_using_fallback(self):
         class APITimeoutError(Exception):
             pass
 
@@ -161,13 +162,17 @@ class NvidiaResponseTests(unittest.TestCase):
                     patch.object(
                         nvidia_client,
                         "_call_vision_once",
-                        side_effect=[APITimeoutError("timeout"), "PM"],
+                        side_effect=[
+                            APITimeoutError("timeout"),
+                            APITimeoutError("timeout"),
+                            "PM",
+                        ],
                     ) as call:
                 self.assertEqual(nvidia_client._call_vision("p", "i"), "PM")
 
             self.assertEqual(
                 [item.args[2] for item in call.call_args_list],
-                ["nvidia/primary", "meta/fallback"],
+                ["nvidia/primary", "nvidia/primary", "meta/fallback"],
             )
         finally:
             nvidia_client._unavailable_models.clear()
@@ -264,7 +269,8 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertEqual(set(result), {
             "order_no", "serial_candidates", "product_raw", "customer_raw",
             "location_raw", "phone_candidates", "asset_candidates",
-            "service_date_raw", "date_source", "unreadable_fields",
+            "work_order_candidates", "service_date_raw", "date_source",
+            "unreadable_fields",
             "serial_no", "product", "customer",
         })
 
@@ -336,6 +342,38 @@ class ProcessorConsensusTests(unittest.TestCase):
 
 
 class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_work_order_number_is_used_to_find_candidates(self):
+        with patch.object(asana_client, "_typeahead", return_value=[]) as search:
+            asana_client._gather_pool(
+                None, [], None, None, work_orders=["HAWO 9876543"]
+            )
+
+        search.assert_called_once_with("HAWO 9876543")
+
+    def test_exact_work_order_is_strong_support(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": ["USZ99A1234"],
+            "serial_no": "USZ99A1234",
+            "product": "MODEL Z",
+            "customer": "TESTH",
+            "phone_candidates": [],
+            "asset_candidates": [],
+            "work_order_candidates": ["9876543"],
+            "service_date_raw": None,
+            "date_source": None,
+            "location_raw": None,
+        }
+        task_row = {
+            "gid": "task",
+            "name": "TESTH/ MODEL Z/ USZ99A1234/ HAWO 9876543",
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertEqual("task", task["gid"])
+        self.assertEqual(2, tier)
+
     def test_unique_candidate_without_serial_is_not_auto_matched(self):
         ocr = {
             "order_no": None,

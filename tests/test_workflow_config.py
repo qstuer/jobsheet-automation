@@ -43,6 +43,16 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("jobsheet_file:", text)
         self.assertIn("JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}", text)
 
+    def test_asana_workspace_id_is_not_treated_as_a_secret(self):
+        for workflow_name in (
+            "jobsheet-process.yml", "jobsheet-order-lookup.yml",
+            "jobsheet-asana-audit.yml",
+        ):
+            workflow = ROOT / ".github" / "workflows" / workflow_name
+            text = workflow.read_text(encoding="utf-8")
+            self.assertIn("vars.ASANA_WORKSPACE_GID", text)
+            self.assertNotIn("secrets.ASANA_WORKSPACE_GID", text)
+
 
 if __name__ == "__main__":
     unittest.main()

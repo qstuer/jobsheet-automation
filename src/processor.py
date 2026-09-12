@@ -88,6 +88,7 @@ def _ocr_and_match(doc, job_type):
             key for key in (
                 "order_no", "serial_candidates", "product_raw", "customer_raw",
                 "location_raw", "phone_candidates", "asset_candidates", "service_date_raw",
+                "work_order_candidates",
             )
             if ocr.get(key)
         ]

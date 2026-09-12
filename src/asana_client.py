@@ -173,7 +173,7 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
 
 
 def _gather_pool(order_no, serials, hosp, product,
-                 phones=None, assets=None) -> List[dict]:
+                 phones=None, assets=None, work_orders=None) -> List[dict]:
     """用可見欄位撈候選池；真正的取捨在本機評分，不交給 Asana 猜。"""
     queries: List[str] = []
     if hosp and product:
@@ -186,6 +186,11 @@ def _gather_pool(order_no, serials, hosp, product,
         queries.append(serial)
         if len(serial) >= 8:
             queries.append(serial[:8])
+    # HAWO/WO 是 Philips 服務工作編號，通常會同時寫在工作單和 Asana
+    # 標題/描述。它比手寫醫院名更不易混淆，應直接用來撈候選。
+    for work_order in work_orders or []:
+        if len(re.sub(r"\D", "", work_order)) >= 6:
+            queries.append(work_order)
     # 免費帳戶的 typeahead 主要搜標題，不用電話/asset 逐一打 API；這兩項
     # 留待候選回來後比對 notes，可顯著減少一疊單據造成的 Asana 查詢量。
     queries = list(dict.fromkeys(q for q in queries if q))
@@ -290,6 +295,13 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("asset")
         reasons.append("asset")
 
+    work_orders = [re.sub(r"\D", "", value)
+                   for value in ocr_data.get("work_order_candidates", [])]
+    if any(len(value) >= 6 and value in digits for value in work_orders):
+        score += 60
+        support.add("work_order")
+        reasons.append("HAWO/WO")
+
     hospital_ok = bool(hosp and _norm(name).startswith(_norm(hosp)))
     product_ok = bool(product and _norm(product) in _norm(name))
     if hospital_ok:
@@ -356,8 +368,11 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     hosp     = hospital_core(ocr_data.get("customer"))
     phones = _clean_candidates(ocr_data.get("phone_candidates"))
     assets = _clean_candidates(ocr_data.get("asset_candidates"))
+    work_orders = _clean_candidates(ocr_data.get("work_order_candidates"))
 
-    pool = _gather_pool(order_no, serials, hosp, product, phones, assets)
+    pool = _gather_pool(
+        order_no, serials, hosp, product, phones, assets, work_orders
+    )
     if not pool:
         return None, 0
 
@@ -389,13 +404,17 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     # 工作，分數亦必須拉開。serial 錯一字時要求至少兩組額外證據。
     strong = best["support"]
     if best["serial_dist"] == 0:
-        supported = bool(strong & {"date", "phone", "asset", "hospital+product"})
+        supported = bool(strong & {
+            "date", "phone", "asset", "work_order", "hospital+product"
+        })
         unambiguous = len(scored) == 1 or gap >= 10
         if supported and unambiguous:
             log.info(f"  ✅ Asana 多欄核對命中（{', '.join(best['reasons'])}）")
             return best["task"], 2
     elif best["serial_dist"] <= MAX_SERIAL_DIST:
-        supported = len(strong & {"date", "phone", "asset", "hospital+product"}) >= 2
+        supported = len(strong & {
+            "date", "phone", "asset", "work_order", "hospital+product"
+        }) >= 2
         unambiguous = len(scored) == 1 or gap >= 15
         if supported and unambiguous:
             log.info(f"  ✅ serial 一字模糊但多欄核對命中（{', '.join(best['reasons'])}）")
