@@ -340,6 +340,29 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual("18/8/2026", consensus["service_date_raw"])
         self.assertEqual("ACTION_DATE", consensus["date_source"])
 
+    def test_one_character_serial_disagreement_is_kept_as_two_candidates(self):
+        readings = [
+            {"serial_candidates": ["US915F0726"]},
+            {"serial_candidates": ["US915F072G"]},
+        ]
+
+        consensus = processor._consensus_ocr(readings)
+
+        self.assertEqual(
+            ["US915F0726", "US915F072G"],
+            consensus["serial_candidates"],
+        )
+
+    def test_non_device_words_do_not_gain_fuzzy_serial_consensus(self):
+        readings = [
+            {"serial_candidates": ["SERIAL-A"]},
+            {"serial_candidates": ["SERIAL-B"]},
+        ]
+
+        consensus = processor._consensus_ocr(readings)
+
+        self.assertEqual([], consensus["serial_candidates"])
+
     def test_disputed_serial_is_not_sent_to_asana_as_evidence(self):
         other = dict(self.ocr_a, serial_no="SERIAL-B")
         other["serial_candidates"] = ["SERIAL-B"]
@@ -407,6 +430,18 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             )
 
         search.assert_called_once_with("HAWO 9876543")
+
+    def test_phone_and_long_asset_are_used_to_find_candidates(self):
+        with patch.object(asana_client, "_typeahead", return_value=[]) as search:
+            asana_client._gather_pool(
+                None, [], None, None,
+                phones=["2595 6917"], assets=["19130438"],
+            )
+
+        self.assertEqual(
+            ["25956917", "19130438"],
+            [call.args[0] for call in search.call_args_list],
+        )
 
     def test_exact_work_order_is_strong_support(self):
         ocr = {

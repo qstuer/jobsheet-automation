@@ -264,8 +264,17 @@ def _gather_pool(order_no, serials, hosp, product,
     for work_order in work_orders or []:
         if len(re.sub(r"\D", "", work_order)) >= 6:
             queries.append(work_order)
-    # 免費帳戶的 typeahead 主要搜標題，不用電話/asset 逐一打 API；這兩項
-    # 留待候選回來後比對 notes，可顯著減少一疊單據造成的 Asana 查詢量。
+    # 電話及較長的 asset/WO 有足夠辨識力，也可能存在 Asana 標題或其搜尋
+    # 索引。每類最多查兩個，避免一疊單據造成過多 API 請求；候選回來後
+    # 仍須在完整 task 的標題/描述中精確核對，搜尋結果本身不算命中。
+    for phone in phones or []:
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) == 8:
+            queries.append(digits)
+    for asset in assets or []:
+        digits = re.sub(r"\D", "", asset)
+        if len(digits) >= 6:
+            queries.append(digits)
     queries = list(dict.fromkeys(q for q in queries if q))
     pool: dict = {}
     for q in queries:
@@ -276,7 +285,10 @@ def _gather_pool(order_no, serials, hosp, product,
     compact = list(pool.values())
     # typeahead 排序不是準確度排序。先用候選標題中的可靠 token 排序，再只讀
     # 最相關的一小批完整 task，避免一份單據打數十至數百次 API。
-    tokens = [order_no, hosp, product, *(serials or []), *(work_orders or [])]
+    tokens = [
+        order_no, hosp, product, *(serials or []), *(work_orders or []),
+        *(phones or []), *(assets or []),
+    ]
     tokens = [_norm(token) for token in tokens if token]
     compact.sort(
         key=lambda task: sum(token in _norm(task.get("name") or "") for token in tokens),

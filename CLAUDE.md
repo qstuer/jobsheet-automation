@@ -122,10 +122,11 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
 Asana 只找出一小批候選，最後核對在本機完成：
 
-1. 用醫院、產品、機身編號、訂單號及 HAWO/WO 分別找候選；電話與 asset 在候選的 Asana 描述中核對。
+1. 用醫院、產品、機身編號、訂單號、HAWO/WO、8 位電話及較長 asset 分別找候選；電話與 asset 搜尋只負責擴大候選池，回來後仍須在 Asana 標題/描述中精確核對。
 2. 校正常見型號小錯字，例如 `EPLQ 5G` 可校正為 `EPIQ 5G`。
 3. 候選會再讀完整 task 及所屬 project/section；明確標為 CM/repair 的候選不能配給 PM 紙，反之亦然。
 4. 機身編號完全相同仍須日期、電話、asset、HAWO/WO、「醫院+型號」或相符 project 類型支持，避免挑到同一設備的舊工作。
+   若兩次獨立辨認的 serial 只差一個字元（常見 O/0、6/G），保留兩個候選而不先猜；之後必須再有至少兩項證據，且 Asana 最佳候選明顯領先才可命名。
 5. 機身編號只可容許 1 個字的辨認差異；此時至少還要兩組證據支持。
 6. 完成/未完成都可以是正確工作。`modified_at` 不代表服務日期；優先比較 ACTION DATE 與 Asana 描述、start/due 日期。
    兩輪都抄到相同服務日期時，即使模型漏填 `date_source`，亦視為 ACTION DATE；單輪讀數仍不會採用。

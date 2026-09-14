@@ -103,6 +103,56 @@ def _norm_evidence(value) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
+def _edit_distance(left: str, right: str) -> int:
+    """小型 Levenshtein；只用於比較不同 OCR 輪次的 serial。"""
+    if len(left) > len(right):
+        left, right = right, left
+    previous = list(range(len(left) + 1))
+    for row, right_char in enumerate(right, 1):
+        current = [row]
+        for column, left_char in enumerate(left, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (left_char != right_char),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def _near_serial_consensus(readings: list) -> list:
+    """保留跨輪只差一字的 serial 候選，仍交給 Asana 多欄規則裁決。
+
+    手寫的 O/0、6/G 常令兩次抄錄只差一個字。這裡不自行挑其中一個，
+    而是保留兩個原始候選；後續仍須電話、asset、日期等至少兩項支持。
+    同一輪模型列出的相似候選不算兩次獨立證據。
+    """
+    entries = []
+    for round_index, reading in enumerate(readings):
+        seen_this_round = set()
+        for value in reading.get("serial_candidates") or []:
+            normalized = _norm_evidence(value)
+            plausible = (
+                len(normalized) >= 8
+                and any(char.isalpha() for char in normalized)
+                and any(char.isdigit() for char in normalized)
+            )
+            if plausible and normalized not in seen_this_round:
+                entries.append((round_index, value, normalized))
+                seen_this_round.add(normalized)
+
+    accepted = []
+    for round_index, value, normalized in entries:
+        if any(
+            other_round != round_index
+            and _edit_distance(normalized, other_normalized) <= 1
+            for other_round, _, other_normalized in entries
+        ):
+            if normalized not in {_norm_evidence(item) for item in accepted}:
+                accepted.append(value)
+    return accepted[:3]
+
+
 def _consensus_ocr(readings: list) -> dict:
     """只保留至少兩次獨立抄錄一致的欄位。"""
     if not readings:
@@ -136,6 +186,11 @@ def _consensus_ocr(readings: list) -> dict:
                     buckets.setdefault(key, []).append(value)
                     seen_this_round.add(key)
         result[field] = [values[0] for values in buckets.values() if len(values) >= 2][:3]
+
+    # 完全一致仍是首選；只有沒有 exact 共識時，才接受跨輪只差一字的
+    # serial 候選。這不等於配對成功，Asana 端仍會要求多項額外證據。
+    if not result.get("serial_candidates"):
+        result["serial_candidates"] = _near_serial_consensus(readings)
 
     # prompt 已限定 service_date_raw 只能抄 ACTION DATE。若兩輪對日期本身有
     # 共識、但模型漏填可選的 date_source，不應因此丟掉最能區分同一設備
