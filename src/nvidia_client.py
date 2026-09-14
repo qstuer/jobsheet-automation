@@ -70,6 +70,12 @@ def current_model_name() -> str:
 def get_client() -> OpenAI:
     global _client, _client_identity
     provider, base_url, api_key, _, timeout, _ = _provider_settings()
+    # 從密碼管理器或網頁複製 GitHub Secret 時，末尾很容易連換行一起貼上。
+    # 換行會令 Authorization header 在請求送出前就被 HTTP client 拒絕；
+    # 前後空白可安全移除，但 key 中間若仍有空白，應明確報告設定錯誤。
+    api_key = api_key.strip()
+    if any(char.isspace() for char in api_key):
+        raise RuntimeError(f"{provider.upper()}_API_KEY 內含空白或換行，請重新貼上")
     identity = (provider, base_url, api_key, timeout)
     if _client is None or _client_identity != identity:
         if not api_key:

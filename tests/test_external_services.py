@@ -113,6 +113,37 @@ class NvidiaResponseTests(unittest.TestCase):
             nvidia_client._client = None
             nvidia_client._client_identity = None
 
+    def test_deepseek_key_trims_copy_paste_newline(self):
+        nvidia_client._client = None
+        nvidia_client._client_identity = None
+        try:
+            with patch.object(config, "OCR_PROVIDER", "deepseek"), \
+                    patch.object(config, "DEEPSEEK_API_KEY", "  deepseek-test-key\r\n"), \
+                    patch.object(nvidia_client, "OpenAI") as openai:
+                nvidia_client.get_client()
+
+            openai.assert_called_once_with(
+                base_url=config.DEEPSEEK_BASE_URL,
+                api_key="deepseek-test-key",
+                timeout=config.DEEPSEEK_REQUEST_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        finally:
+            nvidia_client._client = None
+            nvidia_client._client_identity = None
+
+    def test_deepseek_key_rejects_internal_whitespace(self):
+        nvidia_client._client = None
+        nvidia_client._client_identity = None
+        try:
+            with patch.object(config, "OCR_PROVIDER", "deepseek"), \
+                    patch.object(config, "DEEPSEEK_API_KEY", "deepseek bad-key"):
+                with self.assertRaisesRegex(RuntimeError, "內含空白或換行"):
+                    nvidia_client.get_client()
+        finally:
+            nvidia_client._client = None
+            nvidia_client._client_identity = None
+
     def test_deepseek_vision_disables_thinking_and_enforces_json(self):
         response = SimpleNamespace(choices=[SimpleNamespace(
             message=SimpleNamespace(content='{"ok":true}')
