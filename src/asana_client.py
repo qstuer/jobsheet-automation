@@ -575,11 +575,6 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             log.warning("  同一 order number 命中多個 Asana 工作，不自動選擇")
             return None, 0
 
-    if not serials:
-        # serial 是設備身分證；沒有訂單號又讀不到 serial 時，即使候選池只有
-        # 一個也不能只靠醫院/型號自動歸檔，留在 _PENDING。
-        return None, 0
-
     scored = [
         _candidate_score(task, ocr_data, serials, hosp, product, job_type)
         for task in pool
@@ -588,6 +583,19 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     best = scored[0]
     runner_score = scored[1]["score"] if len(scored) > 1 else -1
     gap = best["score"] - runner_score
+
+    if not serials:
+        # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。
+        # 此時只接受唯一候選，而且完整 task 必須同時精確包含電話、asset
+        # 及最近 ACTION DATE。三項來自不同欄位，不能只靠醫院/型號猜。
+        required = {"phone", "asset", "date"}
+        if len(scored) == 1 and required.issubset(best["support"]):
+            log.info(
+                f"  ✅ serial 未形成共識，但電話、asset、日期唯一命中"
+                f"（{', '.join(best['reasons'])}）"
+            )
+            return best["task"], 2
+        return None, 0
 
     # 同一設備在 Asana 會有很多歷史工作；完成狀態不是新舊依據。
     # serial 完全一致仍須日期/電話/asset，或醫院+型號一起支持；若有並列歷史

@@ -483,6 +483,53 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         self.assertIsNone(task)
         self.assertEqual(tier, 0)
 
+    def test_unique_candidate_can_match_without_serial_on_phone_asset_and_date(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": [],
+            "serial_no": None,
+            "product": "Affiniti 70",
+            "customer": "PYN",
+            "phone_candidates": ["25956917"],
+            "asset_candidates": ["19130438"],
+            "service_date_raw": "18/8/2026",
+            "date_source": "ACTION_DATE",
+        }
+        task_row = {
+            "gid": "task",
+            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
+            "notes": "Phone 25956917; Asset 19130438",
+            "due_on": "2026-08-18",
+            "memberships": [{"project": {"name": "2026 PM"}}],
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertEqual("task", task["gid"])
+        self.assertEqual(2, tier)
+
+    def test_serialless_match_needs_all_three_strong_fields(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": [],
+            "serial_no": None,
+            "phone_candidates": ["25956917"],
+            "asset_candidates": ["19130438"],
+            "service_date_raw": None,
+            "date_source": None,
+        }
+        task_row = {
+            "gid": "task",
+            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
+            "notes": "Phone 25956917; Asset 19130438",
+            "memberships": [{"project": {"name": "2026 PM"}}],
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertIsNone(task)
+        self.assertEqual(0, tier)
+
     def test_completed_recent_task_beats_future_incomplete_task(self):
         ocr = {
             "order_no": None,
