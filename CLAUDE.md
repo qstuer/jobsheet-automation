@@ -89,6 +89,8 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
 手動 Stage B 可填 `jobsheet_file`，並選 `source_queue=split|pending`。`dry_run=true` 時必須指定單檔，只做 OCR/Asana 查詢，不移動 Google Drive、不寫 OneDrive、不更新報告。
 
+若人員已逐頁核對原檔及正確名稱，可在同一個單檔模式填 `confirmed_filename`（不含 `.pdf`）。此救援模式只處理指定 PDF，跳過 OCR/Asana；Windows/OneDrive 禁用的 `/` 等字元會轉成 ` - `。沒有同時指定 `jobsheet_file` 時程式拒絕執行，不能用它批量改名。
+
 新掃描尚在入口時，使用獨立的 `Jobsheet Safe Dry Run` workflow，填完整原始 PDF 檔名。它在 runner 臨時目錄切頁、檢查完整性、OCR 及查 Asana，結束後不留下任何雲端改動，也不會觸發正式 Stage B。
 
 流程：

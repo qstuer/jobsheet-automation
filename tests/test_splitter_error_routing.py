@@ -179,6 +179,33 @@ class VariableLengthSplitTests(unittest.TestCase):
 
 
 class ProcessorPendingTests(unittest.TestCase):
+    def test_confirmed_single_file_bypasses_ocr_and_uses_safe_name(self):
+        filename = "scan__job3_PM.pdf"
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.object(processor.rclone_helper, "download"), \
+                patch.object(processor, "_ocr_and_match") as ocr, \
+                patch.object(processor.rclone_helper, "upload_unique", return_value={
+                    "disposition": "uploaded",
+                    "filename": "Tung Wah Hospital - Affiniti 70 - SZN22F1275.pdf",
+                }) as upload, \
+                patch.object(processor, "_manifest_for_job", return_value={"jobs": []}), \
+                patch.object(processor, "_save_result"), \
+                patch.object(processor.rclone_helper, "delete") as delete:
+            result = processor._process_split_file(
+                filename,
+                Path(tmpdir),
+                source_folder=config.GDRIVE_PENDING,
+                confirmed_filename="Tung Wah Hospital/ Affiniti 70/ SZN22F1275",
+            )
+
+        ocr.assert_not_called()
+        self.assertEqual(
+            "Tung Wah Hospital - Affiniti 70 - SZN22F1275.pdf",
+            upload.call_args.args[2],
+        )
+        delete.assert_called_once_with(f"{config.GDRIVE_PENDING}/{filename}")
+        self.assertEqual("完成（人工確認）", result["status"])
+
     def test_uncertain_match_moves_only_to_pending_and_never_onedrive(self):
         filename = "scan__job1_PM.pdf"
         fake_open = MagicMock()

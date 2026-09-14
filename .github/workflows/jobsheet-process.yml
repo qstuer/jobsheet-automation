@@ -24,6 +24,10 @@ on:
         required: true
         default: false
         type: boolean
+      confirmed_filename:
+        description: '人工已核對的確定檔名（不含 .pdf）；只可配合指定單檔使用'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -82,6 +86,7 @@ jobs:
           JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}
           JOBSHEET_SOURCE_QUEUE: ${{ inputs.source_queue || 'split' }}
           JOBSHEET_DRY_RUN:      ${{ inputs.dry_run || 'false' }}
+          JOBSHEET_CONFIRMED_FILENAME: ${{ inputs.confirmed_filename }}
         run: python -m src.processor
       - name: Cleanup rclone config
         if: always()

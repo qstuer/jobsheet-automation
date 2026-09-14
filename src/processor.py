@@ -32,6 +32,7 @@ log = logging.getLogger("processor")
 TARGET_FILE_ENV = "JOBSHEET_TARGET_FILE"
 DRY_RUN_ENV = config.JOBSHEET_DRY_RUN_ENV
 SOURCE_QUEUE_ENV = config.JOBSHEET_SOURCE_QUEUE_ENV
+CONFIRMED_FILENAME_ENV = "JOBSHEET_CONFIRMED_FILENAME"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -66,6 +67,40 @@ def _planned_filename(task: dict) -> tuple[str, str]:
     if order_no:
         return f"SR#{order_no}.pdf", order_no
     return f"{asana_client.get_safe_title(task)}.pdf", ""
+
+
+def _confirmed_pdf_name(value: str) -> str:
+    """把人工逐頁核對的名稱轉成 OneDrive 可接受的單一 PDF 檔名。"""
+    name = (value or "").strip()
+    if name.lower().endswith(".pdf"):
+        name = name[:-4]
+    safe = asana_client.get_safe_title({"name": name})
+    if not safe or safe == "Unknown":
+        raise ValueError("人工確認檔名不可為空")
+    return f"{safe}.pdf"
+
+
+def _finalize_confirmed(local_pdf: Path, confirmed_filename: str,
+                        source_name: str) -> dict:
+    """人工已看過原檔時的單檔救援；不經 OCR/Asana 猜名。"""
+    planned = _confirmed_pdf_name(confirmed_filename)
+    uploaded = rclone_helper.upload_unique(
+        local_pdf, config.ONEDRIVE_OUTPUT, planned, _USED_NAMES,
+        source_name=source_name, return_details=True,
+    )
+    log.info("  ↑ OneDrive 上傳完成（已用人工確認名稱）")
+    disposition = uploaded["disposition"]
+    return {
+        "status": {
+            "uploaded": "完成（人工確認）",
+            "already_exists": "已存在（人工確認，沒有重複上傳）",
+            "versioned": "完成（人工確認，保留重掃版本）",
+        }[disposition],
+        "state": disposition,
+        "onedrive": uploaded["filename"],
+        "planned": planned,
+        "confirmed": True,
+    }
 
 
 def _finalize_match(local_pdf: Path, task: dict, tier: int,
@@ -322,11 +357,32 @@ def _save_result(work_dir: Path, manifest: dict, filename: str,
 
 def _process_split_file(filename: str, work_dir: Path,
                         source_folder: str = None,
-                        dry_run: bool = False) -> dict:
+                        dry_run: bool = False,
+                        confirmed_filename: str = "") -> dict:
     source_folder = source_folder or config.GDRIVE_SPLIT
     remote = f"{source_folder}/{filename}"
     local = work_dir / filename
     rclone_helper.download(remote, local)
+
+    if confirmed_filename:
+        planned = _confirmed_pdf_name(confirmed_filename)
+        if dry_run:
+            local.unlink(missing_ok=True)
+            return {
+                "status": "預覽：使用人工確認名稱",
+                "planned": planned,
+                "confirmed": True,
+            }
+        result = _finalize_confirmed(local, confirmed_filename, filename)
+        manifest = _manifest_for_job(work_dir, filename)
+        _save_result(
+            work_dir, manifest, filename, result["state"],
+            onedrive=result.get("onedrive"), confirmed=True,
+        )
+        # 與自動配對相同：先記錄成功，最後才刪 Google Drive 來源。
+        rclone_helper.delete(remote)
+        local.unlink(missing_ok=True)
+        return result
 
     job_type = _parse_job_type(filename)
     try:
@@ -432,8 +488,12 @@ def main() -> int:
         log.info(f"{source_queue.upper()} 待處理 job 數：{len(splits)}")
         target = os.environ.get(TARGET_FILE_ENV, "").strip()
         dry_run = os.environ.get(DRY_RUN_ENV, "").strip().lower() in {"1", "true", "yes"}
+        confirmed_filename = os.environ.get(CONFIRMED_FILENAME_ENV, "").strip()
         if dry_run and not target:
             log.error("dry-run 必須精確指定一份 jobsheet_file，沒有處理任何檔案")
+            return 1
+        if confirmed_filename and not target:
+            log.error("人工確認檔名必須精確指定一份 jobsheet_file")
             return 1
         if target:
             # 手動測試時必須精確指定 _SPLIT 根目錄內的一個 PDF；不接受
@@ -454,7 +514,8 @@ def main() -> int:
                 main_report.append({
                     "file": filename,
                     **_process_split_file(
-                        filename, work_dir, source_folder=source_folder, dry_run=dry_run
+                        filename, work_dir, source_folder=source_folder, dry_run=dry_run,
+                        confirmed_filename=confirmed_filename,
                     ),
                 })
             except Exception as e:
