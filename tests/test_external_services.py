@@ -328,6 +328,17 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual(tier, 2)
         self.assertEqual(ocr.call_count, 2)
 
+    def test_repeated_service_date_is_treated_as_action_date_when_source_is_omitted(self):
+        readings = [
+            {"service_date_raw": "18/8/2026", "date_source": None},
+            {"service_date_raw": "18/8/2026", "date_source": None},
+        ]
+
+        consensus = processor._consensus_ocr(readings)
+
+        self.assertEqual("18/8/2026", consensus["service_date_raw"])
+        self.assertEqual("ACTION_DATE", consensus["date_source"])
+
     def test_disputed_serial_is_not_sent_to_asana_as_evidence(self):
         other = dict(self.ocr_a, serial_no="SERIAL-B")
         other["serial_candidates"] = ["SERIAL-B"]

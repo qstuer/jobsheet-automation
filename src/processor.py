@@ -137,6 +137,12 @@ def _consensus_ocr(readings: list) -> dict:
                     seen_this_round.add(key)
         result[field] = [values[0] for values in buckets.values() if len(values) >= 2][:3]
 
+    # prompt 已限定 service_date_raw 只能抄 ACTION DATE。若兩輪對日期本身有
+    # 共識、但模型漏填可選的 date_source，不應因此丟掉最能區分同一設備
+    # 不同月份 PM 的證據。單輪日期仍不會通過上方共識。
+    if result.get("service_date_raw") and not result.get("date_source"):
+        result["date_source"] = "ACTION_DATE"
+
     result["serial_no"] = next(iter(result.get("serial_candidates", [])), None)
     result["product"] = result.get("product_raw")
     result["customer"] = result.get("customer_raw")
