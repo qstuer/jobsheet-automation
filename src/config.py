@@ -18,6 +18,12 @@ GDRIVE_SPLIT   = "googledrive:From_BrotherDevice/_SPLIT"
 # 切割失敗（頁數驗算不過）整份原檔搬來這，等人工審查
 GDRIVE_SPLIT_FAILED = "googledrive:From_BrotherDevice/_SPLIT_FAILED"
 GDRIVE_PENDING = "googledrive:From_BrotherDevice/_PENDING"
+# 掃描器已漏頁，但工作單邊界仍可安全分辨。與 _SPLIT_FAILED 分開，避免把
+# 「需要重掃」誤說成「切頁程式失敗」。
+GDRIVE_INCOMPLETE = "googledrive:From_BrotherDevice/_INCOMPLETE"
+GDRIVE_INCOMPLETE_RAW = "googledrive:From_BrotherDevice/_INCOMPLETE_RAW"
+# 每個原始掃描一份 JSON 狀態；Apps Script 只會為需要人工處理的完成報告寄信。
+GDRIVE_REPORTS = "googledrive:From_BrotherDevice/_REPORTS"
 ONEDRIVE_OUTPUT = "onedrive:Hong Kong Sen's Healthcare/JOBSHEETS"
 
 # === Google Drive Folder IDs (給 Apps Script 用) ===
@@ -41,6 +47,11 @@ NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
 # Jobsheet 只要忠實抄錄，不需要模型展示推理過程。
 NEMOTRON_INSTRUCT_MAX_TOKENS = 1024
 
+# 後備視覺模型有時會先加一小段說明；300 token 可能在完整 JSON 結束前
+# 截斷，造成「HTTP 200 但沒有完整 JSON」。所有 JSON OCR 至少保留這個
+# 輸出空間，最後仍由本機 parser 嚴格驗證，不會接受散文猜測。
+NVIDIA_JSON_MAX_TOKENS = 1024
+
 # Kimi K3 會先推理再給最後答案；過小的 max_tokens 可能只留下推理、沒有
 # JSON/CM/PM 結果。保留相容設定，供 Actions variable 臨時改回 Kimi 時使用。
 KIMI_TEXT_MAX_TOKENS = 1024
@@ -49,6 +60,7 @@ KIMI_STREAM_MAX_SECONDS = 90.0
 
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"
+ASANA_MAX_HYDRATED_CANDIDATES = 40
 
 # === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
 OCR_ZOOM_DEFAULT  = 2.0   # 手寫細字至少 2x，避免低解像度下用猜的
@@ -58,9 +70,11 @@ OCR_CROP_BOTTOM   = 0.56  # 裁到 56%，把聯絡電話、日期及 asset 一�
 OCR_CONTRAST      = 2.0   # 對比加強倍數
 
 # === OCR 多輪交叉核對 ===
-# 同一個 Asana 工作至少要在兩個不同解像度都命中才接受；只命中一次便標成待核對。
+# 至少兩個不同解像度要抄出相同欄位，才把共識資料送去 Asana。
 OCR_RETRY_ZOOMS = [2.0, 2.5, 3.0]
 OCR_MATCH_CONFIRMATIONS = 2
+# 圖片服務連續幾輪工作仍失敗後，停止無限重跑並轉 _PENDING。
+OCR_MAX_BATCH_ATTEMPTS = 3
 
 # === CM/PM 偵測專用裁切（JOB NATURE 欄）===
 # 用戶實測座標：JOB NATURE 那一格在 縱向 10%-17%、橫向 70%-95%
@@ -87,9 +101,24 @@ PM_KEEP_OFFSETS   = [0, 2, 3, 4]     # 相對於 Job 起始頁的偏移
 CONTENT_DARK_PIXEL_THRESHOLD = 200
 CONTENT_MIN_DARK_RATIO = 0.03
 
+# PM 成品必須是工作單 + checklist 1/2/3，共四張有內容頁。頁面數正確但
+# checklist 互相近乎相同時亦視為掃描可疑（常見於雙面送紙重複）。
+CM_EXPECTED_CONTENT_PAGES = 1
+PM_EXPECTED_CONTENT_PAGES = 4
+DUPLICATE_PAGE_MAX_HASH_RATIO = 0.015
+
+# PDF 重新編碼會令 SHA-256 不同；用低解像度 dHash 比較實際頁面內容。
+PDF_VISUAL_HASH_SIZE = 16
+PDF_VISUAL_MAX_HASH_RATIO = 0.025
+
 # 工作單首頁的固定印刷版面會彼此相似，checklist 則明顯不同。先做本機版面
 # 比對，通過後才讓視覺模型讀 CM/PM，可避免模型在 checklist 上猜到 PM。
 JOBSHEET_LAYOUT_WIDTH = 96
 JOBSHEET_LAYOUT_HEIGHT = 128
 JOBSHEET_LAYOUT_DARK_THRESHOLD = 210
 JOBSHEET_LAYOUT_MIN_DICE = 0.35
+
+# 單檔安全測試。dry-run 必須同時指定一個檔案，且不移動／刪除雲端檔案、
+# 不寫 OneDrive、也不更新批次狀態。
+JOBSHEET_DRY_RUN_ENV = "JOBSHEET_DRY_RUN"
+JOBSHEET_SOURCE_QUEUE_ENV = "JOBSHEET_SOURCE_QUEUE"

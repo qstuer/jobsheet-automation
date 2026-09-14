@@ -8,9 +8,22 @@ on:
   workflow_dispatch:
     inputs:
       jobsheet_file:
-        description: '只處理 _SPLIT 內這一份 PDF；留空才處理全部'
+        description: '只處理指定資料夾內這一份 PDF；留空才處理全部'
         required: false
         type: string
+      source_queue:
+        description: '檔案所在位置'
+        required: true
+        default: split
+        type: choice
+        options:
+          - split
+          - pending
+      dry_run:
+        description: '只辨認及核對，不移動檔案、不寫入 OneDrive'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -67,6 +80,8 @@ jobs:
           ASANA_WORKSPACE_GID:  ${{ vars.ASANA_WORKSPACE_GID }}
           # 手動測試可指定一份；Stage A 自動接力時此值為空，維持正常批次。
           JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}
+          JOBSHEET_SOURCE_QUEUE: ${{ inputs.source_queue || 'split' }}
+          JOBSHEET_DRY_RUN:      ${{ inputs.dry_run || 'false' }}
         run: python -m src.processor
       - name: Cleanup rclone config
         if: always()

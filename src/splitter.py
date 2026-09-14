@@ -21,7 +21,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import config, pdf_utils, rclone_helper
+from . import batch_state, config, pdf_utils, rclone_helper
 from .pdf_utils import SplitError
 
 logging.basicConfig(level=logging.INFO,
@@ -51,23 +51,48 @@ def _split_one(filename: str, work_dir: Path) -> dict:
         f"{[(j['type'], j['input_pages'], len(j['keep_pages'])) for j in jobs]}"
     )
 
-    # ── 逐 job 抽頁 → 上傳 _SPLIT ──
+    # ── 逐 job 抽頁；完整才進 _SPLIT，缺頁直接隔離 ──
     stem = Path(filename).stem
     uploaded = []
+    incomplete = []
     for idx, job in enumerate(jobs, 1):
         out_name = f"{stem}__job{idx}_{job['type']}.pdf"
+        job["output_name"] = out_name
         out_path = work_dir / out_name
         pdf_utils.extract_pages(local_pdf, job["keep_pages"], out_path)
-        rclone_helper.upload(out_path, f"{config.GDRIVE_SPLIT}/{out_name}")
+        if job["complete"]:
+            destination = f"{config.GDRIVE_SPLIT}/{out_name}"
+            uploaded.append(out_name)
+            log.info(f"    → _SPLIT/{out_name}")
+        else:
+            destination = f"{config.GDRIVE_INCOMPLETE}/{out_name}"
+            incomplete.append(out_name)
+            log.warning(
+                f"    ⚠ → _INCOMPLETE/{out_name}：{job['incomplete_reason']}"
+            )
+        rclone_helper.upload(out_path, destination)
         out_path.unlink(missing_ok=True)
-        uploaded.append(out_name)
-        log.info(f"    → _SPLIT/{out_name}")
 
-    # ── 全部 job 上傳成功，才刪原檔 ──
-    rclone_helper.delete(src_remote)
+    # 狀態檔是之後重試、防重複及通知的唯一依據。寫入成功後才處理原檔。
+    source_pages = max((job["end"] for job in jobs), default=0)
+    manifest = batch_state.new_manifest(filename, source_pages, jobs)
+    batch_state.save(work_dir, manifest)
+
+    # 有任何缺頁時保留原始整批掃描作查證，但移離入口，避免每五分鐘重跑。
+    if incomplete:
+        rclone_helper.moveto(
+            src_remote, f"{config.GDRIVE_INCOMPLETE_RAW}/{filename}"
+        )
+    else:
+        rclone_helper.delete(src_remote)
     local_pdf.unlink(missing_ok=True)
-    return {"file": filename, "status": "切割完成",
-            "jobs": len(jobs), "uploaded": uploaded}
+    return {
+        "file": filename,
+        "status": "切割完成" if not incomplete else "切割完成（有缺頁）",
+        "jobs": len(jobs),
+        "uploaded": uploaded,
+        "incomplete": incomplete,
+    }
 
 
 def main() -> int:

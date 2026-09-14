@@ -5,9 +5,14 @@
 """
 import hashlib
 import json
+import re
 import subprocess
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+
+from . import pdf_identity
 
 
 class RcloneError(Exception):
@@ -59,6 +64,18 @@ def list_pending(remote_path: str, prefix: str = "PENDING_") -> List[str]:
         for line in output.splitlines()
         if line.strip() and not line.strip().endswith("/")
     ]
+
+
+def list_files(remote_path: str, include: str = "*") -> List[str]:
+    """列出資料夾根層指定 pattern 的檔案。"""
+    args = (
+        "lsf", remote_path, "--include", include, "--files-only", "--max-depth", "1"
+    )
+    result = run_result(*args)
+    if result.returncode == 3:
+        return []
+    _raise_for_result(args, result)
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def download(remote_file: str, local_path: Path) -> None:
@@ -113,7 +130,7 @@ def remote_matches(local_path: Path, remote_file: str, stat: dict = None) -> boo
     """比較本機與遠端檔案內容。
 
     只在目的檔名已存在時使用。先比大小，再請 rclone 下載計算 SHA-256；
-    這讓「已上傳成功、但來源刪除失敗」的重跑能認出同一份檔案，不會再生 (1)。
+    這讓「已上傳成功、但來源刪除失敗」的重跑先用最快方式認出同一份檔案。
     """
     stat = stat if stat is not None else remote_stat(remote_file)
     if stat is None or stat.get("IsDir"):
@@ -126,11 +143,32 @@ def remote_matches(local_path: Path, remote_file: str, stat: dict = None) -> boo
     return bool(remote_hash) and remote_hash == _sha256_local(local_path)
 
 
+def remote_visually_matches(local_path: Path, remote_file: str) -> bool:
+    """下載單一碰撞檔作頁面比較；只在同名檔已存在時使用。"""
+    with tempfile.TemporaryDirectory(prefix="jobsheet_compare_") as tmpdir:
+        remote_copy = Path(tmpdir) / "remote.pdf"
+        download(remote_file, remote_copy)
+        try:
+            return pdf_identity.visually_same_pdf(local_path, remote_copy)
+        except (ValueError, RuntimeError):
+            # PDF 本身損壞時不可當成相同；保留兩個版本比覆蓋安全。
+            return False
+
+
+def _version_tag_from_name(source_name: str = None) -> str:
+    match = re.search(r"(?<!\d)(20\d{12})(?!\d)", source_name or "")
+    if match:
+        return f"{match.group(1)[:8]}-{match.group(1)[8:12]}"
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+
+
 def upload_unique(local_path: Path, folder: str, filename: str,
-                  seen: set = None) -> str:
-    """防撞名上傳：若 filename 在本輪已用過、或 OneDrive 上已存在同名，
-    就在副檔名前自動加 (1)、(2)... 直到不撞名為止，避免 copyto 把前一份靜默蓋掉。
-    回傳「實際使用」的檔名（給報告與日誌用）。
+                  seen: set = None, source_name: str = None,
+                  return_details: bool = False):
+    """安全上傳並分辨「相同內容」與「同名的新版本」。
+
+    同名且 SHA-256 或頁面視覺內容相同時沿用既有檔；內容不同時使用穩定的
+    ``_重掃_YYYYMMDD-HHMM`` 名稱，避免難以追查的 ``(1)``。
 
     seen：本輪已配發過的檔名集合（同一次執行內先佔先得，不必等雲端寫入生效）。
     """
@@ -143,11 +181,16 @@ def upload_unique(local_path: Path, folder: str, filename: str,
         stem, suffix = filename, ""
 
     candidate = filename
+    version_tag = _version_tag_from_name(source_name)
+    version_stem = f"{stem}_重掃_{version_tag}"
     n = 0
     while True:
         if candidate in seen:
             n += 1
-            candidate = f"{stem} ({n}){suffix}"
+            candidate = (
+                f"{version_stem}{suffix}" if n == 1
+                else f"{version_stem}_{n}{suffix}"
+            )
             continue
 
         remote_file = f"{folder}/{candidate}"
@@ -155,16 +198,27 @@ def upload_unique(local_path: Path, folder: str, filename: str,
         if stat is None:
             run("copyto", str(local_path), remote_file)
             seen.add(candidate)
-            return candidate
+            result = {
+                "filename": candidate,
+                "disposition": "uploaded" if candidate == filename else "versioned",
+            }
+            return result if return_details else candidate
 
         # 上一輪可能已完成上傳，只在刪除 Google Drive 來源時失敗。
         # 內容相同就直接沿用原檔名，不重複上傳。
-        if remote_matches(local_path, remote_file, stat=stat):
+        if (
+            remote_matches(local_path, remote_file, stat=stat)
+            or remote_visually_matches(local_path, remote_file)
+        ):
             seen.add(candidate)
-            return candidate
+            result = {"filename": candidate, "disposition": "already_exists"}
+            return result if return_details else candidate
 
         n += 1
-        candidate = f"{stem} ({n}){suffix}"
+        candidate = (
+            f"{version_stem}{suffix}" if n == 1
+            else f"{version_stem}_{n}{suffix}"
+        )
 
 
 def delete(remote_file: str) -> None:

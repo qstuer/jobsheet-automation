@@ -1,0 +1,53 @@
+name: Jobsheet Safe Dry Run
+
+# 手動指定 Google Drive 入口的一份原始 PDF。只下載、切頁預覽、OCR 及查 Asana；
+# 不移動 Google Drive、不寫 OneDrive，亦不會觸發正式 Stage B。
+on:
+  workflow_dispatch:
+    inputs:
+      raw_file:
+        description: 'From_BrotherDevice 根目錄內的完整 PDF 檔名'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - run: pip install -r requirements.txt
+      - name: Inspect one raw scan without cloud writes
+        env:
+          JOBSHEET_RAW_FILE:    ${{ inputs.raw_file }}
+          NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID:  ${{ vars.ASANA_WORKSPACE_GID }}
+        run: python -m src.dry_run
+      - name: Cleanup rclone config
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true

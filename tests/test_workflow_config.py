@@ -42,6 +42,17 @@ class WorkflowConfigTests(unittest.TestCase):
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("jobsheet_file:", text)
         self.assertIn("JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}", text)
+        self.assertIn("source_queue:", text)
+        self.assertIn("dry_run:", text)
+        self.assertIn("JOBSHEET_DRY_RUN:", text)
+
+    def test_raw_dry_run_is_separate_and_cannot_trigger_stage_b(self):
+        workflow = ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertNotIn("repository_dispatch", text)
+        self.assertNotIn("jobsheet-process", text.lower())
+        self.assertIn("python -m src.dry_run", text)
 
     def test_asana_workspace_id_is_not_treated_as_a_secret(self):
         for workflow_name in (
@@ -52,6 +63,21 @@ class WorkflowConfigTests(unittest.TestCase):
             text = workflow.read_text(encoding="utf-8")
             self.assertIn("vars.ASANA_WORKSPACE_GID", text)
             self.assertNotIn("secrets.ASANA_WORKSPACE_GID", text)
+
+
+class AppsScriptSafetyTests(unittest.TestCase):
+    def test_dispatch_busy_state_is_checked_before_and_after_upload_wait(self):
+        text = (ROOT / "apps_script" / "trigger.gs").read_text(encoding="utf-8")
+        self.assertEqual(2, text.count("if (isPipelineBusy(pat))"))
+        self.assertIn("changedDuringWait", text)
+
+    def test_batch_email_is_marked_before_report_is_moved(self):
+        text = (ROOT / "apps_script" / "trigger.gs").read_text(encoding="utf-8")
+        marked = text.index("props.setProperty(sentMarker")
+        moved = text.index("file.moveTo(sent)")
+        cleared = text.index("props.deleteProperty(sentMarker)")
+        self.assertLess(marked, moved)
+        self.assertLess(moved, cleared)
 
 
 if __name__ == "__main__":

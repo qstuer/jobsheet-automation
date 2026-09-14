@@ -16,6 +16,7 @@ from src import asana_client, config, nvidia_client, processor
 class AsanaFailureTests(unittest.TestCase):
     def setUp(self):
         asana_client._typeahead_cache.clear()
+        asana_client._task_cache.clear()
 
     def test_auth_failure_raises_instead_of_returning_no_match(self):
         response = MagicMock(status_code=401, headers={})
@@ -53,7 +54,7 @@ class NvidiaResponseTests(unittest.TestCase):
     def _payload(**overrides):
         data = {
             "order_no": None,
-            "serial_candidates": ["US123"],
+            "serial_candidates": ["US1234"],
             "product_raw": "CX50",
             "customer_raw": "HKCH",
             "location_raw": None,
@@ -151,6 +152,22 @@ class NvidiaResponseTests(unittest.TestCase):
         })
         self.assertNotIn("stream", request)
 
+    def test_fallback_json_has_enough_space_to_finish(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"ok":true}')
+        )])
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch.object(nvidia_client, "get_client", return_value=client):
+            result = nvidia_client._call_vision_once(
+                "prompt", "image", "meta/fallback", 300, expects_json=True
+            )
+
+        self.assertEqual('{"ok":true}', result)
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["max_tokens"], config.NVIDIA_JSON_MAX_TOKENS)
+
     def test_primary_model_retries_before_using_fallback(self):
         class APITimeoutError(Exception):
             pass
@@ -228,7 +245,7 @@ class NvidiaResponseTests(unittest.TestCase):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         self.assertIsNone(result["order_no"])
-        self.assertEqual(result["serial_no"], "US123")
+        self.assertEqual(result["serial_no"], "US1234")
 
     def test_unrelated_json_before_ocr_json_is_skipped(self):
         wrapped = (
@@ -240,7 +257,7 @@ class NvidiaResponseTests(unittest.TestCase):
                 patch.object(nvidia_client, "_call_vision", return_value=wrapped):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
-        self.assertEqual(result["serial_no"], "US123")
+        self.assertEqual(result["serial_no"], "US1234")
 
     def test_non_text_ocr_field_is_rejected(self):
         invalid = self._payload(order_no=12345678)
@@ -311,34 +328,32 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual(tier, 2)
         self.assertEqual(ocr.call_count, 2)
 
-    def test_single_match_is_not_accepted(self):
+    def test_disputed_serial_is_not_sent_to_asana_as_evidence(self):
+        other = dict(self.ocr_a, serial_no="SERIAL-B")
+        other["serial_candidates"] = ["SERIAL-B"]
+        first = dict(self.ocr_a, serial_candidates=["SERIAL-A"])
+        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
+                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
+                patch.object(nvidia_client, "ocr_jobsheet_fields",
+                             side_effect=[first, other, other]), \
+                patch.object(asana_client, "find_task", return_value=(None, 0)) as find:
+            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertIsNone(matched)
+        self.assertEqual(tier, 0)
+        self.assertNotIn("SERIAL-A", find.call_args.args[0].get("serial_candidates", []))
+
+    def test_asana_is_not_called_before_two_ocr_readings(self):
         task = {"gid": "task-1", "name": "Task 1"}
         with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
                 patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
                 patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[self.ocr_a, self.ocr_a, self.ocr_a]), \
-                patch.object(asana_client, "find_task",
-                             side_effect=[(task, 2), (None, 0), (None, 0)]):
+                             side_effect=[self.ocr_a, self.ocr_a]), \
+                patch.object(asana_client, "find_task", return_value=(task, 2)) as find:
             matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
 
-        self.assertIsNone(matched)
-        self.assertEqual(tier, 0)
-
-    def test_two_different_tasks_are_not_accepted(self):
-        tasks = [
-            ({"gid": "task-1", "name": "Task 1"}, 2),
-            ({"gid": "task-2", "name": "Task 2"}, 2),
-            (None, 0),
-        ]
-        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
-                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
-                patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[self.ocr_a, self.ocr_a, self.ocr_a]), \
-                patch.object(asana_client, "find_task", side_effect=tasks):
-            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
-
-        self.assertIsNone(matched)
-        self.assertEqual(tier, 0)
+        self.assertEqual("task-1", matched["gid"])
+        find.assert_called_once()
 
 
 class AsanaMatchSafetyTests(unittest.TestCase):
@@ -439,6 +454,53 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             task, tier = asana_client.find_task(supported, job_type="PM")
         self.assertEqual("task", task["gid"])
         self.assertEqual(2, tier)
+
+    def test_pm_sheet_rejects_explicit_cm_project(self):
+        ocr = {
+            "order_no": "61947879",
+            "serial_candidates": ["US519F0836"],
+            "serial_no": "US519F0836",
+            "product": "Affiniti 70",
+            "customer": "HKCH",
+        }
+        cm_task = {
+            "gid": "repair",
+            "name": "HKCH Affiniti 70 US519F0836 61947879",
+            "memberships": [{"project": {"name": "Corrective Maintenance"}}],
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[cm_task]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+        self.assertIsNone(task)
+        self.assertEqual(0, tier)
+
+    def test_known_pm_project_is_matching_evidence(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": ["US519F0836"],
+            "serial_no": "US519F0836",
+            "product": None,
+            "customer": None,
+        }
+        pm_task = {
+            "gid": "pm",
+            "name": "HKCH Affiniti 70 US519F0836",
+            "memberships": [{"project": {"name": "2026 PM"}}],
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[pm_task]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+        self.assertEqual("pm", task["gid"])
+        self.assertEqual(2, tier)
+
+    def test_unknown_short_hospital_code_is_not_used(self):
+        self.assertIsNone(asana_client.hospital_core("KWM"))
+        self.assertIsNone(asana_client.hospital_core("PYTV-6F"))
+        self.assertEqual("QMH", asana_client.hospital_core("Queen Mary Hospital"))
+
+    def test_safe_title_removes_trailing_separators(self):
+        title = asana_client.get_safe_title({
+            "name": "PYNEH, EPIQ Elite / US622B1115/ "
+        })
+        self.assertEqual("PYNEH, EPIQ Elite - US622B1115", title)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,34 @@ MAX_SERIAL_DIST = 1   # serial 錯一字才可考慮，而且仍須其他欄位�
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 
 _typeahead_cache: dict = {}
+_task_cache: dict = {}
+
+# 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
+# 與配對證據；完整的私人機構名稱仍可保留使用。
+HOSPITAL_ALIASES = {
+    "QMH": "QMH",
+    "QUEENMARYHOSPITAL": "QMH",
+    "QEH": "QEH",
+    "QUEENELIZABETHHOSPITAL": "QEH",
+    "KWH": "KWH",
+    "KWONGWAHHOSPITAL": "KWH",
+    "KH": "KH",
+    "KOWLOONHOSPITAL": "KH",
+    "PYNEH": "PYNEH",
+    "PAMELAYOUDENETHERSOLEEASTERNHOSPITAL": "PYNEH",
+    "PMH": "PMH",
+    "PRINCESSMARGARETHOSPITAL": "PMH",
+    "HKCH": "HKCH",
+    "HONGKONGCHILDRENSHOSPITAL": "HKCH",
+    "PWH": "PWH",
+    "PRINCEOFWALESHOSPITAL": "PWH",
+    "UCH": "UCH",
+    "UNITEDCHRISTIANHOSPITAL": "UCH",
+    "TMH": "TMH",
+    "TUENMUNHOSPITAL": "TMH",
+    "NDH": "NDH",
+    "NORTHDISTRICTHOSPITAL": "NDH",
+}
 
 
 class AsanaError(RuntimeError):
@@ -82,7 +110,13 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     if not customer:
         return None
     core = re.split(r"[,/\-]", customer.strip(), 1)[0].strip()
-    return core or customer.strip()
+    canonical = HOSPITAL_ALIASES.get(_norm(core))
+    if canonical:
+        return canonical
+    # KWM / PYTV 這類未知短碼不得成為候選搜尋或加分依據。
+    if re.fullmatch(r"[A-Za-z]{2,6}", core):
+        return None
+    return core if len(_norm(core)) >= 5 else None
 
 
 def extract_serial(name: str) -> Optional[str]:
@@ -114,12 +148,8 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
         "resource_type": "task",
         "query": query,
         "count": count,
-        # notes 供電話/asset 交叉核對；日期用來選同一部機器最近三個月的工作。
-        # completed 只作資料顯示，不再把未完成工作排在已完成工作之前。
-        "opt_fields": (
-            "name,notes,completed,created_at,modified_at,completed_at,"
-            "due_on,start_on"
-        ),
+        # 官方 typeahead 只保證 compact task；完整欄位會在候選縮小後逐一讀取。
+        "opt_fields": "name",
     }
     url = f"{config.ASANA_BASE_URL}/workspaces/{config.ASANA_WORKSPACE_GID}/typeahead"
     response = None
@@ -172,6 +202,49 @@ def _typeahead(query: str, count: int = 60) -> List[dict]:
     return tasks
 
 
+def _fetch_task(gid: str) -> dict:
+    """讀一個候選的完整證據，包含描述、日期及所屬 project。"""
+    if gid in _task_cache:
+        return _task_cache[gid]
+    if not config.ASANA_TOKEN:
+        raise AsanaError("ASANA_TOKEN 未設定")
+    headers = {"Authorization": f"Bearer {config.ASANA_TOKEN}"}
+    params = {"opt_fields": (
+        "name,notes,completed,created_at,completed_at,due_on,start_on,"
+        "memberships.project.name,memberships.section.name,"
+        "effective_memberships.project.name,effective_memberships.section.name"
+    )}
+    url = f"{config.ASANA_BASE_URL}/tasks/{gid}"
+    response = None
+    for attempt in range(1, 5):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+        except requests.RequestException as exc:
+            if attempt == 4:
+                raise AsanaError("Asana 工作詳情查詢連線失敗") from exc
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt == 4:
+                raise AsanaError(f"Asana 工作詳情查詢失敗：HTTP {response.status_code}")
+            try:
+                delay = max(1.0, min(float(response.headers.get("Retry-After")), 120.0))
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 30)
+            time.sleep(delay)
+            continue
+        try:
+            response.raise_for_status()
+            task = response.json().get("data")
+        except (requests.RequestException, ValueError) as exc:
+            raise AsanaError(f"Asana 工作詳情查詢失敗：HTTP {response.status_code}") from exc
+        if not isinstance(task, dict):
+            raise AsanaError("Asana 工作詳情回傳格式不正確")
+        _task_cache[gid] = task
+        return task
+    raise AsanaError("Asana 工作詳情查詢失敗")  # pragma: no cover
+
+
 def _gather_pool(order_no, serials, hosp, product,
                  phones=None, assets=None, work_orders=None) -> List[dict]:
     """用可見欄位撈候選池；真正的取捨在本機評分，不交給 Asana 猜。"""
@@ -200,8 +273,22 @@ def _gather_pool(order_no, serials, hosp, product,
             gid = t.get("gid")
             if gid:
                 pool[gid] = t
-    log.info(f"  候選池：{len(pool)} 個 task（使用 {len(queries)} 組可見欄位查詢）")
-    return list(pool.values())
+    compact = list(pool.values())
+    # typeahead 排序不是準確度排序。先用候選標題中的可靠 token 排序，再只讀
+    # 最相關的一小批完整 task，避免一份單據打數十至數百次 API。
+    tokens = [order_no, hosp, product, *(serials or []), *(work_orders or [])]
+    tokens = [_norm(token) for token in tokens if token]
+    compact.sort(
+        key=lambda task: sum(token in _norm(task.get("name") or "") for token in tokens),
+        reverse=True,
+    )
+    compact = compact[:config.ASANA_MAX_HYDRATED_CANDIDATES]
+    hydrated = [_fetch_task(task["gid"]) for task in compact]
+    log.info(
+        f"  候選池：{len(pool)} 個，讀取最相關 {len(hydrated)} 個完整 task"
+        f"（使用 {len(queries)} 組可見欄位查詢）"
+    )
+    return hydrated
 
 
 def _clean_candidates(values, fallback=None) -> List[str]:
@@ -247,10 +334,12 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
 
 
 def _task_dates(task: dict) -> List[date]:
-    values = [
-        task.get("due_on"), task.get("start_on"), task.get("completed_at"),
-        task.get("created_at"), task.get("modified_at"),
-    ]
+    """只回傳可能代表實際服務日的日期。
+
+    modified_at 會因改名、留言或欄位更新而變，不可用來證明服務日期；
+    created/completed 只在另一個 helper 作很弱的排序，不算交叉證據。
+    """
+    values = [task.get("due_on"), task.get("start_on")]
     notes = task.get("notes") or ""
     values.extend(re.findall(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|"
                              r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", notes))
@@ -258,8 +347,38 @@ def _task_dates(task: dict) -> List[date]:
     return list(dict.fromkeys(value for value in parsed if value))
 
 
+def _task_activity_dates(task: dict) -> List[date]:
+    values = [task.get("created_at"), task.get("completed_at")]
+    parsed = [_parse_date(value) for value in values]
+    return list(dict.fromkeys(value for value in parsed if value))
+
+
+def _task_container_text(task: dict) -> str:
+    parts = []
+    for field in ("memberships", "effective_memberships"):
+        for membership in task.get(field) or []:
+            for kind in ("project", "section"):
+                value = membership.get(kind) or {}
+                if value.get("name"):
+                    parts.append(value["name"])
+    return " ".join(parts)
+
+
+def _task_job_type(task: dict) -> Optional[str]:
+    """只由 Asana project/section 判斷工作種類；不從客戶標題猜。"""
+    text = _task_container_text(task).upper()
+    if not text:
+        return None
+    pm = bool(re.search(r"\bPM\b|PREVENTI(?:VE|ATIVE)|PLANNED\s+MAINT", text))
+    cm = bool(re.search(r"\bCM\b|CORRECTIVE|REPAIR|SERVICE\s+REQUEST", text))
+    if pm == cm:
+        return None
+    return "PM" if pm else "CM"
+
+
 def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
-                     hosp: Optional[str], product: Optional[str]) -> dict:
+                     hosp: Optional[str], product: Optional[str],
+                     job_type: Optional[str] = None) -> dict:
     name = task.get("name") or ""
     notes = task.get("notes") or ""
     haystack_norm = _norm(f"{name}\n{notes}")
@@ -274,6 +393,11 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
     score = 0
     support = set()
     reasons = []
+    candidate_type = _task_job_type(task)
+    if job_type and candidate_type == job_type:
+        score += 35
+        support.add("job_type")
+        reasons.append("job type")
     if best_dist == 0:
         score += 100
         reasons.append("serial exact")
@@ -340,6 +464,12 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         elif date_delta <= 93:
             score += 10
             reasons.append("date within 3 months")
+    elif service_date:
+        activity_dates = _task_activity_dates(task)
+        if activity_dates and min(abs((candidate - service_date).days)
+                                  for candidate in activity_dates) <= 93:
+            score += 5
+            reasons.append("recent task activity")
 
     return {
         "task": task,
@@ -348,6 +478,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         "support": support,
         "reasons": reasons,
         "date_delta": date_delta,
+        "job_type": candidate_type,
     }
 
 
@@ -373,6 +504,11 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     pool = _gather_pool(
         order_no, serials, hosp, product, phones, assets, work_orders
     )
+    if job_type:
+        before = len(pool)
+        pool = [task for task in pool if _task_job_type(task) in (None, job_type)]
+        if len(pool) != before:
+            log.info(f"  已排除 {before - len(pool)} 個與 {job_type} 類型衝突的候選")
     if not pool:
         return None, 0
 
@@ -393,7 +529,10 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         # 一個也不能只靠醫院/型號自動歸檔，留在 _PENDING。
         return None, 0
 
-    scored = [_candidate_score(task, ocr_data, serials, hosp, product) for task in pool]
+    scored = [
+        _candidate_score(task, ocr_data, serials, hosp, product, job_type)
+        for task in pool
+    ]
     scored.sort(key=lambda row: (row["score"], -row["serial_dist"]), reverse=True)
     best = scored[0]
     runner_score = scored[1]["score"] if len(scored) > 1 else -1
@@ -405,7 +544,7 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     strong = best["support"]
     if best["serial_dist"] == 0:
         supported = bool(strong & {
-            "date", "phone", "asset", "work_order", "hospital+product"
+            "date", "phone", "asset", "work_order", "hospital+product", "job_type"
         })
         unambiguous = len(scored) == 1 or gap >= 10
         if supported and unambiguous:
@@ -413,7 +552,7 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             return best["task"], 2
     elif best["serial_dist"] <= MAX_SERIAL_DIST:
         supported = len(strong & {
-            "date", "phone", "asset", "work_order", "hospital+product"
+            "date", "phone", "asset", "work_order", "hospital+product", "job_type"
         }) >= 2
         unambiguous = len(scored) == 1 or gap >= 15
         if supported and unambiguous:
@@ -436,6 +575,9 @@ def extract_order_no_from_name(task: dict) -> Optional[str]:
 
 
 def get_safe_title(task: dict) -> str:
-    """OneDrive 檔名安全標題：Windows 不允許的字元換成 _"""
+    """保留 Asana 原文，只整理 Windows 禁用字元及多餘尾端符號。"""
     title = task.get("name", "Unknown").strip()
-    return re.sub(r'[\\/:*?"<>|]', "_", title)
+    title = re.sub(r"\s*[\\/:*?\"<>|]+\s*", " - ", title)
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"(?:\s+-\s*)+$", "", title).strip(" ._-")
+    return title or "Unknown"

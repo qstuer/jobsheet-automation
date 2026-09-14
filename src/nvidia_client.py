@@ -8,7 +8,7 @@ import time
 from typing import Optional
 
 import fitz
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from openai import OpenAI
 from . import config
 
@@ -59,7 +59,11 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     w, h = img.size
     crop = img.crop((0, int(h * config.OCR_CROP_TOP), w, int(h * config.OCR_CROP_BOTTOM)))
+    # Jobsheet 是黑白表格；自動拉開紙色／墨色並輕微銳化，比單純放大更能
+    # 保留手寫字邊緣。只處理指定欄位區，不把簽名與印章等雜訊送給模型。
+    crop = ImageOps.autocontrast(crop.convert("L")).convert("RGB")
     crop = ImageEnhance.Contrast(crop).enhance(config.OCR_CONTRAST)
+    crop = crop.filter(ImageFilter.SHARPEN)
     buf = io.BytesIO()
     crop.save(buf, "JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
@@ -91,6 +95,8 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
             if is_kimi_k3
             else max(max_tokens, config.NEMOTRON_INSTRUCT_MAX_TOKENS)
             if is_nemotron_omni
+            else max(max_tokens, config.NVIDIA_JSON_MAX_TOKENS)
+            if expects_json
             else max_tokens
         ),
         temperature=0.2 if is_nemotron_omni else 1 if is_kimi_k3 else 0,
@@ -181,7 +187,9 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
             )
 
     if last_error is not None:
-        raise last_error
+        # 已確認是暫時性圖片服務問題；轉成統一例外，讓 processor 記錄重試
+        # 次數，而不是令整批工作單每次都顯示 pipeline 崩潰。
+        raise NvidiaResponseError("所有 NVIDIA 圖片模型暫時無法完成辨認") from last_error
     raise NvidiaResponseError("沒有可用的 NVIDIA 圖片模型")
 
 
@@ -389,6 +397,40 @@ def ocr_jobsheet_fields(
                 if item and item.lower() not in ("null", "none", "n/a") and item not in cleaned:
                     cleaned.append(item)
             data[key] = cleaned[:3] if key != "unreadable_fields" else cleaned
+
+    # 格式安全閘：模型只抄字，但不合業務格式的值不可進 Asana 搜尋。
+    order_digits = re.sub(r"\D", "", data.get("order_no") or "")
+    data["order_no"] = (
+        order_digits if re.fullmatch(config.ORDER_NO_REGEX, order_digits) else None
+    )
+
+    def valid_mixed(value: str, minimum: int = 6) -> bool:
+        token = re.sub(r"[^A-Z0-9]", "", value.upper())
+        return (
+            len(token) >= minimum
+            and any(ch.isalpha() for ch in token)
+            and any(ch.isdigit() for ch in token)
+        )
+
+    data["serial_candidates"] = [
+        value for value in data["serial_candidates"] if valid_mixed(value)
+    ]
+    phones = []
+    for value in data["phone_candidates"]:
+        digits = re.sub(r"\D", "", value)
+        if len(digits) == 11 and digits.startswith("852"):
+            digits = digits[3:]
+        if len(digits) == 8 and digits not in phones:
+            phones.append(digits)
+    data["phone_candidates"] = phones
+    data["asset_candidates"] = [
+        value for value in data["asset_candidates"]
+        if len(re.sub(r"\D", "", value)) >= 4
+    ]
+    data["work_order_candidates"] = [
+        value for value in data["work_order_candidates"]
+        if len(re.sub(r"\D", "", value)) >= 6
+    ]
 
     if data.get("date_source"):
         data["date_source"] = data["date_source"].strip().upper().replace(" ", "_")

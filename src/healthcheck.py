@@ -11,8 +11,9 @@ log = logging.getLogger("healthcheck")
 QUEUES = (
     ("等待切割", config.GDRIVE_INPUT),
     ("等待辨認及上傳", config.GDRIVE_SPLIT),
-    ("單據內容需人工檢查", config.GDRIVE_SPLIT_FAILED),
-    ("舊版待處理區", config.GDRIVE_PENDING),
+    ("切頁邊界需人工檢查", config.GDRIVE_SPLIT_FAILED),
+    ("掃描不完整、需要重掃", config.GDRIVE_INCOMPLETE),
+    ("名稱等待人工核對", config.GDRIVE_PENDING),
 )
 
 

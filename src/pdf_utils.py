@@ -10,7 +10,7 @@ from typing import List
 import fitz
 from PIL import Image
 
-from . import config, nvidia_client
+from . import config, nvidia_client, pdf_identity
 
 
 class SplitError(ValueError):
@@ -47,7 +47,10 @@ def _page_layout_signature(page: fitz.Page) -> tuple[bool, ...]:
     pix = page.get_pixmap(matrix=fitz.Matrix(0.75, 0.75), colorspace=fitz.csGRAY)
     image = Image.frombytes("L", (pix.width, pix.height), pix.samples)
     image = image.resize((config.JOBSHEET_LAYOUT_WIDTH, config.JOBSHEET_LAYOUT_HEIGHT))
-    return tuple(value < config.JOBSHEET_LAYOUT_DARK_THRESHOLD for value in image.getdata())
+    return tuple(
+        value < config.JOBSHEET_LAYOUT_DARK_THRESHOLD
+        for value in image.get_flattened_data()
+    )
 
 
 def page_looks_like_jobsheet(pdf_doc: fitz.Document, page_idx: int,
@@ -58,6 +61,33 @@ def page_looks_like_jobsheet(pdf_doc: fitz.Document, page_idx: int,
     dark_count = sum(reference) + sum(candidate)
     similarity = (2 * overlap / dark_count) if dark_count else 0.0
     return similarity >= config.JOBSHEET_LAYOUT_MIN_DICE
+
+
+def _completeness(pdf_doc: fitz.Document, job_type: str,
+                  keep_pages: List[int]) -> tuple[bool, str]:
+    """檢查「掃描是否齊頁」，不把缺頁混入切割錯誤。
+
+    PM 以四張有內容頁為硬條件。若四張之中兩張 checklist 的低解像度
+    視覺 hash 幾乎一樣，亦當作送紙重複，要求重掃。checklist 頁碼由人工
+    印刷位置／後續報告輔助辨認，但不靠模型猜頁碼來決定是否完整。
+    """
+    expected = (
+        config.PM_EXPECTED_CONTENT_PAGES
+        if job_type == "PM"
+        else config.CM_EXPECTED_CONTENT_PAGES
+    )
+    actual = len(keep_pages)
+    if actual != expected:
+        return False, f"{job_type} 只有 {actual}/{expected} 張有內容頁"
+
+    if job_type == "PM":
+        hashes = [pdf_identity.page_dhash(pdf_doc[index]) for index in keep_pages[1:]]
+        for left in range(len(hashes)):
+            for right in range(left + 1, len(hashes)):
+                ratio = pdf_identity.hash_distance_ratio(hashes[left], hashes[right])
+                if ratio <= config.DUPLICATE_PAGE_MAX_HASH_RATIO:
+                    return False, "PM checklist 疑似有重複頁"
+    return True, ""
 
 
 def _find_job_end(pdf_doc: fitz.Document, cursor: int, job_type: str,
@@ -148,12 +178,21 @@ def split_jobs(pdf_path: Path) -> List[dict]:
                     if page_has_meaningful_content(doc, page_idx)
                 )
 
+            complete, incomplete_reason = _completeness(doc, job_type, keep)
+            expected_content_pages = (
+                config.PM_EXPECTED_CONTENT_PAGES
+                if job_type == "PM"
+                else config.CM_EXPECTED_CONTENT_PAGES
+            )
             jobs.append({
                 "start": cursor,
                 "end": end,
                 "type": job_type,
                 "input_pages": end - cursor,
                 "keep_pages": keep,
+                "expected_content_pages": expected_content_pages,
+                "complete": complete,
+                "incomplete_reason": incomplete_reason or None,
             })
             cursor = end
     finally:
