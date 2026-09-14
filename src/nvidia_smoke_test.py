@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""只測 NVIDIA 圖片入口，不讀雲端工作單，也不連接 Asana/OneDrive。"""
+"""只測指定圖片入口，不讀雲端工作單，也不連接 Asana/OneDrive。"""
 import base64
 import io
 import sys
@@ -40,8 +40,11 @@ def main() -> int:
     )
     result = nvidia_client._parse_json_object(raw, required_keys={"code"})
     if result.get("code") != EXPECTED_CODE:
-        raise RuntimeError("NVIDIA 圖片測試讀到錯誤代碼")
-    print(f"NVIDIA 圖片測試成功：{config.NVIDIA_MODEL}")
+        raise RuntimeError("圖片模型測試讀到錯誤代碼")
+    print(
+        f"圖片模型測試成功：{config.OCR_PROVIDER}/"
+        f"{nvidia_client.current_model_name()}"
+    )
     return 0
 
 

@@ -51,9 +51,12 @@ jobs:
         run: python -m src.healthcheck
       - name: Run splitter
         env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OCR_PROVIDER:     ${{ vars.OCR_PROVIDER }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL:   ${{ vars.DEEPSEEK_MODEL }}
+          NVIDIA_API_KEY:   ${{ secrets.NVIDIA_API_KEY }}
           # 模型名稱不是密鑰；Stage A/B 共用同一個 Actions variable。
-          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          NVIDIA_MODEL:     ${{ vars.NVIDIA_MODEL }}
         run: python -m src.splitter
       - name: Cleanup rclone config
         if: always()

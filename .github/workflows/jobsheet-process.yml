@@ -76,6 +76,9 @@ jobs:
         run: python -m src.healthcheck
       - name: Run processor
         env:
+          OCR_PROVIDER:         ${{ vars.OCR_PROVIDER }}
+          DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL:       ${{ vars.DEEPSEEK_MODEL }}
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
           # 模型名稱不是敏感資料；未設定 variable 時使用 src/config.py 的 Nemotron。
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}

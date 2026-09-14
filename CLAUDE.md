@@ -180,7 +180,10 @@ GitHub Secrets：
 |---|---|---|
 | `RCLONE_CONFIG` | 是 | Google Drive / OneDrive 的 rclone 登入設定（base64） |
 | `NVIDIA_API_KEY` | 是 | 視覺辨認服務 API key |
+| `DEEPSEEK_API_KEY` | 測試時是 | DeepSeek 官方付費 API key；只放 Secret，不寫進變數或 repo |
 | `ASANA_TOKEN` | 是 | Asana 存取權杖；需能讀 task、workspace typeahead、project 及 section |
+| `OCR_PROVIDER`（Actions variable） | 否 | 正式流程選 `nvidia` 或 `deepseek`；未設定時仍用 NVIDIA |
+| `DEEPSEEK_MODEL`（Actions variable） | 否 | DeepSeek 模型；未設定使用 `deepseek-flash`（V4.1 Flash） |
 | `NVIDIA_MODEL`（Actions variable） | 否 | 臨時換辨認模型；不填使用程式預設 Nemotron 3 Nano Omni |
 | `ASANA_WORKSPACE_GID`（Actions variable） | 否 | 日後搬 Asana workspace 才覆蓋；不填使用已核對的目前 workspace |
 
@@ -200,6 +203,13 @@ GitHub Secrets：
 - 欄位辨認要求 NVIDIA 只回指定 JSON：order、serial 候選、產品、醫院/位置、電話候選、asset 候選、HAWO/WO、ACTION DATE 及讀不清欄位；若服務在 JSON 外加短說明或 markdown 外框也能安全讀取，但不會從散文硬猜。
 - 提示文字不可放入看似真實的機身編號、型號或醫院範例；模型在字跡難讀時可能直接複製範例，造成錯配。
 - 可用 GitHub Actions variable `NVIDIA_MODEL` 暫時覆蓋，不需先改程式；模型名稱不是密鑰，不放 Secrets。
+- 2026-09-14 加入 DeepSeek 官方付費入口。`deepseek-flash` 對應
+  DeepSeek-V4.1-Flash，支援圖片及 JSON；OCR 關閉 thinking，避免抄錄工作
+  產生不必要的推理延遲。加入能力本身不會改正式流程，`OCR_PROVIDER` 未設定
+  時仍使用 NVIDIA。
+- `DeepSeek V4.1 Vision Check` 只讀程式即時產生的假圖片，不接觸任何客戶
+  工作單。`Jobsheet Safe Dry Run` 可逐次選 `deepseek` 或 `nvidia`，供同一份
+  原始掃描比較；兩者都不移動 Drive 檔案及不寫 OneDrive。
 - rclone 固定 1.75.0，不再每次下載未知的新版本。
 - GitHub 內的下載版本變數必須叫 `JOBSHEET_RCLONE_RELEASE`；不可改成 `RCLONE_VERSION`，否則 rclone 會誤當成自己的開關而啟動失敗。
 - Python 套件固定在 `requirements.txt`，避免數月後自動升級而失效。
@@ -238,9 +248,11 @@ python -m compileall -q src tests
 
 歷史 PDF 辨認抽查：將測試 PDF 放入 `tests/sample_pdfs/`，設定本機 `NVIDIA_API_KEY`，執行 `python -m tests.test_ocr_local`。
 
-正式雲端前的安全測試：手動啟動 `Jobsheet Safe Dry Run`，輸入入口原始 PDF 的完整檔名。結果只顯示預計切頁、缺頁及預計名稱，不寫入 OneDrive。
+正式雲端前的安全測試：手動啟動 `Jobsheet Safe Dry Run`，輸入入口原始 PDF 的完整檔名並選擇 `deepseek` 或 `nvidia`。結果只顯示預計切頁、缺頁及預計名稱，不寫入 OneDrive。
 
 只測 NVIDIA 模型能否看圖及回傳合格 JSON：在 GitHub Actions 手動執行 `NVIDIA Model Check`。它只讀一張程式即時產生的假資料圖片，不會讀 Google Drive、Asana 或 OneDrive。
+
+只測 DeepSeek V4.1 Flash 的付費 Key、圖片輸入及 JSON：手動執行 `DeepSeek V4.1 Vision Check`。這個檢查同樣只使用假圖片；成功後才以 `Jobsheet Safe Dry Run` 測一份真實掃描。
 
 ## 11. 程式地圖
 

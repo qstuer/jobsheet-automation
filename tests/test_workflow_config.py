@@ -34,8 +34,31 @@ class WorkflowConfigTests(unittest.TestCase):
         split_text = (ROOT / ".github" / "workflows" / "jobsheet-split.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}", split_text)
+        self.assertIn("${{ vars.NVIDIA_MODEL }}", split_text)
         self.assertNotIn("secrets.NVIDIA_MODEL", split_text)
+
+    def test_paid_deepseek_can_be_selected_without_changing_default(self):
+        for workflow_name in ("jobsheet-split.yml", "jobsheet-process.yml"):
+            text = (ROOT / ".github" / "workflows" / workflow_name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("vars.OCR_PROVIDER", text)
+            self.assertIn("secrets.DEEPSEEK_API_KEY", text)
+            self.assertIn("vars.DEEPSEEK_MODEL", text)
+
+        dry_run = (ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ocr_provider:", dry_run)
+        self.assertIn("default: deepseek", dry_run)
+
+        smoke = (
+            ROOT / ".github" / "workflows" / "deepseek-model-check.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OCR_PROVIDER:       deepseek", smoke)
+        self.assertIn("secrets.DEEPSEEK_API_KEY", smoke)
+        self.assertNotIn("RCLONE_CONFIG", smoke)
+        self.assertNotIn("ASANA_TOKEN", smoke)
 
     def test_stage_b_manual_run_can_target_exactly_one_pdf(self):
         workflow = ROOT / ".github" / "workflows" / "jobsheet-process.yml"

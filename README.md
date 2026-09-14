@@ -39,6 +39,11 @@ python -m src.healthcheck
 
 正式處理前可手動執行 `Jobsheet Safe Dry Run`，指定入口的一份 PDF。它會切頁、辨認及查 Asana，但不移動檔案，也不寫入 OneDrive。
 
+圖片辨認預設仍使用 NVIDIA。若要比較 DeepSeek 官方付費
+DeepSeek-V4.1-Flash，先加入 GitHub Secret `DEEPSEEK_API_KEY`，執行
+`DeepSeek V4.1 Vision Check`，再在 `Jobsheet Safe Dry Run` 選擇
+`deepseek` 測一份原始 PDF；測試不會改動正式供應商。
+
 完整說明及修復步驟在 [CLAUDE.md](CLAUDE.md)。人或 AI 接手都應先讀該檔。
 
 > 本專案不需要、也不應由自動化程式處理任何 GitHub 帳單、付款或訂閱設定。

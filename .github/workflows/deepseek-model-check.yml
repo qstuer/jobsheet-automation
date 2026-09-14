@@ -1,0 +1,30 @@
+name: DeepSeek V4.1 Vision Check
+
+# 只用程式即時產生的假圖片確認付費 DeepSeek Key、圖片輸入和 JSON。
+# 不讀 Google Drive、Asana 或 OneDrive，也不改正式 OCR 供應商。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Read a synthetic image with DeepSeek V4.1 Flash
+        env:
+          OCR_PROVIDER:       deepseek
+          DEEPSEEK_API_KEY:   ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL:     ${{ vars.DEEPSEEK_MODEL }}
+        run: python -m src.nvidia_smoke_test

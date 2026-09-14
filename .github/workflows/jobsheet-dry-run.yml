@@ -9,6 +9,14 @@ on:
         description: 'From_BrotherDevice 根目錄內的完整 PDF 檔名'
         required: true
         type: string
+      ocr_provider:
+        description: '只限本次測試使用的圖片服務'
+        required: true
+        default: deepseek
+        type: choice
+        options:
+          - deepseek
+          - nvidia
 
 permissions:
   contents: read
@@ -43,6 +51,9 @@ jobs:
       - name: Inspect one raw scan without cloud writes
         env:
           JOBSHEET_RAW_FILE:    ${{ inputs.raw_file }}
+          OCR_PROVIDER:         ${{ inputs.ocr_provider }}
+          DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL:       ${{ vars.DEEPSEEK_MODEL }}
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}

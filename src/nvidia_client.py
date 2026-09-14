@@ -1,4 +1,8 @@
-"""NVIDIA 視覺辨認服務：讀取 CM/PM 圈選及單據欄位。"""
+"""視覺辨認服務：讀取 CM/PM 圈選及單據欄位。
+
+檔名為歷史相容保留；正式流程預設使用 NVIDIA，Safe Dry Run 亦可明確
+選用 DeepSeek 官方付費 API 做隔離測試。
+"""
 import base64
 import io
 import json
@@ -13,6 +17,7 @@ from openai import OpenAI
 from . import config
 
 _client: Optional[OpenAI] = None
+_client_identity: Optional[tuple] = None
 _unavailable_models: set[str] = set()
 log = logging.getLogger(__name__)
 
@@ -33,18 +38,50 @@ def _is_retryable_error(exc: BaseException) -> bool:
     return exc.__class__.__name__ in {"APIConnectionError", "APITimeoutError"}
 
 
+def _provider_settings() -> tuple[str, str, str, str, float, Optional[str]]:
+    """回傳供應商、網址、key、主模型、timeout、後備模型。"""
+    provider = config.OCR_PROVIDER.strip().lower()
+    if provider == "deepseek":
+        return (
+            provider,
+            config.DEEPSEEK_BASE_URL,
+            config.DEEPSEEK_API_KEY,
+            config.DEEPSEEK_MODEL,
+            config.DEEPSEEK_REQUEST_TIMEOUT_SECONDS,
+            None,
+        )
+    if provider == "nvidia":
+        return (
+            provider,
+            config.NVIDIA_BASE_URL,
+            config.NVIDIA_API_KEY,
+            config.NVIDIA_MODEL,
+            config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
+            config.NVIDIA_FALLBACK_MODEL,
+        )
+    raise RuntimeError(f"不支援的 OCR_PROVIDER：{config.OCR_PROVIDER}")
+
+
+def current_model_name() -> str:
+    """供 smoke test 及日誌顯示目前真正會呼叫的模型。"""
+    return _provider_settings()[3]
+
+
 def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        if not config.NVIDIA_API_KEY:
-            raise RuntimeError("NVIDIA_API_KEY 未設定")
+    global _client, _client_identity
+    provider, base_url, api_key, _, timeout, _ = _provider_settings()
+    identity = (provider, base_url, api_key, timeout)
+    if _client is None or _client_identity != identity:
+        if not api_key:
+            raise RuntimeError(f"{provider.upper()}_API_KEY 未設定")
         _client = OpenAI(
-            base_url=config.NVIDIA_BASE_URL,
-            api_key=config.NVIDIA_API_KEY,
-            timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
             # SDK 自己再重試會令實際等待時間失控；下方程式統一處理。
             max_retries=0,
         )
+        _client_identity = identity
     return _client
 
 
@@ -93,7 +130,9 @@ def crop_jobsheet_serial(pdf_doc: fitz.Document, page_idx: int,
 def _call_vision_once(prompt: str, image_b64: str, model: str,
                       max_tokens: int, expects_json: bool) -> str:
     """向一個指定模型發出一次請求；重試和後備由外層控制。"""
+    provider, _, _, _, timeout, _ = _provider_settings()
     normalized_model = model.strip().lower()
+    is_deepseek = provider == "deepseek"
     is_kimi_k3 = normalized_model == "moonshotai/kimi-k3"
     is_nemotron_omni = (
         normalized_model
@@ -114,6 +153,8 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
             if is_kimi_k3 and expects_json
             else max(max_tokens, config.KIMI_TEXT_MAX_TOKENS)
             if is_kimi_k3
+            else max(max_tokens, config.DEEPSEEK_JSON_MAX_TOKENS)
+            if is_deepseek and expects_json
             else max(max_tokens, config.NEMOTRON_INSTRUCT_MAX_TOKENS)
             if is_nemotron_omni
             else max(max_tokens, config.NVIDIA_JSON_MAX_TOKENS)
@@ -121,8 +162,14 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
             else max_tokens
         ),
         temperature=0.2 if is_nemotron_omni else 1 if is_kimi_k3 else 0,
-        timeout=config.NVIDIA_REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
+    if is_deepseek:
+        # OCR 只需忠實抄錄，關閉預設思考可縮短延遲；JSON 工作同時使用
+        # 官方 JSON mode，回覆仍會再經本機 parser 及欄位型別驗證。
+        request["extra_body"] = {"thinking": {"type": "disabled"}}
+        if expects_json:
+            request["response_format"] = {"type": "json_object"}
     if is_nemotron_omni:
         # Nemotron 官方的 instruct/OCR 設定：不產生推理文字、固定取最可能
         # 的 token。模型只抄錄畫面內容，最後仍由本機嚴格驗證 JSON。
@@ -168,15 +215,16 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
 def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
                  expects_json: bool = False,
                  allow_fallback: bool = True) -> str:
-    """呼叫 NVIDIA 視覺模型做單張圖 OCR。
+    """呼叫目前指定的視覺模型做單張圖 OCR。
 
     Kimi 失聯時只等待一次（避免它再次長時間掛起）；目前使用的 Nemotron
     遇到 503/timeout 會短重試一次，才改用後備模型。失聯的模型會在本批
     工作內停用，避免每張單據都重等。
     """
-    primary = config.NVIDIA_MODEL.strip()
+    provider, _, _, primary, _, fallback = _provider_settings()
+    primary = primary.strip()
     models = [primary]
-    fallback = config.NVIDIA_FALLBACK_MODEL.strip()
+    fallback = (fallback or "").strip()
     if allow_fallback and fallback and primary.lower() != fallback.lower():
         models.append(fallback)
 
@@ -203,15 +251,15 @@ def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
                     time.sleep(2)
         _unavailable_models.add(model)
         if model == primary and len(models) > 1:
-            log.warning(
-                "主要 NVIDIA 圖片模型本次無回應，改用安全後備模型"
-            )
+            log.warning("主要圖片模型本次無回應，改用安全後備模型")
 
     if last_error is not None:
         # 已確認是暫時性圖片服務問題；轉成統一例外，讓 processor 記錄重試
         # 次數，而不是令整批工作單每次都顯示 pipeline 崩潰。
-        raise NvidiaResponseError("所有 NVIDIA 圖片模型暫時無法完成辨認") from last_error
-    raise NvidiaResponseError("沒有可用的 NVIDIA 圖片模型")
+        raise NvidiaResponseError(
+            f"{provider} 圖片模型暫時無法完成辨認"
+        ) from last_error
+    raise NvidiaResponseError(f"沒有可用的 {provider} 圖片模型")
 
 
 def _parse_json_object(raw: str, required_keys: Optional[set] = None) -> dict:

@@ -3,6 +3,7 @@ import os
 
 # === API Keys (從環境變數讀，GitHub Actions 從 Secrets 注入) ===
 NVIDIA_API_KEY      = os.environ.get("NVIDIA_API_KEY", "")
+DEEPSEEK_API_KEY    = os.environ.get("DEEPSEEK_API_KEY", "")
 ASANA_TOKEN         = os.environ.get("ASANA_TOKEN", "")
 # 這個 workspace 編號已用目前連接的 Asana 帳戶實際核對。它不是密鑰；
 # Actions variable 可在日後搬 workspace 時覆蓋，空值則必須回到已核對的預設值。
@@ -30,7 +31,19 @@ ONEDRIVE_OUTPUT = "onedrive:Hong Kong Sen's Healthcare/JOBSHEETS"
 GDRIVE_FROM_BROTHER_FOLDER_ID = "1ls3TQXyr0GTxDOO3MVQgR3QFDPXFM6gn"
 GDRIVE_PENDING_FOLDER_ID      = "1Yby1chpl40PYv3Ph9xhnJd971Qwo32en"
 
-# === 視覺 OCR 模型 (NVIDIA NIM) ===
+# === 視覺 OCR 供應商 ===
+# 正式流程在未指定時仍使用已驗證的 NVIDIA，避免加入 DeepSeek 測試能力時
+# 意外改動自動上傳。Safe Dry Run 可明確設為 deepseek 做隔離比較。
+OCR_PROVIDER = (os.environ.get("OCR_PROVIDER") or "nvidia").strip().lower()
+
+# DeepSeek 官方付費 API。2026-09 的 DeepSeek-V4.1-Flash API 名稱為
+# deepseek-flash，原生支援圖片；模型名稱可用非敏感環境變數覆蓋。
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL") or "deepseek-flash"
+DEEPSEEK_REQUEST_TIMEOUT_SECONDS = 60.0
+DEEPSEEK_JSON_MAX_TOKENS = 1024
+
+# === NVIDIA NIM 視覺 OCR ===
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # Nemotron 3 Nano Omni 是 NVIDIA 的圖片/OCR 模型，支援 JSON 輸出。
 # 模型名稱不是密鑰；GitHub 可用 Actions variable NVIDIA_MODEL 暫時覆蓋。

@@ -94,6 +94,51 @@ class NvidiaResponseTests(unittest.TestCase):
         finally:
             nvidia_client._client = None
 
+    def test_deepseek_uses_paid_endpoint_and_separate_key(self):
+        nvidia_client._client = None
+        nvidia_client._client_identity = None
+        try:
+            with patch.object(config, "OCR_PROVIDER", "deepseek"), \
+                    patch.object(config, "DEEPSEEK_API_KEY", "deepseek-test-key"), \
+                    patch.object(nvidia_client, "OpenAI") as openai:
+                nvidia_client.get_client()
+
+            openai.assert_called_once_with(
+                base_url=config.DEEPSEEK_BASE_URL,
+                api_key="deepseek-test-key",
+                timeout=config.DEEPSEEK_REQUEST_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        finally:
+            nvidia_client._client = None
+            nvidia_client._client_identity = None
+
+    def test_deepseek_vision_disables_thinking_and_enforces_json(self):
+        response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"ok":true}')
+        )])
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch.object(config, "OCR_PROVIDER", "deepseek"), \
+                patch.object(config, "DEEPSEEK_MODEL", "deepseek-flash"), \
+                patch.object(nvidia_client, "get_client", return_value=client):
+            self.assertEqual(
+                '{"ok":true}',
+                nvidia_client._call_vision(
+                    "return JSON", "image", max_tokens=128, expects_json=True
+                ),
+            )
+
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual("deepseek-flash", request["model"])
+        self.assertEqual(
+            {"thinking": {"type": "disabled"}}, request["extra_body"]
+        )
+        self.assertEqual({"type": "json_object"}, request["response_format"])
+        self.assertEqual(config.DEEPSEEK_JSON_MAX_TOKENS, request["max_tokens"])
+        self.assertEqual(config.DEEPSEEK_REQUEST_TIMEOUT_SECONDS, request["timeout"])
+
     def test_kimi_uses_reasoning_space_for_json(self):
         first = SimpleNamespace(choices=[SimpleNamespace(
             delta=SimpleNamespace(content='{"ok":')
