@@ -69,6 +69,26 @@ def _planned_filename(task: dict) -> tuple[str, str]:
     return f"{asana_client.get_safe_title(task)}.pdf", ""
 
 
+def _dry_run_ocr_preview(ocr: dict) -> str:
+    """只在私有 dry-run 報告列出核對所需欄位；電話不寫入 Actions 日誌。"""
+    labels = (
+        ("serial", "serial_candidates"),
+        ("product", "product_raw"),
+        ("customer", "customer_raw"),
+        ("location", "location_raw"),
+        ("asset", "asset_candidates"),
+        ("date", "service_date_raw"),
+    )
+    parts = []
+    for label, key in labels:
+        value = ocr.get(key)
+        if isinstance(value, list):
+            value = "/".join(str(item) for item in value if item)
+        if value:
+            parts.append(f"{label}={value}")
+    return "; ".join(parts)
+
+
 def _confirmed_pdf_name(value: str) -> str:
     """把人工逐頁核對的名稱轉成 OneDrive 可接受的單一 PDF 檔名。"""
     name = (value or "").strip()
@@ -430,6 +450,7 @@ def _process_split_file(filename: str, work_dir: Path,
                 "order_no": order_no or None,
                 "asana_task_gid": task.get("gid"),
                 "tier": tier,
+                "ocr_preview": _dry_run_ocr_preview(ocr),
             }
         result = _finalize_match(local, task, tier, filename)
     else:
@@ -438,7 +459,10 @@ def _process_split_file(filename: str, work_dir: Path,
         log.warning("  ⚠ 多輪核對仍不確定 → 留在 Google Drive _PENDING")
         if dry_run:
             local.unlink(missing_ok=True)
-            return {"status": "預覽：證據不足，會留待人工核對"}
+            return {
+                "status": "預覽：證據不足，會留待人工核對",
+                "ocr_preview": _dry_run_ocr_preview(ocr),
+            }
         if source_folder == config.GDRIVE_PENDING:
             pending_name = filename
         else:
@@ -532,12 +556,29 @@ def main() -> int:
     log.info("處理階段完成報告" + ("（只讀預覽）" if dry_run else ""))
     log.info("=" * 60)
     for row in main_report:
-        log.info(f"  {row.get('file')}：{row.get('status')}")
+        details = [row.get("status")]
+        if row.get("planned"):
+            details.append(f"預計檔名={row['planned']}")
+        if row.get("ocr_preview"):
+            details.append(f"OCR={row['ocr_preview']}")
+        log.info(f"  {row.get('file')}：{'；'.join(details)}")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:
-        lines = ["## Jobsheet 處理報告", "", "| 檔案 | 結果 |", "|---|---|"]
+        lines = [
+            "## Jobsheet 處理報告", "",
+            "| 檔案 | 結果 | 預計檔名 | OCR 核對欄位 |",
+            "|---|---|---|---|",
+        ]
         for row in main_report:
-            lines.append(f"| {row.get('file')} | {row.get('status')} |")
+            cells = (
+                row.get("file") or "",
+                row.get("status") or "",
+                row.get("planned") or "-",
+                row.get("ocr_preview") or "-",
+            )
+            cells = tuple(str(value).replace("|", "\\|").replace("\n", " ")
+                          for value in cells)
+            lines.append(f"| {' | '.join(cells)} |")
         with open(summary_path, "a", encoding="utf-8") as stream:
             stream.write("\n".join(lines) + "\n")
     # 只有登入、Asana、rclone 或程式等整體故障才令 workflow 失敗；單一圖片

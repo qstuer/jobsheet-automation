@@ -279,10 +279,16 @@ class ProcessorPendingTests(unittest.TestCase):
         fake_open = MagicMock()
         fake_open.return_value.__enter__.return_value = MagicMock()
         task = {"gid": "task", "name": "Hospital / 61932685"}
+        ocr = {
+            "serial_candidates": ["US123"],
+            "product_raw": "Affiniti 70",
+            "customer_raw": "PYN",
+            "phone_candidates": ["25551234"],
+        }
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch.object(processor.rclone_helper, "download"), \
                 patch.object(processor.fitz, "open", fake_open), \
-                patch.object(processor, "_ocr_and_match", return_value=(task, 1, {})), \
+                patch.object(processor, "_ocr_and_match", return_value=(task, 1, ocr)), \
                 patch.object(processor.rclone_helper, "upload_unique") as upload, \
                 patch.object(processor.rclone_helper, "moveto") as move, \
                 patch.object(processor.rclone_helper, "delete") as delete, \
@@ -292,6 +298,8 @@ class ProcessorPendingTests(unittest.TestCase):
             )
         self.assertEqual("預覽：可以可靠配對", result["status"])
         self.assertEqual("SR#61932685.pdf", result["planned"])
+        self.assertIn("serial=US123", result["ocr_preview"])
+        self.assertNotIn("25551234", result["ocr_preview"])
         upload.assert_not_called()
         move.assert_not_called()
         delete.assert_not_called()
