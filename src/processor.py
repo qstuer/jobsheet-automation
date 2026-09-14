@@ -239,6 +239,45 @@ def _ocr_and_match(doc, job_type):
             return task, tier, consensus
         if i < len(config.OCR_RETRY_ZOOMS):
             log.info("  一致證據仍不足，針對有爭議欄位再讀一輪…")
+
+    # 電話/asset/日期等已有兩項共識，但整張上半頁的 serial 仍令 Asana
+    # 無法核對時，才高倍重讀 serial 小格。這是局部精讀，不把候選名稱或
+    # 已知 serial 告訴模型；兩次精讀仍須形成共識後才能再配對。
+    rescue_evidence = sum(bool(last_consensus.get(field)) for field in (
+        "phone_candidates", "asset_candidates", "work_order_candidates",
+        "service_date_raw",
+    ))
+    if rescue_evidence >= 2:
+        focused_readings = []
+        log.info("  啟動 SERIAL NO. 小格高倍精讀…")
+        for i, zoom in enumerate(config.OCR_SERIAL_RETRY_ZOOMS, 1):
+            try:
+                candidates = nvidia_client.ocr_jobsheet_serial_candidates(
+                    doc, 0, zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                log.warning(f"  serial 精讀第{i}輪暫時無法完成")
+                continue
+            focused_readings.append({"serial_candidates": candidates})
+            log.info(
+                f"  serial 精讀第{i}輪({zoom}x)："
+                f"{'已讀到候選' if candidates else '未讀到可靠值'}"
+            )
+            if len(focused_readings) < config.OCR_MATCH_CONFIRMATIONS:
+                continue
+            focused_consensus = _consensus_ocr(focused_readings)
+            focused_serials = focused_consensus.get("serial_candidates") or []
+            if not focused_serials:
+                continue
+            combined = dict(last_consensus)
+            combined["serial_candidates"] = list(dict.fromkeys(
+                list(last_consensus.get("serial_candidates") or []) + focused_serials
+            ))[:3]
+            combined["serial_no"] = combined["serial_candidates"][0]
+            task, tier = asana_client.find_task(combined, job_type=job_type)
+            if task is not None:
+                log.info("  serial 小格精讀後取得唯一可靠的 Asana 工作")
+                return task, tier, combined
     log.warning("  多輪抄錄後仍沒有唯一可靠的 Asana 工作")
     return None, 0, last_consensus
 

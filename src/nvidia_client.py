@@ -69,6 +69,27 @@ def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) 
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def crop_jobsheet_serial(pdf_doc: fitz.Document, page_idx: int,
+                         zoom: float = 5.0) -> str:
+    """只渲染 SERIAL NO. 標籤及手寫值，供配對失敗後精讀。"""
+    page = pdf_doc[page_idx]
+    rect = page.rect
+    clip = fitz.Rect(
+        rect.x0 + rect.width * config.OCR_SERIAL_CROP_LEFT,
+        rect.y0 + rect.height * config.OCR_SERIAL_CROP_TOP,
+        rect.x0 + rect.width * config.OCR_SERIAL_CROP_RIGHT,
+        rect.y0 + rect.height * config.OCR_SERIAL_CROP_BOTTOM,
+    )
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    img = ImageOps.autocontrast(img.convert("L")).convert("RGB")
+    img = ImageEnhance.Contrast(img).enhance(config.OCR_CONTRAST)
+    img = img.filter(ImageFilter.SHARPEN)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def _call_vision_once(prompt: str, image_b64: str, model: str,
                       max_tokens: int, expects_json: bool) -> str:
     """向一個指定模型發出一次請求；重試和後備由外層控制。"""
@@ -442,3 +463,46 @@ def ocr_jobsheet_fields(
     data["product"] = data["product_raw"]
     data["customer"] = data["customer_raw"]
     return data
+
+
+def ocr_jobsheet_serial_candidates(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        zoom: float = 5.0,
+) -> list[str]:
+    """高倍精讀 serial 小格；只回傳畫面支持的機身編號候選。"""
+    img_b64 = crop_jobsheet_serial(pdf_doc, page_idx, zoom=zoom)
+    prompt = (
+        "This crop contains the printed label SERIAL NO. and its handwritten value box. "
+        "Transcribe only the handwritten serial value. Ignore the printed label and any "
+        "adjacent job-nature boxes. Never autocomplete from a known device or prior image. "
+        "If exactly one character is visually ambiguous, include at most three readings "
+        "that are each supported by the strokes. Return JSON only: "
+        '{"serial_candidates":["raw visible reading"]}. '
+        "Use [] if the handwriting is unreadable."
+    )
+    raw = _call_vision(
+        prompt=prompt,
+        image_b64=img_b64,
+        max_tokens=120,
+        expects_json=True,
+    )
+    data = _parse_json_object(raw, required_keys={"serial_candidates"})
+    values = data.get("serial_candidates")
+    if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+        raise NvidiaResponseError("NVIDIA serial 精讀欄位不是文字清單")
+
+    candidates = []
+    for value in values:
+        value = value.strip()
+        normalized = re.sub(r"[^A-Z0-9]", "", value.upper())
+        if (
+            len(normalized) >= 8
+            and any(char.isalpha() for char in normalized)
+            and any(char.isdigit() for char in normalized)
+            and normalized not in {
+                re.sub(r"[^A-Z0-9]", "", item.upper()) for item in candidates
+            }
+        ):
+            candidates.append(value)
+    return candidates[:3]

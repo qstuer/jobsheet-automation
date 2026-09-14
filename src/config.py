@@ -73,6 +73,13 @@ OCR_CONTRAST      = 2.0   # 對比加強倍數
 # 至少兩個不同解像度要抄出相同欄位，才把共識資料送去 Asana。
 OCR_RETRY_ZOOMS = [2.0, 2.5, 3.0]
 OCR_MATCH_CONFIRMATIONS = 2
+# 整張上半頁多輪仍配不到時，只重讀 SERIAL NO. 小格。裁小後可用更高
+# 解像度而不增加太多圖片大小，減少模型被其他手寫欄位干擾。
+OCR_SERIAL_CROP_LEFT = 0.55
+OCR_SERIAL_CROP_RIGHT = 0.77
+OCR_SERIAL_CROP_TOP = 0.095
+OCR_SERIAL_CROP_BOTTOM = 0.18
+OCR_SERIAL_RETRY_ZOOMS = [4.0, 5.0, 6.0]
 # 圖片服務連續幾輪工作仍失敗後，停止無限重跑並轉 _PENDING。
 OCR_MAX_BATCH_ATTEMPTS = 3
 

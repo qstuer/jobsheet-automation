@@ -306,6 +306,15 @@ class NvidiaResponseTests(unittest.TestCase):
         for old_example in ("US622B1115", "USO16D0865", "PYNEH", "EPIQ Elite"):
             self.assertNotIn(old_example, prompt)
 
+    def test_focused_serial_reader_filters_non_serial_text(self):
+        response = '{"serial_candidates":["US123F4567","SERIAL NO.","--"]}'
+        with patch.object(nvidia_client, "crop_jobsheet_serial", return_value="image"), \
+                patch.object(nvidia_client, "_call_vision", return_value=response) as call:
+            result = nvidia_client.ocr_jobsheet_serial_candidates(MagicMock(), 0)
+
+        self.assertEqual(["US123F4567"], result)
+        self.assertTrue(call.call_args.kwargs["expects_json"])
+
 
 class ProcessorConsensusTests(unittest.TestCase):
     def setUp(self):
@@ -389,6 +398,32 @@ class ProcessorConsensusTests(unittest.TestCase):
 
         self.assertEqual("task-1", matched["gid"])
         find.assert_called_once()
+
+    def test_failed_full_crop_uses_focused_serial_consensus(self):
+        general = {
+            "serial_candidates": ["WRONG12345"],
+            "phone_candidates": ["25956917"],
+            "asset_candidates": ["19130438"],
+            "service_date_raw": "18/8/2026",
+            "date_source": "ACTION_DATE",
+        }
+        task = {"gid": "task-1", "name": "Task 1"}
+        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
+                patch.object(config, "OCR_SERIAL_RETRY_ZOOMS", [4.0, 5.0, 6.0]), \
+                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
+                patch.object(nvidia_client, "ocr_jobsheet_fields",
+                             side_effect=[general, general, general]), \
+                patch.object(nvidia_client, "ocr_jobsheet_serial_candidates",
+                             side_effect=[["US123F4567"], ["US123F4567"]]) as focused, \
+                patch.object(asana_client, "find_task",
+                             side_effect=[(None, 0), (None, 0), (task, 2)]) as find:
+            matched, tier, consensus = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertEqual("task-1", matched["gid"])
+        self.assertEqual(2, tier)
+        self.assertIn("US123F4567", consensus["serial_candidates"])
+        self.assertEqual(2, focused.call_count)
+        self.assertEqual(3, find.call_count)
 
 
 class AsanaMatchSafetyTests(unittest.TestCase):
