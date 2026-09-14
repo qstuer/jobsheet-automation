@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 if "fitz" not in sys.modules and importlib.util.find_spec("fitz") is None:
     sys.modules["fitz"] = MagicMock()
 
-from src import config, processor, rclone_helper, splitter
+from src import config, healthcheck, processor, rclone_helper, splitter
 from src import pdf_utils
 from src.pdf_utils import SplitError
 
@@ -304,6 +304,13 @@ class RcloneListTests(unittest.TestCase):
             "lsf", "remote:path", "--include", "*.pdf", "--files-only",
             "--max-depth", "1",
         )
+
+    def test_healthcheck_uses_missing_folder_safe_listing(self):
+        with patch.object(rclone_helper, "list_files", return_value=[]) as listing:
+            self.assertEqual(0, healthcheck.main())
+
+        self.assertEqual(len(healthcheck.QUEUES), listing.call_count)
+        listing.assert_any_call(config.GDRIVE_INCOMPLETE, "*.pdf")
 
 
 class RcloneSafetyTests(unittest.TestCase):

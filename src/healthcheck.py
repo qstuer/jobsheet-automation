@@ -20,7 +20,10 @@ QUEUES = (
 def main() -> int:
     try:
         for label, remote in QUEUES:
-            files = rclone_helper.list_pdfs(remote, exclude_subdirs=True)
+            # 新增的狀態資料夾在第一次真正需要前可能尚未存在；rclone 的
+            # exit 3 在這裡只代表該資料夾為空／未建立，不應令整個 Stage B
+            # 在開始辨認前失敗。登入、網路等其他錯誤仍會正常拋出。
+            files = rclone_helper.list_files(remote, "*.pdf")
             log.info(f"{label}：{len(files)} 份")
             for filename in files:
                 log.info(f"  - {filename}")
