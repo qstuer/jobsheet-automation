@@ -353,6 +353,38 @@ def _task_activity_dates(task: dict) -> List[date]:
     return list(dict.fromkeys(value for value in parsed if value))
 
 
+def _today() -> date:
+    """獨立 helper 讓近期日期規則可測試，不把執行日期寫死。"""
+    return date.today()
+
+
+def _service_date_delta(service_date: date, task_dates: List[date]) -> tuple:
+    """回傳 (最小日差, 是否只校正了明顯誤讀的年份)。
+
+    手寫 6 常被看成 0/5。只在 OCR 日期不在最近三個月、而 Asana 日期在
+    最近三個月時，才用 Asana 年份重算月日差；仍需 serial/電話等證據才會
+    真正配對，所以這不是單靠日期猜工作。
+    """
+    direct = min(abs((candidate - service_date).days) for candidate in task_dates)
+    today = _today()
+    if abs((service_date - today).days) <= 93:
+        return direct, False
+    recent_candidates = [
+        candidate for candidate in task_dates
+        if abs((candidate - today).days) <= 93
+    ]
+    corrected = []
+    for candidate in recent_candidates:
+        try:
+            same_year = service_date.replace(year=candidate.year)
+        except ValueError:
+            continue
+        corrected.append(abs((candidate - same_year).days))
+    if corrected and min(corrected) <= 14 and min(corrected) < direct:
+        return min(corrected), True
+    return direct, False
+
+
 def _task_container_text(task: dict) -> str:
     parts = []
     for field in ("memberships", "effective_memberships"):
@@ -447,16 +479,23 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         service_date = _parse_date(ocr_data.get("service_date_raw"))
     task_dates = _task_dates(task)
     date_delta = None
+    date_year_corrected = False
     if service_date and task_dates:
-        date_delta = min(abs((candidate - service_date).days) for candidate in task_dates)
+        date_delta, date_year_corrected = _service_date_delta(service_date, task_dates)
         if date_delta <= 3:
             score += 50
             support.add("date")
-            reasons.append("date within 3 days")
+            reasons.append(
+                "date within 3 days (year corrected)"
+                if date_year_corrected else "date within 3 days"
+            )
         elif date_delta <= 14:
             score += 40
             support.add("date")
-            reasons.append("date within 14 days")
+            reasons.append(
+                "date within 14 days (year corrected)"
+                if date_year_corrected else "date within 14 days"
+            )
         elif date_delta <= 31:
             score += 25
             support.add("date")

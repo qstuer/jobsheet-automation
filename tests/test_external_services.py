@@ -2,6 +2,7 @@
 import importlib.util
 import sys
 import unittest
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -368,6 +369,37 @@ class ProcessorConsensusTests(unittest.TestCase):
 
 
 class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_recent_task_can_correct_obviously_misread_service_year(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": ["USN16F0565"],
+            "serial_no": "USN16F0565",
+            "phone_candidates": ["25956158"],
+            "service_date_raw": "18/8/2020",
+            "date_source": "ACTION_DATE",
+        }
+        current = {
+            "gid": "current",
+            "name": "PYNEH Affiniti 70 USN16F0565 61877077",
+            "notes": "25956158",
+            "due_on": "2026-08-20",
+            "memberships": [{"project": {"name": "2026 PM"}}],
+        }
+        historical = {
+            "gid": "historical",
+            "name": "PYNEH Affiniti 70 USN16F0565 60000001",
+            "notes": "25956158",
+            "due_on": "2025-08-20",
+            "memberships": [{"project": {"name": "2025 PM"}}],
+        }
+        with patch.object(asana_client, "_today", return_value=date(2026, 9, 14)), \
+                patch.object(asana_client, "_gather_pool",
+                             return_value=[historical, current]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertEqual("current", task["gid"])
+        self.assertEqual(2, tier)
+
     def test_work_order_number_is_used_to_find_candidates(self):
         with patch.object(asana_client, "_typeahead", return_value=[]) as search:
             asana_client._gather_pool(
