@@ -24,6 +24,14 @@ on:
         required: true
         default: false
         type: boolean
+      ocr_provider:
+        description: '手動測試本次使用的圖片服務；自動流程不受影響'
+        required: true
+        default: nvidia
+        type: choice
+        options:
+          - nvidia
+          - deepseek
       confirmed_filename:
         description: '人工已核對的確定檔名（不含 .pdf）；只可配合指定單檔使用'
         required: false
@@ -76,7 +84,9 @@ jobs:
         run: python -m src.healthcheck
       - name: Run processor
         env:
-          OCR_PROVIDER:         ${{ vars.OCR_PROVIDER }}
+          # 手動執行可只為本次選 DeepSeek；workflow_run 沒有 inputs，仍使用
+          # repository variable，未設定時由 src/config.py 保持 NVIDIA 預設。
+          OCR_PROVIDER:         ${{ inputs.ocr_provider || vars.OCR_PROVIDER }}
           DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL:       ${{ vars.DEEPSEEK_MODEL }}
           NVIDIA_API_KEY:       ${{ secrets.NVIDIA_API_KEY }}

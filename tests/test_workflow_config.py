@@ -70,6 +70,8 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("JOBSHEET_DRY_RUN:", text)
         self.assertIn("confirmed_filename:", text)
         self.assertIn("JOBSHEET_CONFIRMED_FILENAME:", text)
+        self.assertIn("ocr_provider:", text)
+        self.assertIn("inputs.ocr_provider || vars.OCR_PROVIDER", text)
 
     def test_raw_dry_run_is_separate_and_cannot_trigger_stage_b(self):
         workflow = ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml"
