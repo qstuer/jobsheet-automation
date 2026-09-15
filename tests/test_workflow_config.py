@@ -97,6 +97,7 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("full_rebuild:", text)
         self.assertIn("if: ${{ !inputs.full_rebuild }}", text)
         self.assertIn("if: ${{ inputs.full_rebuild }}", text)
+        self.assertIn("set -o pipefail", text)
 
 
 class AppsScriptSafetyTests(unittest.TestCase):

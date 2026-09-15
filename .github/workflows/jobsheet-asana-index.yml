@@ -78,7 +78,9 @@ jobs:
           ASANA_INDEX_WINDOW_START: ${{ inputs.window_start }}
           ASANA_INDEX_WINDOW_END: ${{ inputs.window_end }}
           ASANA_INDEX_OUTPUT_DIR: /tmp/asana-index
-        run: python -m src.asana_index | tee /tmp/asana-index-summary.json
+        run: |
+          set -o pipefail
+          python -m src.asana_index | tee /tmp/asana-index-summary.json
       - name: Replace private index files in Google Drive
         run: |
           # 設備 JSON、設備 CSV、地點 CSV 先寫，manifest 最後寫；Stage B 會比對版本，

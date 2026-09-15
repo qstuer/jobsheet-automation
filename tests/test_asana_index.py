@@ -28,6 +28,21 @@ def task(gid, name, *, modified="2026-09-10T00:00:00Z", notes="", project_type="
 
 
 class AsanaIndexTests(unittest.TestCase):
+    def test_transient_asana_error_is_retried(self):
+        limited = MagicMock(status_code=429, headers={"Retry-After": "1"})
+        success = MagicMock(status_code=200, headers={})
+        success.json.return_value = {"data": []}
+        with patch.object(asana_index.config, "ASANA_TOKEN", "token"), \
+                patch.object(asana_index.config, "ASANA_WORKSPACE_GID", "workspace"), \
+                patch.object(
+                    asana_index.requests, "get", side_effect=[limited, success]
+                ) as request, \
+                patch.object(asana_index.time, "sleep") as sleep:
+            payload = asana_index._request("https://example.invalid/tasks", {})
+        self.assertEqual({"data": []}, payload)
+        self.assertEqual(2, request.call_count)
+        sleep.assert_called_once_with(1.0)
+
     def test_same_device_merges_history_but_different_serials_stay_separate(self):
         rows = asana_index.build_index([
             task("1", "PYNEH / Affiniti 70 / US123F4567", notes="Phone 61234567 Contact: Alice Asset# 19130438"),

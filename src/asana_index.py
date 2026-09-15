@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -105,12 +106,35 @@ def _request(url: str, params: dict, *, timeout: int = 30) -> dict:
     if not config.ASANA_TOKEN or not config.ASANA_WORKSPACE_GID:
         raise AsanaIndexError("ASANA_TOKEN 或 ASANA_WORKSPACE_GID 未設定")
     headers = {"Authorization": f"Bearer {config.ASANA_TOKEN}"}
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise AsanaIndexError(f"Asana 索引讀取失敗：{url}") from exc
+    response = None
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            if attempt == 5:
+                raise AsanaIndexError(f"Asana 索引讀取失敗：{url}") from exc
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt == 5:
+                raise AsanaIndexError(
+                    f"Asana 索引讀取失敗：HTTP {response.status_code}"
+                )
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = max(1.0, min(float(retry_after), 120.0))
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 30)
+            time.sleep(delay)
+            continue
+        try:
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise AsanaIndexError(f"Asana 索引讀取失敗：{url}") from exc
+        break
+    else:  # pragma: no cover - loop exits or raises above
+        raise AsanaIndexError(f"Asana 索引讀取失敗：{url}")
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise AsanaIndexError("Asana 索引回傳格式不正確")
     return payload
