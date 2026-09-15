@@ -181,6 +181,16 @@ class LayeredSearchTests(unittest.TestCase):
         self.assertNotIn("task_refs", candidates[0])
         self.assertNotIn("order_no", candidates[0])
 
+    def test_candidate_exactly_ten_percentage_points_behind_is_included(self):
+        asana_client.set_device_index({
+            "schema_version": 3,
+            "devices": [row("ABCDEFGHXX"), row("ABCDEFGXXX")],
+        })
+        candidates = asana_client.get_close_index_candidates(
+            ocr("ABCDEFGHIJ"), "PM"
+        )
+        self.assertEqual(2, len(candidates))
+
     def test_serial_missing_requires_unique_product_hospital_phone_and_asset(self):
         asana_client.set_device_index({"schema_version": 3, "devices": [row("USN16F0565")]})
         ranked = asana_client._rank_index_devices(ocr(None), "PM")

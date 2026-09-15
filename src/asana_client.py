@@ -39,6 +39,7 @@ _task_cache: dict = {}
 # running in the legacy/live-search mode (keeps small unit tests and emergency
 # fallback behaviour compatible).
 _device_index: Optional[dict] = None
+_INDEX_SCORE_EPSILON = 1e-9
 
 # 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
 # 與配對證據；完整的私人機構名稱仍可保留使用。
@@ -746,12 +747,12 @@ def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -
     if not serials_visible or len(ranked) < 2:
         return []
     gap = ranked[0]["serial_similarity"] - ranked[1]["serial_similarity"]
-    if gap > config.INDEX_SERIAL_CLOSE_GAP:
+    if gap > config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON:
         return []
     close_ranked = [
         item for item in ranked
         if ranked[0]["serial_similarity"] - item["serial_similarity"]
-        <= config.INDEX_SERIAL_CLOSE_GAP
+        <= config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
     ][:config.INDEX_VISION_CANDIDATE_LIMIT]
     result = []
     for number, item in enumerate(close_ranked, 1):
@@ -806,7 +807,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         allowed = [
             item for item in scored
             if scored[0]["serial_similarity"] - item["serial_similarity"]
-            <= config.INDEX_SERIAL_CLOSE_GAP
+            <= config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
         ][:config.INDEX_VISION_CANDIDATE_LIMIT]
         selected = next(
             (item for item in allowed if item["row"].get("device_key") == selected_device_key),
@@ -827,7 +828,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         if best is scored[0] and len(scored) > 1 else 1.0
     )
     accepted = bool(selected_device_key) or not serials_visible or len(scored) == 1 \
-        or gap > config.INDEX_SERIAL_CLOSE_GAP
+        or gap > config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
     if not accepted:
         log.info(
             "  設備索引前兩名只相差 %s 個百分點，需要一次候選複核",
