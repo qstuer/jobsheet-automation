@@ -109,6 +109,40 @@ class SerialRowIndexTests(unittest.TestCase):
         self.assertEqual(["KWM"], location["unconfirmed_aliases"])
         self.assertEqual("", location["canonical_hospital"])
 
+    def test_status_prefix_and_short_code_room_are_not_hospital_names(self):
+        self.assertEqual(
+            ("QMH", "A7"),
+            asana_client.split_hospital_location("(Cancel) QMH A7"),
+        )
+        self.assertEqual(
+            ("TKO", "MB-G-A"),
+            asana_client.split_hospital_location("TKO MB-G-A"),
+        )
+        self.assertEqual(
+            ("Alpha Medical Diagnostic Centre", ""),
+            asana_client.split_hospital_location("Alpha Medical Diagnostic Centre"),
+        )
+
+    def test_location_table_groups_status_variants_under_confirmed_hospital(self):
+        index = asana_index.build_index([
+            task("1", "(Cancel) QMH A7 / CX50 / USN16F0565"),
+            task("2", "(Office)QMH K3 / CX50 / USN16F0566"),
+        ], window_start=date(2025, 1, 1), window_end=date(2026, 12, 31))
+        self.assertEqual(1, index["location_count"])
+        location = index["location_directory"][0]
+        self.assertEqual("Queen Mary Hospital", location["canonical_hospital"])
+        self.assertIn("A7", location["department_rooms"])
+        self.assertIn("K3", location["department_rooms"])
+
+    def test_unclosed_status_text_is_visible_but_not_matchable(self):
+        index = asana_index.build_index([
+            task("1", "(**Before 14 / CX50 / USN16F0565"),
+        ], window_start=date(2025, 1, 1), window_end=date(2026, 12, 31))
+        location = index["location_directory"][0]
+        self.assertFalse(location["match_enabled"])
+        self.assertEqual("", location["canonical_hospital"])
+        self.assertEqual(["(**Before 14"], location["unconfirmed_aliases"])
+
     def test_relocated_serial_keeps_two_distinct_full_hospitals(self):
         index = asana_index.build_index([
             task("1", "Alpha Hospital / CX50 / USN16F0565"),

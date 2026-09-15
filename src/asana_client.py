@@ -200,16 +200,47 @@ def hospital_acronym(value: Optional[str]) -> Optional[str]:
     return acronym if 2 <= len(acronym) <= 8 else None
 
 
+def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
+    """Separate hospital identity from status tags and floor/room suffixes.
+
+    Asana operators commonly prefix a real site with ``(Cancel)``, ``(Aug)``,
+    ``(**BESS)`` or ``(Office)``.  Those labels and a trailing location after an
+    uppercase hospital code belong to detail, not to the hospital identity.
+    Full names such as ``Alpha Medical Diagnostic Centre`` remain untouched.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+    while True:
+        tagged = re.match(r"^\s*\((?P<tag>[^)]{1,40})\)\s*(?P<rest>.+)$", raw)
+        if not tagged:
+            break
+        raw = tagged.group("rest").strip()
+    core = re.split(r"[,/]", raw, 1)[0].strip()
+    detail = raw[len(core):].lstrip(" ,/").strip()
+    match = re.match(r"^(?P<hospital>[A-Za-z]{2,8})\s*-\s*(?P<detail>.+)$", core)
+    if match:
+        detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
+        core = match.group("hospital").strip()
+    else:
+        # ``QMH K3``, ``TKO MB-G-A`` and ``HKAH(Stubbs Road)`` are a short
+        # hospital code followed by in-hospital detail.  Requiring the code to
+        # be uppercase avoids splitting ordinary full names at their first word.
+        match = re.match(
+            r"^(?P<hospital>[A-Z]{2,8})(?:(?:\s+)|(?=\())(?P<detail>.+)$",
+            core,
+        )
+        if match:
+            detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
+            core = match.group("hospital").strip()
+    return core, detail
+
+
 def hospital_aliases(value: Optional[str]) -> List[str]:
     """Return safe comparison forms without turning room detail into a hospital."""
-    if not value:
+    core, _ = split_hospital_location(value)
+    if not core:
         return []
-    raw = str(value).strip()
-    # Slash/comma conventionally starts department/detail.  A hyphen is treated
-    # as detail only for a leading hospital code (e.g. GH-3F), not in a full name.
-    core = re.split(r"[,/]", raw, 1)[0].strip()
-    if re.match(r"^[A-Za-z]{2,8}\s*-", core):
-        core = core.split("-", 1)[0].strip()
     canonical = hospital_core(core)
     # Unknown short codes are the most common OCR hallucination (PN/KWM/PYTV).
     # They must not pass the 33% fuzzy hospital gate.
@@ -222,20 +253,6 @@ def hospital_aliases(value: Optional[str]) -> List[str]:
     if acronym:
         result.append(acronym)
     return list(dict.fromkeys(item for item in result if item))
-
-
-def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
-    """Separate hospital identity from a short-code floor/room suffix."""
-    raw = str(value or "").strip()
-    if not raw:
-        return "", ""
-    core = re.split(r"[,/]", raw, 1)[0].strip()
-    detail = raw[len(core):].lstrip(" ,/").strip()
-    match = re.match(r"^(?P<hospital>[A-Za-z]{2,8})\s*-\s*(?P<detail>.+)$", core)
-    if match:
-        detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
-        core = match.group("hospital").strip()
-    return core, detail
 
 
 def _index_hospital_aliases(value: Optional[str]) -> List[str]:

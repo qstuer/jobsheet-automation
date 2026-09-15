@@ -124,6 +124,9 @@ serial 的列標記為 weak，永不自動命名。索引不保存 Order Number�
 統一地點表亦嵌在設備 JSON，Stage B 不必多下載一個檔案。未知短碼會留在地點 CSV
 供人工查看，但標為不可配對；同一設備曾搬院亦不會令兩間完整醫院名稱變成同義詞。
 只有簡寫與完整名稱在至少兩個不同 Serial 重複並存，才可由程序學成別名。
+Asana 標題前的 `(Cancel)`、`(Aug)`、`(**BESS)`、`(Office)` 等狀態標籤會被移除；
+`QMH K3`、`TKO MB-G-A` 這類「大寫醫院碼 + 院內位置」會拆成醫院及詳細位置。
+沒有完整括號的狀態文字只保留供人工查看，不參與自動配對。
 
 目前索引 schema 是 `3`。四個檔案只寫入 Google Drive `.jobsheet-control/`。JSON/CSV 先替換，manifest 最後
 替換；Stage B 下載 JSON 及 manifest 並核對版本，不一致或下載失敗便保留來源檔，

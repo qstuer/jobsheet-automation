@@ -488,7 +488,11 @@ def _build_location_directory(rows: list[dict], learned_groups: list[dict]) -> l
         normalized = _norm(core)
         known = asana_client.hospital_core(core)
         learned = learned_by_alias.get(normalized)
-        if known:
+        malformed_status = core.lstrip().startswith("(")
+        if malformed_status:
+            key, official = f"UNCONFIRMED|{normalized}", ""
+            confirmed, learned_aliases, unconfirmed, enabled = [], [], [core], False
+        elif known:
             key = _norm(known)
             official = (
                 asana_client.HOSPITAL_OFFICIAL_NAMES.get(key)
