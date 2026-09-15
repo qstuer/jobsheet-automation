@@ -25,6 +25,11 @@ GDRIVE_INCOMPLETE = "googledrive:From_BrotherDevice/_INCOMPLETE"
 GDRIVE_INCOMPLETE_RAW = "googledrive:From_BrotherDevice/_INCOMPLETE_RAW"
 # 每個原始掃描一份 JSON 狀態；Apps Script 只會為需要人工處理的完成報告寄信。
 GDRIVE_REPORTS = "googledrive:From_BrotherDevice/_REPORTS"
+# Asana 設備索引只放在 Google Drive 私有控制資料夾；不放 Git，也不放 OneDrive。
+GDRIVE_CONTROL = "googledrive:From_BrotherDevice/.jobsheet-control"
+GDRIVE_ASANA_INDEX_JSON = f"{GDRIVE_CONTROL}/asana-device-index.json"
+GDRIVE_ASANA_INDEX_CSV = f"{GDRIVE_CONTROL}/asana-device-index.csv"
+GDRIVE_ASANA_INDEX_MANIFEST = f"{GDRIVE_CONTROL}/asana-device-index-manifest.json"
 ONEDRIVE_OUTPUT = "onedrive:Hong Kong Sen's Healthcare/JOBSHEETS"
 
 # === Google Drive Folder IDs (給 Apps Script 用) ===
@@ -90,6 +95,7 @@ OCR_FIELD_BOXES = {
     "product_raw":     (0.405, 0.108, 0.570, 0.162),
     "serial_candidates": (0.570, 0.108, 0.770, 0.162),
     "hospital_raw":    (0.055, 0.164, 0.575, 0.207),
+    "contact_person_raw": (0.555, 0.164, 0.955, 0.207),
     "department_room_raw": (0.055, 0.198, 0.575, 0.242),
     "phone_candidates": (0.555, 0.198, 0.955, 0.242),
     "service_date_raw": (0.555, 0.312, 0.735, 0.365),
@@ -103,20 +109,21 @@ OCR_FOCUSED_FIELD_BOXES = {
     "product_raw":       (0.405, 0.122, 0.570, 0.162),
     "serial_candidates": (0.570, 0.120, 0.770, 0.166),
     "hospital_raw":      (0.180, 0.166, 0.575, 0.207),
+    "contact_person_raw": (0.670, 0.166, 0.955, 0.207),
     "department_room_raw": (0.180, 0.198, 0.575, 0.242),
     "phone_candidates":  (0.670, 0.198, 0.955, 0.242),
     "service_date_raw":   (0.555, 0.323, 0.735, 0.365),
 }
 OCR_PRIMARY_CARD_FIELDS = (
     "order_no", "product_raw", "serial_candidates", "hospital_raw",
-    "department_room_raw", "phone_candidates", "service_date_raw",
+    "contact_person_raw", "department_room_raw", "phone_candidates", "service_date_raw",
     "fault_symptom", "action_taken",
 )
 OCR_IDENTITY_CARD_FIELDS = (
     "order_no", "product_raw", "serial_candidates", "hospital_raw",
 )
 OCR_SUPPORT_CARD_FIELDS = (
-    "department_room_raw", "phone_candidates", "service_date_raw",
+    "contact_person_raw", "department_room_raw", "phone_candidates", "service_date_raw",
     "fault_symptom", "action_taken",
 )
 OCR_CARD_WIDTH = 1200

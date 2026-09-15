@@ -30,12 +30,18 @@ KNOWN_PRODUCTS = [
     "CX30", "CX50",
 ]
 
-MAX_SERIAL_DIST = 1   # serial 錯一字才可考慮，而且仍須其他欄位交叉支持
+MAX_SERIAL_DIST = 3   # 設備索引容許 1–3 字 OCR 誤差；越遠要求越多其他證據
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
+INDEX_DEVICE_MIN_SCORE = 60
+INDEX_DEVICE_MIN_GAP = 15
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
+# Optional private index loaded by Stage B.  ``None`` means this process is
+# running in the legacy/live-search mode (keeps small unit tests and emergency
+# fallback behaviour compatible).
+_device_index: Optional[dict] = None
 
 # 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
 # 與配對證據；完整的私人機構名稱仍可保留使用。
@@ -60,6 +66,20 @@ HOSPITAL_ALIASES = {
 
 class AsanaError(RuntimeError):
     """Asana 連線或權限故障；必須保留 PDF 等下次重試。"""
+
+
+def set_device_index(index: dict) -> None:
+    """Install a validated device index for this process only."""
+    global _device_index
+    if not isinstance(index, dict) or not isinstance(index.get("devices"), list):
+        raise AsanaError("Asana 設備索引格式不正確")
+    _device_index = index
+
+
+def clear_device_index() -> None:
+    """Clear the optional index (used by tests and one-shot local runs)."""
+    global _device_index
+    _device_index = None
 
 
 # ── 小工具 ────────────────────────────────────────────────────
@@ -97,6 +117,28 @@ def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
         if d < best_d:
             best_d, best = d, p
     return best if best_d <= MAX_PRODUCT_DIST else ocr_product
+
+
+def product_family(value: Optional[str]) -> Optional[str]:
+    """Return the stable equipment family while preserving variants elsewhere.
+
+    Field engineers use both ``Affiniti 70`` and ``Affiniti 70G`` for the same
+    family.  The index groups them together but keeps every raw spelling for
+    audit and matching.
+    """
+    if not value:
+        return None
+    normalized = _norm(value)
+    normalized = re.sub(r"G$", "", normalized) if normalized.startswith("AFFINITI") else normalized
+    best = None
+    best_distance = 99
+    for known in KNOWN_PRODUCTS:
+        known_norm = _norm(known)
+        family_norm = re.sub(r"G$", "", known_norm) if known_norm.startswith("AFFINITI") else known_norm
+        distance = _lev(normalized, family_norm)
+        if distance < best_distance:
+            best, best_distance = known, distance
+    return best if best_distance <= MAX_PRODUCT_DIST else normalize_product(value)
 
 
 def hospital_core(customer: Optional[str]) -> Optional[str]:
@@ -327,6 +369,280 @@ def _gather_pool(order_no, serials, hosp, product,
     return hydrated
 
 
+def _index_dates(ref: dict) -> List[date]:
+    values = []
+    for value in ref.get("work_dates") or []:
+        parsed = _parse_date(str(value))
+        if parsed:
+            values.append(parsed)
+    return values
+
+
+def _text_norm(value: Optional[str]) -> str:
+    """Unicode-safe comparison key for people and room names."""
+    return "".join(char for char in str(value or "").casefold() if char.isalnum())
+
+
+def _similarity(left: Optional[str], right: Optional[str]) -> float:
+    left_key, right_key = _text_norm(left), _text_norm(right)
+    if not left_key or not right_key:
+        return 0.0
+    return 1.0 - (_lev(left_key, right_key) / max(len(left_key), len(right_key)))
+
+
+def _digit_distance(left: str, right: str) -> int:
+    return _lev(re.sub(r"\D", "", left), re.sub(r"\D", "", right))
+
+
+def _score_index_device(row: dict, ocr_data: dict,
+                        job_type: Optional[str]) -> dict:
+    """Score one equipment row without revealing indexed values in logs."""
+    score = 0
+    support = set()
+    reasons = []
+    serials = _clean_candidates(
+        ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
+    )
+    serials += [value for value in _clean_candidates(
+        ocr_data.get("serial_visual_candidates")
+    ) if value not in serials]
+    row_serial = _norm(row.get("serial"))
+    serial_dist = 99
+    if row_serial and serials:
+        serial_dist = min(_lev(_norm(value), row_serial) for value in serials)
+        serial_points = {0: 50, 1: 42, 2: 32, 3: 22}.get(serial_dist, 0)
+        score += serial_points
+        if serial_points:
+            support.add("serial_exact" if serial_dist == 0 else "serial_fuzzy")
+            reasons.append(f"serial distance {serial_dist}")
+
+    wanted_product = product_family(
+        ocr_data.get("product") or ocr_data.get("product_raw")
+    )
+    if wanted_product and _norm(wanted_product) == _norm(product_family(row.get("product"))):
+        score += 20
+        support.add("product")
+        reasons.append("product family")
+
+    wanted_hospital = hospital_core(
+        ocr_data.get("hospital_raw") or ocr_data.get("customer")
+        or ocr_data.get("customer_raw")
+    )
+    hospital_keys = {
+        _norm(hospital_core(value) or value)
+        for value in [*(row.get("hospitals") or []), *(row.get("locations") or [])]
+        if value
+    }
+    if wanted_hospital and _norm(wanted_hospital) in hospital_keys:
+        score += 20
+        support.add("hospital")
+        reasons.append("hospital")
+
+    wanted_room = ocr_data.get("department_room_raw") or ocr_data.get("location_raw")
+    room_similarity = max(
+        (_similarity(wanted_room, value) for value in row.get("department_rooms") or []),
+        default=0.0,
+    )
+    if room_similarity >= 0.90:
+        score += 10
+        support.add("room")
+        reasons.append("room exact")
+    elif room_similarity >= 0.75:
+        score += 6
+        support.add("room")
+        reasons.append("room similar")
+
+    wanted_phones = [re.sub(r"\D", "", value) for value in ocr_data.get("phone_candidates") or []]
+    row_phones = [re.sub(r"\D", "", value) for value in row.get("phones") or []]
+    phone_dist = min(
+        (_digit_distance(left, right) for left in wanted_phones for right in row_phones
+         if left and right and len(left) == len(right)), default=99,
+    )
+    if phone_dist == 0:
+        score += 20
+        support.add("phone_exact")
+        reasons.append("phone exact")
+    elif phone_dist == 1:
+        score += 10
+        support.add("phone_fuzzy")
+        reasons.append("phone differs by 1")
+
+    wanted_assets = [re.sub(r"\D", "", value) for value in ocr_data.get("asset_candidates") or []]
+    row_assets = [re.sub(r"\D", "", value) for value in row.get("assets") or []]
+    asset_dist = min(
+        (_digit_distance(left, right) for left in wanted_assets for right in row_assets
+         if left and right and len(left) == len(right)), default=99,
+    )
+    if asset_dist == 0:
+        score += 18
+        support.add("asset_exact")
+        reasons.append("asset exact")
+    elif asset_dist == 1:
+        score += 8
+        support.add("asset_fuzzy")
+        reasons.append("asset differs by 1")
+
+    contact = ocr_data.get("contact_person_raw")
+    contact_similarity = max(
+        (_similarity(contact, value) for value in row.get("contacts") or []),
+        default=0.0,
+    )
+    if contact_similarity >= 0.90:
+        score += 8
+        support.add("contact")
+        reasons.append("contact")
+    elif contact_similarity >= 0.75:
+        score += 5
+        support.add("contact")
+        reasons.append("contact similar")
+
+    service_date = (
+        _parse_date(ocr_data.get("service_date_raw"))
+        if ocr_data.get("date_source") == "ACTION_DATE" else None
+    )
+    indexed_dates = [
+        candidate
+        for ref in row.get("task_refs") or []
+        for candidate in _index_dates(ref)
+    ]
+    if service_date and indexed_dates:
+        delta = min(abs((candidate - service_date).days) for candidate in indexed_dates)
+        if delta <= 3:
+            score += 15
+            support.add("date")
+            reasons.append("date within 3 days")
+        elif delta <= 14:
+            score += 10
+            support.add("date")
+            reasons.append("date within 14 days")
+        elif delta <= 31:
+            score += 5
+            support.add("date")
+            reasons.append("date within 31 days")
+
+    if job_type and job_type in (row.get("job_types") or []):
+        score += 8
+        support.add("job_type")
+        reasons.append("job type")
+    return {
+        "row": row, "score": score, "serial_dist": serial_dist,
+        "support": support, "reasons": reasons,
+    }
+
+
+def _score_index_task_ref(ref: dict, ocr_data: dict,
+                          job_type: Optional[str]) -> int:
+    """Rank historical jobs inside an accepted device; never use recency alone."""
+    score = 0
+    ref_type = ref.get("job_type") or ""
+    if job_type and ref_type and ref_type != job_type:
+        return -1000
+    if job_type and ref_type == job_type:
+        score += 20
+    service_date = (
+        _parse_date(ocr_data.get("service_date_raw"))
+        if ocr_data.get("date_source") == "ACTION_DATE" else None
+    )
+    dates = _index_dates(ref)
+    if service_date and dates:
+        delta = min(abs((candidate - service_date).days) for candidate in dates)
+        score += 30 if delta <= 3 else 20 if delta <= 14 else 10 if delta <= 31 else 0
+    for field, points in (("phones", 25), ("assets", 20)):
+        wanted_key = "phone_candidates" if field == "phones" else "asset_candidates"
+        wanted = [re.sub(r"\D", "", value) for value in ocr_data.get(wanted_key) or []]
+        stored = [re.sub(r"\D", "", value) for value in ref.get(field) or []]
+        if any(left and left == right for left in wanted for right in stored):
+            score += points
+        elif any(left and right and len(left) == len(right) and _digit_distance(left, right) == 1
+                 for left in wanted for right in stored):
+            score += points // 2
+    contact = ocr_data.get("contact_person_raw")
+    if max((_similarity(contact, value) for value in ref.get("contacts") or []), default=0.0) >= 0.75:
+        score += 8
+    room = ocr_data.get("department_room_raw") or ocr_data.get("location_raw")
+    if max((_similarity(room, value) for value in ref.get("department_rooms") or []), default=0.0) >= 0.75:
+        score += 8
+    wanted_hospital = hospital_core(
+        ocr_data.get("hospital_raw") or ocr_data.get("customer")
+        or ocr_data.get("customer_raw")
+    )
+    ref_hospital = hospital_core(ref.get("hospital") or ref.get("location"))
+    if wanted_hospital and ref_hospital and _norm(wanted_hospital) == _norm(ref_hospital):
+        score += 8
+    wanted_product = product_family(
+        ocr_data.get("product") or ocr_data.get("product_raw")
+    )
+    ref_product = product_family(ref.get("product") or ref.get("product_variant"))
+    if wanted_product and ref_product and _norm(wanted_product) == _norm(ref_product):
+        score += 5
+    return score
+
+
+def _gather_index_pool(ocr_data: dict, job_type: Optional[str]) -> tuple[List[dict], bool]:
+    """Choose one device, then hydrate its historical tasks from live Asana.
+
+    The boolean distinguishes a genuine index miss (safe to use typeahead) from
+    ambiguous indexed candidates (must stay pending instead of broadening).
+    """
+    if _device_index is None:
+        return [], False
+    scored = [
+        _score_index_device(row, ocr_data, job_type)
+        for row in _device_index.get("devices", [])
+    ]
+    scored = [item for item in scored if item["score"] > 0]
+    if not scored:
+        return [], False
+    scored.sort(key=lambda item: (item["score"], -item["serial_dist"]), reverse=True)
+    for rank, item in enumerate(scored[:3], 1):
+        log.info(
+            "  設備候選 #%s：分數=%s、serial距離=%s、證據=%s",
+            rank, item["score"], item["serial_dist"], sorted(item["support"]),
+        )
+    best = scored[0]
+    runner_score = scored[1]["score"] if len(scored) > 1 else -1
+    gap = best["score"] - runner_score
+    serials_visible = bool(
+        ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
+        or ocr_data.get("serial_no")
+    )
+    non_serial = best["support"] - {"serial_exact", "serial_fuzzy"}
+    strong = non_serial & {"product", "hospital", "phone_exact", "asset_exact"}
+    accepted = (
+        not best["row"].get("weak_identity")
+        and best["score"] >= INDEX_DEVICE_MIN_SCORE
+        and gap >= INDEX_DEVICE_MIN_GAP
+    )
+    if serials_visible:
+        accepted = accepted and best["serial_dist"] <= MAX_SERIAL_DIST
+        if best["serial_dist"] in (1, 2, 3):
+            accepted = accepted and len(non_serial) >= 2 and bool(strong)
+    else:
+        accepted = accepted and {
+            "phone_exact", "asset_exact", "date"
+        }.issubset(best["support"])
+    if not accepted:
+        log.info(
+            "  設備索引仍有歧義：最高分=%s、分差=%s、serial距離=%s",
+            best["score"], gap, best["serial_dist"],
+        )
+        return [], True
+
+    refs = list(best["row"].get("task_refs") or [])
+    refs.sort(key=lambda ref: _score_index_task_ref(ref, ocr_data, job_type), reverse=True)
+    gids = []
+    for ref in refs:
+        if _score_index_task_ref(ref, ocr_data, job_type) < 0:
+            continue
+        gid = str(ref.get("gid") or "")
+        if gid and gid not in gids:
+            gids.append(gid)
+    gids = gids[:config.ASANA_MAX_HYDRATED_CANDIDATES]
+    hydrated = [_fetch_task(gid) for gid in gids]
+    log.info("  已鎖定一部設備，並即時讀取 %s 個歷史 Asana task", len(hydrated))
+    return hydrated, True
+
+
 def _clean_candidates(values, fallback=None) -> List[str]:
     items = []
     for value in list(values or []) + ([fallback] if fallback else []):
@@ -444,13 +760,81 @@ def _task_job_type(task: dict) -> Optional[str]:
     return "PM" if pm else "CM"
 
 
+def _task_contacts(task: dict) -> List[str]:
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
+    matches = re.findall(
+        r"(?im)\b(?:contact(?:\s+person)?|attn\.?|attention)\s*[:#-]?\s*"
+        r"([^\r\n,;|/]{2,50})",
+        text,
+    )
+    contacts = []
+    for value in matches:
+        value = re.split(r"\b(?:phone|tel|mobile|asset)\b", value, 1,
+                         flags=re.IGNORECASE)[0].strip(" .,:;-")
+        if sum(char.isalpha() for char in value) >= 2:
+            contacts.append(value)
+    return list(dict.fromkeys(contacts))
+
+
+def _task_digit_tokens(task: dict) -> List[str]:
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
+    values = []
+    for value in re.findall(r"(?<!\d)\d(?:[\d -]{5,}\d)(?!\d)", text):
+        digits = re.sub(r"\D", "", value)
+        if digits and digits not in values:
+            values.append(digits)
+    return values
+
+
+def _task_phones(task: dict) -> List[str]:
+    """Read phone evidence by label; avoid treating an Order Number as a phone."""
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
+    labeled = re.findall(
+        r"(?i)\b(?:phone|telephone|tel\.?|mobile)\s*(?:no\.?)?\s*[#.:\-]?\s*"
+        r"((?:\+?852[ -]?)?\d{4}[ -]?\d{4})",
+        text,
+    )
+    values = []
+    for value in labeled:
+        digits = re.sub(r"\D", "", value)
+        if len(digits) == 11 and digits.startswith("852"):
+            digits = digits[3:]
+        if len(digits) == 8 and digits not in values:
+            values.append(digits)
+    if values:
+        return values
+
+    excluded = set(re.findall(r"(?<!\d)[56]\d{7}(?!\d)", task.get("name") or ""))
+    excluded.update(_task_assets(task))
+    excluded.update(_task_work_orders(task))
+    return [value for value in _task_digit_tokens(task)
+            if len(value) == 8 and value not in excluded]
+
+
+def _task_assets(task: dict) -> List[str]:
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
+    values = re.findall(
+        r"(?i)\basset(?:\s*(?:no\.?))?\s*[#.\-:]?\s*(\d[\d -]{2,}\d)",
+        text,
+    )
+    return list(dict.fromkeys(
+        digits for value in values
+        if len(digits := re.sub(r"\D", "", value)) >= 4
+    ))
+
+
+def _task_work_orders(task: dict) -> List[str]:
+    text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
+    values = re.findall(r"(?i)\b(?:HAWO|WO)\s*[#.:\-]?\s*(\d{6,})\b", text)
+    return list(dict.fromkeys(values))
+
+
 def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                      hosp: Optional[str], product: Optional[str],
                      job_type: Optional[str] = None) -> dict:
     name = task.get("name") or ""
     notes = task.get("notes") or ""
     haystack_norm = _norm(f"{name}\n{notes}")
-    digits = re.sub(r"\D", "", f"{name}\n{notes}")
     task_serials = _task_serials(task)
 
     best_dist = 99
@@ -470,26 +854,52 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         score += 100
         reasons.append("serial exact")
     elif best_dist == 1:
-        score += 55
+        score += 70
         reasons.append("serial differs by 1")
+    elif best_dist == 2:
+        score += 50
+        reasons.append("serial differs by 2")
+    elif best_dist == 3:
+        score += 30
+        reasons.append("serial differs by 3")
 
     phones = [re.sub(r"\D", "", value)
               for value in ocr_data.get("phone_candidates", [])]
-    if any(len(value) >= 6 and value in digits for value in phones):
+    task_phones = _task_phones(task)
+    if any(len(value) >= 6 and value == candidate
+           for value in phones for candidate in task_phones):
         score += 45
-        support.add("phone")
+        support.add("phone_exact")
         reasons.append("phone")
+    elif any(
+        len(value) == len(candidate) == 8 and _lev(value, candidate) == 1
+        for value in phones for candidate in task_phones
+    ):
+        score += 20
+        support.add("phone_fuzzy")
+        reasons.append("phone differs by 1")
 
     assets = [re.sub(r"\D", "", value)
               for value in ocr_data.get("asset_candidates", [])]
-    if any(len(value) >= 4 and value in digits for value in assets):
+    task_assets = _task_assets(task)
+    if any(len(value) >= 4 and value == candidate
+           for value in assets for candidate in task_assets):
         score += 35
-        support.add("asset")
+        support.add("asset_exact")
         reasons.append("asset")
+    elif any(
+        len(value) == len(candidate) and len(value) >= 4 and _lev(value, candidate) == 1
+        for value in assets for candidate in task_assets
+    ):
+        score += 15
+        support.add("asset_fuzzy")
+        reasons.append("asset differs by 1")
 
     work_orders = [re.sub(r"\D", "", value)
                    for value in ocr_data.get("work_order_candidates", [])]
-    if any(len(value) >= 6 and value in digits for value in work_orders):
+    task_work_orders = _task_work_orders(task)
+    if any(len(value) >= 6 and value == candidate
+           for value in work_orders for candidate in task_work_orders):
         score += 60
         support.add("work_order")
         reasons.append("HAWO/WO")
@@ -500,6 +910,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
     product_ok = bool(product and _norm(product) in _norm(name))
     if hospital_ok:
         score += 20
+        support.add("hospital")
         reasons.append("hospital prefix")
     if product_ok:
         score += 15
@@ -508,12 +919,31 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
     if hospital_ok and product_ok:
         support.add("hospital+product")
 
+    contact = ocr_data.get("contact_person_raw")
+    contact_similarity = max(
+        (_similarity(contact, candidate) for candidate in _task_contacts(task)),
+        default=0.0,
+    )
+    if contact_similarity >= 0.90:
+        score += 8
+        support.add("contact")
+        reasons.append("contact")
+    elif contact_similarity >= 0.75:
+        score += 5
+        support.add("contact")
+        reasons.append("contact similar")
+
     # 新 OCR 已把 Dept./Room 中純 Asset 內容移除；不可再把整段 Asset#
     # 當作地點加分。只有舊資料完全沒有新欄位時才回退 location_raw。
     location = ocr_data.get("location_raw") or ""
     if len(_norm(location)) >= 3 and _norm(location) in haystack_norm:
         score += 5
         reasons.append("location")
+    room = ocr_data.get("department_room_raw") or ""
+    if len(_norm(room)) >= 2 and _norm(room) in haystack_norm:
+        score += 8
+        support.add("room")
+        reasons.append("department/room")
 
     service_date = None
     if ocr_data.get("date_source") == "ACTION_DATE":
@@ -590,9 +1020,24 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     assets = _clean_candidates(ocr_data.get("asset_candidates"))
     work_orders = _clean_candidates(ocr_data.get("work_order_candidates"))
 
-    pool = _gather_pool(
-        order_no, serials, hosp, product, phones, assets, work_orders
-    )
+    # The private index is only a local narrowing aid.  If it has no usable
+    # row, retain the existing live typeahead search for newly-created tasks;
+    # once rows are found, do not broaden the search and risk a false match.
+    used_index = False
+    if _device_index is not None:
+        pool, index_had_candidates = _gather_index_pool(ocr_data, job_type)
+        used_index = bool(pool)
+        if not pool and not index_had_candidates:
+            log.info("  設備索引沒有候選，改用即時 Asana 搜尋後備")
+            pool = _gather_pool(
+                order_no, serials, hosp, product, phones, assets, work_orders
+            )
+        elif not pool:
+            return None, 0
+    else:
+        pool = _gather_pool(
+            order_no, serials, hosp, product, phones, assets, work_orders
+        )
     if job_type:
         before = len(pool)
         pool = [task for task in pool if _task_job_type(task) in (None, job_type)]
@@ -619,6 +1064,11 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         for task in pool
     ]
     scored.sort(key=lambda row: (row["score"], -row["serial_dist"]), reverse=True)
+    for rank, row in enumerate(scored[:3], 1):
+        log.info(
+            "  工作候選 #%s：分數=%s、serial距離=%s、證據=%s",
+            rank, row["score"], row["serial_dist"], sorted(row["support"]),
+        )
     best = scored[0]
     runner_score = scored[1]["score"] if len(scored) > 1 else -1
     gap = best["score"] - runner_score
@@ -627,7 +1077,7 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。
         # 此時只接受唯一候選，而且完整 task 必須同時精確包含電話、asset
         # 及最近 ACTION DATE。三項來自不同欄位，不能只靠醫院/型號猜。
-        required = {"phone", "asset", "date"}
+        required = {"phone_exact", "asset_exact", "date"}
         if len(scored) == 1 and required.issubset(best["support"]):
             log.info(
                 f"  ✅ serial 未形成共識，但電話、asset、日期唯一命中"
@@ -635,19 +1085,21 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             )
             return best["task"], 2
         # 未通過格式或只出現一輪的 serial 絕不拿去全域搜尋。只有電話等
-        # 可靠欄位已把 Asana 候選縮到唯一一筆後，才容許它作一字距離核對；
+        # 可靠欄位已把 Asana 候選縮到唯一一筆後，才容許原始讀數作距離核對；
         # 仍須至少兩項來自其他欄位的獨立證據。
         visual_support = best["support"] & {
-            "phone", "asset", "date", "hospital+product", "product",
+            "phone_exact", "phone_fuzzy", "asset_exact", "asset_fuzzy",
+            "contact", "date", "hospital", "product", "room", "job_type",
         }
+        visual_limit = MAX_SERIAL_DIST if used_index else 1
         if (
             len(scored) == 1
             and visual_serials
-            and best["serial_dist"] <= MAX_SERIAL_DIST
+            and best["serial_dist"] <= visual_limit
             and len(visual_support) >= 2
         ):
             log.info(
-                "  ✅ serial 原始抄錄只差一字，且唯一候選有多欄支持"
+                "  ✅ serial 原始抄錄接近固定 serial，且唯一候選有多欄支持"
                 f"（{', '.join(best['reasons'])}）"
             )
             return best["task"], 2
@@ -655,26 +1107,31 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
 
     # 同一設備在 Asana 會有很多歷史工作；完成狀態不是新舊依據。
     # serial 完全一致仍須日期/電話/asset，或醫院+型號一起支持；若有並列歷史
-    # 工作，分數亦必須拉開。serial 錯一字時要求至少兩組額外證據。
+    # 工作，分數亦必須拉開。serial 有誤差時要求至少兩組額外證據。
     strong = best["support"]
     serial_ambiguous = bool(ocr_data.get("serial_ambiguous"))
     if best["serial_dist"] == 0 and not serial_ambiguous:
         supported = bool(strong & {
-            "date", "phone", "asset", "work_order", "hospital+product", "job_type"
+            "date", "phone_exact", "phone_fuzzy", "asset_exact", "asset_fuzzy",
+            "contact", "room", "work_order", "hospital", "product", "job_type"
         })
         unambiguous = len(scored) == 1 or gap >= 10
         if supported and unambiguous:
             log.info(f"  ✅ Asana 多欄核對命中（{', '.join(best['reasons'])}）")
             return best["task"], 2
-    elif best["serial_dist"] <= MAX_SERIAL_DIST:
-        # 兩輪 OCR 只差一字時，即使其中一個剛好與 Asana 完全相同，也仍是
-        # 有爭議的讀數；必須按一字模糊規則要求兩組額外證據。
-        supported = len(strong & {
-            "date", "phone", "asset", "work_order", "hospital+product", "job_type"
-        }) >= 2
+    elif best["serial_dist"] <= (MAX_SERIAL_DIST if used_index else 1):
+        # 索引已先鎖定設備；task 層仍須用獨立欄位分辨同一設備的歷史工作。
+        # 任何 1–3 字誤差都至少要兩項額外證據及一項強設備證據。
+        additional = strong & {
+            "date", "phone_exact", "phone_fuzzy", "asset_exact", "asset_fuzzy",
+            "contact", "room", "work_order", "hospital", "product", "job_type",
+        }
+        strong_device = additional & {"phone_exact", "asset_exact", "hospital", "product"}
+        needed = 2
+        supported = len(additional) >= needed and bool(strong_device)
         unambiguous = len(scored) == 1 or gap >= 15
         if supported and unambiguous:
-            log.info(f"  ✅ serial 一字模糊但多欄核對命中（{', '.join(best['reasons'])}）")
+            log.info(f"  ✅ serial 模糊但多欄核對命中（{', '.join(best['reasons'])}）")
             return best["task"], 2
 
     log.info(

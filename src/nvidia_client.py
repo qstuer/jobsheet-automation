@@ -124,6 +124,7 @@ _FIELD_DISPLAY_LABELS = {
     "product_raw": "PRODUCT ONLY",
     "serial_candidates": "SERIAL NO. ONLY",
     "hospital_raw": "CUSTOMER NAME / HOSPITAL ONLY",
+    "contact_person_raw": "CONTACT PERSON ONLY",
     "department_room_raw": "DEPT. / ROOM NO. ONLY",
     "phone_candidates": "TELEPHONE NO. ONLY",
     "service_date_raw": "ACTION DATE ONLY",
@@ -480,7 +481,7 @@ def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:
 
 _OCR_MODEL_FIELDS = (
     "order_no", "serial_candidates", "product_raw", "hospital_raw",
-    "department_room_raw", "phone_candidates", "asset_candidates",
+    "contact_person_raw", "department_room_raw", "phone_candidates", "asset_candidates",
     "work_order_candidates", "service_date_raw", "date_source",
     "unreadable_fields",
 )
@@ -637,6 +638,16 @@ def _normalize_ocr_data(candidate: dict) -> dict:
         mark_unreadable("hospital_raw")
         data["hospital_raw"] = None
 
+    if data.get("contact_person_raw"):
+        contact = re.sub(r"\s+", " ", data["contact_person_raw"]).strip(" ,;/#-_")
+        # A contact must visibly contain a name.  Numeric values belong to the
+        # neighbouring telephone field and must not be silently reassigned.
+        if sum(char.isalpha() for char in contact) < 2:
+            mark_unreadable("contact_person_raw")
+            data["contact_person_raw"] = None
+        else:
+            data["contact_person_raw"] = contact
+
     phones = []
     for value in data["phone_candidates"]:
         digits = re.sub(r"\D", "", value)
@@ -724,6 +735,7 @@ def ocr_jobsheet_fields(
         "returned for a genuinely ambiguous number. Required shape:\n"
         '{"order_no":null,"serial_candidates":[],"product_raw":null,'
         '"hospital_raw":null,"department_room_raw":null,"phone_candidates":[],'
+        '"contact_person_raw":null,'
         '"asset_candidates":[],"work_order_candidates":[],"service_date_raw":null,'
         '"date_source":"ACTION_DATE","unreadable_fields":[]}'
     )
@@ -766,17 +778,19 @@ def ocr_jobsheet_support_fields(
         pdf_doc, page_idx, config.OCR_SUPPORT_CARD_FIELDS, zoom=zoom, strong=True
     )
     prompt = _TRANSCRIPTION_RULES + (
-        "Read DEPT./ROOM and TELEPHONE from their own panels. An Asset value is valid only "
+        "Read CONTACT PERSON, DEPT./ROOM and TELEPHONE from their own panels. "
+        "A contact name is a literal transcription and must never be inferred from a phone number. "
+        "An Asset value is valid only "
         "when the word Asset is visibly attached to it. A work-order value is valid only when "
         "HAWO or WO is visibly attached to it. Read the date only from ACTION DATE. Required shape:\n"
-        '{"department_room_raw":null,"phone_candidates":[],"asset_candidates":[],'
+        '{"contact_person_raw":null,"department_room_raw":null,"phone_candidates":[],"asset_candidates":[],'
         '"work_order_candidates":[],"service_date_raw":null,'
         '"date_source":"ACTION_DATE","unreadable_fields":[]}'
     )
     return _read_card(
         image_b64,
         prompt,
-        {"department_room_raw", "phone_candidates", "asset_candidates", "service_date_raw"},
+        {"contact_person_raw", "department_room_raw", "phone_candidates", "asset_candidates", "service_date_raw"},
     )
 
 
@@ -789,7 +803,7 @@ def ocr_jobsheet_focused_field(
     """有爭議時只重讀一格；不把先前讀數或 Asana 候選告訴模型。"""
     allowed = {
         "order_no", "product_raw", "serial_candidates", "hospital_raw",
-        "department_room_raw", "phone_candidates", "service_date_raw",
+        "contact_person_raw", "department_room_raw", "phone_candidates", "service_date_raw",
     }
     if field not in allowed:
         raise ValueError(f"不支援單格複核：{field}")

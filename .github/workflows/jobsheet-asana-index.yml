@@ -1,0 +1,94 @@
+name: Jobsheet - Refresh Asana Device Index
+
+# 手動建立／更新近兩年的 Asana 設備索引。索引只寫入 Google Drive
+# .jobsheet-control，不會觸碰 _SPLIT、_PENDING 或 OneDrive。
+on:
+  workflow_dispatch:
+    inputs:
+      window_start:
+        description: '索引起始日期（YYYY-MM-DD；留空為兩年前）'
+        required: false
+        type: string
+      window_end:
+        description: '索引結束日期（YYYY-MM-DD；留空為今天）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+concurrency:
+  group: jobsheet-asana-index
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+          rclone version
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Restore previous index when available
+        run: |
+          if rclone lsf "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" >/dev/null 2>&1; then
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
+              /tmp/asana-device-index-previous.json
+            echo "ASANA_INDEX_EXISTING_PATH=/tmp/asana-device-index-previous.json" >> "$GITHUB_ENV"
+          else
+            echo 'No previous index; building the initial two-year index.'
+          fi
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build private Asana device index
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          ASANA_INDEX_WINDOW_START: ${{ inputs.window_start }}
+          ASANA_INDEX_WINDOW_END: ${{ inputs.window_end }}
+          ASANA_INDEX_OUTPUT_DIR: /tmp/asana-index
+        run: python -m src.asana_index | tee /tmp/asana-index-summary.json
+      - name: Replace private index files in Google Drive
+        run: |
+          # JSON/CSV 先寫，manifest 最後寫；Stage B 會比對兩者版本，
+          # 因此中途失敗不會讀到半份索引。
+          rclone copyto /tmp/asana-index/asana-device-index.json \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json"
+          rclone copyto /tmp/asana-index/asana-device-index.csv \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.csv"
+          rclone copyto /tmp/asana-index/asana-device-index-manifest.json \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json"
+      - name: Write non-sensitive summary
+        if: always()
+        run: |
+          if [ -f /tmp/asana-index-summary.json ]; then
+            echo '## Asana 設備索引' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/asana-index-summary.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Cleanup rclone config
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true

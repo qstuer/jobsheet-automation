@@ -47,6 +47,14 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
+      - name: Restore private Asana device index
+        run: |
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
+            /tmp/asana-device-index.json
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
+            /tmp/asana-device-index-manifest.json
       - run: pip install -r requirements.txt
       - name: Inspect one raw scan without cloud writes
         env:
@@ -58,6 +66,8 @@ jobs:
           NVIDIA_MODEL:         ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN:          ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID:  ${{ vars.ASANA_WORKSPACE_GID }}
+          ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
         run: python -m src.dry_run
       - name: Cleanup rclone config
         if: always()

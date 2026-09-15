@@ -59,6 +59,7 @@ class NvidiaResponseTests(unittest.TestCase):
             "serial_candidates": ["US123F4567"],
             "product_raw": "CX50",
             "hospital_raw": "HKCH",
+            "contact_person_raw": None,
             "department_room_raw": None,
             "phone_candidates": [],
             "asset_candidates": [],
@@ -367,7 +368,7 @@ class NvidiaResponseTests(unittest.TestCase):
 
         self.assertEqual(set(result), {
             "order_no", "serial_candidates", "serial_visual_candidates",
-            "product_raw", "hospital_raw",
+            "product_raw", "hospital_raw", "contact_person_raw",
             "department_room_raw", "customer_raw", "location_raw",
             "phone_candidates", "asset_candidates",
             "work_order_candidates", "service_date_raw", "date_source",
@@ -517,6 +518,15 @@ class ProcessorConsensusTests(unittest.TestCase):
 
         self.assertEqual("18/8/2026", consensus["service_date_raw"])
         self.assertEqual("ACTION_DATE", consensus["date_source"])
+
+    def test_contact_person_has_its_own_consensus_field(self):
+        consensus = processor._consensus_ocr([
+            {"contact_person_raw": "Ms. Chan", "phone_candidates": ["61234567"]},
+            {"contact_person_raw": "Ms Chan", "phone_candidates": ["61234567"]},
+        ])
+
+        self.assertEqual("Ms. Chan", consensus["contact_person_raw"])
+        self.assertEqual(["61234567"], consensus["phone_candidates"])
 
     def test_one_character_serial_disagreement_is_kept_as_two_candidates(self):
         readings = [
@@ -675,6 +685,23 @@ class ProcessorConsensusTests(unittest.TestCase):
 
 
 class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_order_number_is_not_reused_as_phone_or_asset_evidence(self):
+        task_row = {
+            "gid": "task", "name": "PYN / Affiniti 70 / US915F0726 / 61877075",
+            "notes": "Telephone 25956917; Asset 19130438",
+        }
+        scored = asana_client._candidate_score(
+            task_row,
+            {
+                "phone_candidates": ["61877075"],
+                "asset_candidates": ["25956917"],
+            },
+            serials=[], hosp=None, product=None,
+        )
+
+        self.assertNotIn("phone_exact", scored["support"])
+        self.assertNotIn("asset_exact", scored["support"])
+
     def test_one_character_visual_serial_needs_unique_candidate_and_two_fields(self):
         ocr = {
             "order_no": None,
@@ -891,7 +918,7 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "serial_candidates": ["SZN22B128O"],
             "serial_no": "SZN22B128O",
             "product": "EPIQ Elite",
-            "customer": "KWH-6F",
+            "customer": None,
             "phone_candidates": [],
             "asset_candidates": [],
             "service_date_raw": None,
@@ -978,7 +1005,7 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "serial_no": "SZN22B1280",
             "serial_ambiguous": True,
             "product": "EPIQ Elite",
-            "hospital_raw": "KWH",
+            "hospital_raw": None,
         }
         task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZN22B1280"}
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):

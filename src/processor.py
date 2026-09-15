@@ -23,7 +23,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, batch_state, config, nvidia_client, rclone_helper
+from . import asana_client, asana_index, batch_state, config, nvidia_client, rclone_helper
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,6 +33,8 @@ TARGET_FILE_ENV = "JOBSHEET_TARGET_FILE"
 DRY_RUN_ENV = config.JOBSHEET_DRY_RUN_ENV
 SOURCE_QUEUE_ENV = config.JOBSHEET_SOURCE_QUEUE_ENV
 CONFIRMED_FILENAME_ENV = "JOBSHEET_CONFIRMED_FILENAME"
+ASANA_INDEX_FILE_ENV = "ASANA_INDEX_LOCAL_FILE"
+ASANA_INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -217,7 +219,7 @@ def _consensus_ocr(readings: list) -> dict:
         "work_order_candidates", "unreadable_fields",
     }
     scalar_fields = (
-        "order_no", "product_raw", "hospital_raw", "department_room_raw",
+        "order_no", "product_raw", "hospital_raw", "contact_person_raw", "department_room_raw",
         "service_date_raw", "date_source",
     )
     for field in scalar_fields:
@@ -300,7 +302,7 @@ def _ocr_and_match(doc, job_type):
         return [
             key for key in (
                 "order_no", "serial_candidates", "product_raw", "hospital_raw",
-                "department_room_raw", "phone_candidates", "asset_candidates",
+                "contact_person_raw", "department_room_raw", "phone_candidates", "asset_candidates",
                 "service_date_raw", "work_order_candidates",
             ) if reading.get(key)
         ]
@@ -373,10 +375,11 @@ def _ocr_and_match(doc, job_type):
         # 電話與 ACTION DATE 是同一設備不同月份工作的關鍵。完整卡兩輪
         # 不一致時只重讀相應小格；普通/加強兩種影像避免重複確定性誤讀。
         labels = {
+            "contact_person_raw": "CONTACT PERSON",
             "phone_candidates": "TELEPHONE NO.",
             "service_date_raw": "ACTION DATE",
         }
-        for field in ("phone_candidates", "service_date_raw"):
+        for field in ("contact_person_raw", "phone_candidates", "service_date_raw"):
             if consensus.get(field) or not any(
                 reading.get(field)
                 or field in (reading.get("unreadable_fields") or [])
@@ -579,6 +582,24 @@ def main() -> int:
         log.info(f"工作目錄：{work_dir}")
         _USED_NAMES.clear()   # 防撞名集合，每次執行重置
         asana_client._task_cache.clear()
+        asana_client.clear_device_index()
+        index_path = os.environ.get(ASANA_INDEX_FILE_ENV, "").strip()
+        manifest_path = os.environ.get(ASANA_INDEX_MANIFEST_ENV, "").strip()
+        if index_path:
+            try:
+                index = asana_index.load_index(
+                    Path(index_path), Path(manifest_path) if manifest_path else None
+                )
+                asana_client.set_device_index(index)
+                log.info(
+                    "已載入 Asana 設備索引：%s 部設備（不在公開輸出列出客戶資料）",
+                    index.get("device_count", 0),
+                )
+            except asana_index.AsanaIndexError as exc:
+                # 索引遺失、損毀或與 manifest 不一致時必須停在來源端，
+                # 不能把「沒有候選」誤當成查無資料而移動/命名 PDF。
+                log.error("Asana 設備索引無法驗證，保留來源檔：%s", exc)
+                return 1
 
         source_queue = os.environ.get(SOURCE_QUEUE_ENV, "split").strip().lower() or "split"
         if source_queue not in {"split", "pending"}:
