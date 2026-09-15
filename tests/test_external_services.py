@@ -366,7 +366,8 @@ class NvidiaResponseTests(unittest.TestCase):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         self.assertEqual(set(result), {
-            "order_no", "serial_candidates", "product_raw", "hospital_raw",
+            "order_no", "serial_candidates", "serial_visual_candidates",
+            "product_raw", "hospital_raw",
             "department_room_raw", "customer_raw", "location_raw",
             "phone_candidates", "asset_candidates",
             "work_order_candidates", "service_date_raw", "date_source",
@@ -443,6 +444,10 @@ class NvidiaResponseTests(unittest.TestCase):
         result = nvidia_client._normalize_ocr_data(candidate)
 
         self.assertEqual([], result["serial_candidates"])
+        self.assertEqual(
+            ["15915F0726", "S2N22F1275"],
+            result["serial_visual_candidates"],
+        )
         self.assertIsNone(result["hospital_raw"])
         self.assertEqual(["19130438"], result["asset_candidates"])
         self.assertIsNone(result["location_raw"])
@@ -638,8 +643,76 @@ class ProcessorConsensusTests(unittest.TestCase):
             zoom=config.OCR_FOCUSED_RETRY_ZOOMS[0],
         )
 
+    def test_disputed_phone_gets_one_field_recheck(self):
+        primary = dict(self.ocr_a, phone_candidates=["25956158"])
+        support = {"phone_candidates": ["25956159"],
+                   "unreadable_fields": []}
+        focused = {"phone_candidates": ["25956158"],
+                   "unreadable_fields": []}
+        task = {"gid": "task-1", "name": "Task 1"}
+        with patch.object(nvidia_client, "ocr_jobsheet_fields",
+                          return_value=primary), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=self.ocr_a), \
+                patch.object(nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=support), \
+                patch.object(nvidia_client, "ocr_jobsheet_serial_candidates",
+                             return_value=["US123F4567"]), \
+                patch.object(nvidia_client, "ocr_jobsheet_focused_field",
+                             return_value=focused) as reread, \
+                patch.object(asana_client, "find_task",
+                             side_effect=[(None, 0), (None, 0),
+                                          (None, 0), (task, 2)]):
+            matched, tier, consensus = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertEqual("task-1", matched["gid"])
+        self.assertEqual(2, tier)
+        self.assertEqual(["25956158"], consensus["phone_candidates"])
+        reread.assert_called_once_with(
+            unittest.mock.ANY, 0, "phone_candidates",
+            zoom=config.OCR_FOCUSED_RETRY_ZOOMS[0],
+        )
+
 
 class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_one_character_visual_serial_needs_unique_candidate_and_two_fields(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": [],
+            "serial_visual_candidates": ["S2N22F1275"],
+            "product": "Affiniti 70",
+            "phone_candidates": ["25899327"],
+        }
+        task_row = {
+            "gid": "task",
+            "name": "Tung Wah Hospital/ Affiniti 70/ SZN22F1275",
+            "notes": "Telephone 25899327",
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertEqual("task", task["gid"])
+        self.assertEqual(2, tier)
+
+    def test_two_character_visual_serial_is_not_accepted(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": [],
+            "serial_visual_candidates": ["15915F0726"],
+            "product": "Affiniti 70",
+            "phone_candidates": ["25956917"],
+        }
+        task_row = {
+            "gid": "task",
+            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
+            "notes": "Telephone 25956917",
+        }
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+
+        self.assertIsNone(task)
+        self.assertEqual(0, tier)
+
     def test_tung_wah_search_keeps_spaces_for_typeahead(self):
         canonical = asana_client.hospital_core("Tung Wah Hospital")
 

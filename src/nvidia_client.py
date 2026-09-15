@@ -503,6 +503,18 @@ def _valid_serial_token(value: str) -> bool:
     )
 
 
+def _visible_serial_token(value: str) -> Optional[str]:
+    """保留模型實際抄到的 serial 形狀，但不把它升格為有效 serial。
+
+    例如 S2N22F1275 仍會被正式格式閘拒絕；這份原始讀數只可在 Asana
+    已由其他欄位縮到唯一候選後，作一字距離的交叉核對。
+    """
+    token = re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+    if 8 <= len(token) <= 12 and sum(char.isdigit() for char in token) >= 4:
+        return token
+    return None
+
+
 def _hospital_is_plausible(value: Optional[str]) -> bool:
     if not value:
         return False
@@ -600,6 +612,10 @@ def _normalize_ocr_data(candidate: dict) -> dict:
     )
 
     raw_serials = data["serial_candidates"]
+    data["serial_visual_candidates"] = list(dict.fromkeys(
+        token for value in raw_serials
+        if (token := _visible_serial_token(value))
+    ))[:3]
     data["serial_candidates"] = [
         value for value in raw_serials if _valid_serial_token(value)
     ]

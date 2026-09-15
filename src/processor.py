@@ -255,6 +255,12 @@ def _consensus_ocr(readings: list) -> dict:
         for value in reading.get("serial_candidates") or []
         if nvidia_client._valid_serial_token(value)
     }
+    result["serial_visual_candidates"] = list(dict.fromkeys(
+        value
+        for reading in readings
+        for value in reading.get("serial_visual_candidates") or []
+        if nvidia_client._visible_serial_token(value)
+    ))[:6]
     result["serial_ambiguous"] = (
         len(observed_serials) > 1
         or len(result.get("serial_candidates") or []) > 1
@@ -363,27 +369,33 @@ def _ocr_and_match(doc, job_type):
         except nvidia_client.NvidiaResponseError:
             log.warning("  輔助欄複核暫時無法完成，保留現有安全證據")
 
-    if task is None and not consensus.get("service_date_raw") and any(
-        reading.get("service_date_raw")
-        or "service_date_raw" in (reading.get("unreadable_fields") or [])
-        for reading in readings
-    ):
-        # ACTION DATE 是區分同一設備不同月份 PM 的關鍵。完整卡兩輪不一致
-        # 時，只再讀日期小格；使用普通/加強兩種影像，避免把同一個確定性
-        # 誤讀當成兩次獨立證據。
-        log.info("  ACTION DATE 兩輪不一致，只重讀日期格")
-        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
-            try:
-                reading = nvidia_client.ocr_jobsheet_focused_field(
-                    doc, 0, "service_date_raw", zoom=zoom
-                )
-            except nvidia_client.NvidiaResponseError:
-                log.warning(f"  日期單格 {zoom}x 暫時無法完成")
+    if task is None:
+        # 電話與 ACTION DATE 是同一設備不同月份工作的關鍵。完整卡兩輪
+        # 不一致時只重讀相應小格；普通/加強兩種影像避免重複確定性誤讀。
+        labels = {
+            "phone_candidates": "TELEPHONE NO.",
+            "service_date_raw": "ACTION DATE",
+        }
+        for field in ("phone_candidates", "service_date_raw"):
+            if consensus.get(field) or not any(
+                reading.get(field)
+                or field in (reading.get("unreadable_fields") or [])
+                for reading in readings
+            ):
                 continue
-            readings.append(reading)
-            consensus = _consensus_ocr(readings)
-            if consensus.get("service_date_raw"):
-                break
+            log.info(f"  {labels[field]} 兩輪不一致，只重讀該格")
+            for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+                try:
+                    reading = nvidia_client.ocr_jobsheet_focused_field(
+                        doc, 0, field, zoom=zoom
+                    )
+                except nvidia_client.NvidiaResponseError:
+                    log.warning(f"  {labels[field]} 單格 {zoom}x 暫時無法完成")
+                    continue
+                readings.append(reading)
+                consensus = _consensus_ocr(readings)
+                if consensus.get(field):
+                    break
         task, tier = asana_client.find_task(consensus, job_type=job_type)
 
     metrics = nvidia_client.get_ocr_metrics()

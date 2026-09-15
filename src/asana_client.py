@@ -484,6 +484,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         reasons.append("hospital prefix")
     if product_ok:
         score += 15
+        support.add("product")
         reasons.append("product")
     if hospital_ok and product_ok:
         support.add("hospital+product")
@@ -555,6 +556,9 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     serials = _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
+    visual_serials = _clean_candidates(
+        ocr_data.get("serial_visual_candidates")
+    )
     product  = normalize_product(
         ocr_data.get("product") or ocr_data.get("product_raw")
     )
@@ -590,8 +594,9 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             log.warning("  同一 order number 命中多個 Asana 工作，不自動選擇")
             return None, 0
 
+    scoring_serials = serials or visual_serials
     scored = [
-        _candidate_score(task, ocr_data, serials, hosp, product, job_type)
+        _candidate_score(task, ocr_data, scoring_serials, hosp, product, job_type)
         for task in pool
     ]
     scored.sort(key=lambda row: (row["score"], -row["serial_dist"]), reverse=True)
@@ -607,6 +612,23 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         if len(scored) == 1 and required.issubset(best["support"]):
             log.info(
                 f"  ✅ serial 未形成共識，但電話、asset、日期唯一命中"
+                f"（{', '.join(best['reasons'])}）"
+            )
+            return best["task"], 2
+        # 未通過格式或只出現一輪的 serial 絕不拿去全域搜尋。只有電話等
+        # 可靠欄位已把 Asana 候選縮到唯一一筆後，才容許它作一字距離核對；
+        # 仍須至少兩項來自其他欄位的獨立證據。
+        visual_support = best["support"] & {
+            "phone", "asset", "date", "hospital+product", "product",
+        }
+        if (
+            len(scored) == 1
+            and visual_serials
+            and best["serial_dist"] <= MAX_SERIAL_DIST
+            and len(visual_support) >= 2
+        ):
+            log.info(
+                "  ✅ serial 原始抄錄只差一字，且唯一候選有多欄支持"
                 f"（{', '.join(best['reasons'])}）"
             )
             return best["task"], 2
