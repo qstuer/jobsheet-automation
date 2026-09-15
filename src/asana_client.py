@@ -32,6 +32,7 @@ KNOWN_PRODUCTS = [
 
 MAX_SERIAL_DIST = 1   # serial 錯一字才可考慮，而且仍須其他欄位交叉支持
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
+MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -109,6 +110,24 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     # KWM / PYTV 這類未知短碼不得成為候選搜尋或加分依據。
     if re.fullmatch(r"[A-Za-z]{2,6}", core):
         return None
+
+    # 完整醫院名可能有極少量抄寫誤差，例如 Tong Nah Hospital。只在它與
+    # 已確認清單中的某一個完整名稱相差最多兩字、而且最近答案唯一時校正。
+    # 這一步只在程式內做；候選名不會交給視覺模型，避免模型迎合答案。
+    normalized = _norm(core)
+    full_names = {
+        raw: value for raw, value in HOSPITAL_ALIASES.items()
+        if len(raw) >= 10
+    }
+    distances = sorted(
+        (_lev(normalized, raw), raw, value)
+        for raw, value in full_names.items()
+    )
+    if distances and distances[0][0] <= MAX_HOSPITAL_NAME_DIST:
+        nearest = distances[0]
+        if len(distances) == 1 or distances[1][0] > nearest[0]:
+            log.info("  醫院完整名稱有輕微 OCR 誤差，已由已確認清單唯一校正")
+            return nearest[2]
     return core if len(_norm(core)) >= 5 else None
 
 

@@ -961,6 +961,16 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             asana_client.hospital_search_terms("PYNEH"),
         )
 
+    def test_full_hospital_name_allows_unique_two_character_ocr_error(self):
+        self.assertEqual(
+            "Tung Wah Hospital",
+            asana_client.hospital_core("Tong Nah Hospital"),
+        )
+        self.assertEqual(
+            "Completely Unknown Clinic",
+            asana_client.hospital_core("Completely Unknown Clinic"),
+        )
+
     def test_ambiguous_serial_needs_two_supporting_signals_even_if_one_is_exact(self):
         ocr = {
             "order_no": None,
