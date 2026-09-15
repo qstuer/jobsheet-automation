@@ -9,10 +9,11 @@ import json
 import logging
 import re
 import time
+from datetime import date, datetime
 from typing import Optional
 
 import fitz
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 from openai import OpenAI
 from . import config
 
@@ -21,9 +22,36 @@ _client_identity: Optional[tuple] = None
 _unavailable_models: set[str] = set()
 log = logging.getLogger(__name__)
 
+_ocr_metrics = {
+    "calls": 0,
+    "seconds": 0.0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+}
+
 
 class NvidiaResponseError(RuntimeError):
     """辨認服務回覆不完整或格式不正確；不得當成空白單據繼續處理。"""
+
+
+def reset_ocr_metrics() -> None:
+    """每份工作單開始前重設非敏感的用量統計。"""
+    for key in _ocr_metrics:
+        _ocr_metrics[key] = 0.0 if key == "seconds" else 0
+
+
+def get_ocr_metrics() -> dict:
+    """回傳呼叫次數、耗時、token 與 DeepSeek 費用上限，不含單據內容。"""
+    result = dict(_ocr_metrics)
+    if config.OCR_PROVIDER.strip().lower() == "deepseek":
+        # 使用未命中快取及高峰價格計算保守上限；實際帳單通常不高於此數。
+        result["estimated_cost_cny_upper"] = round(
+            result["prompt_tokens"] * 2.0 / 1_000_000
+            + result["completion_tokens"] * 8.0 / 1_000_000,
+            4,
+        )
+    return result
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
@@ -91,46 +119,108 @@ def get_client() -> OpenAI:
     return _client
 
 
-def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int, zoom: float = 1.0) -> str:
-    """
-    裁切第 N 頁的 10%-56% 區域（全寬），加強對比，回傳 base64 JPEG。
-    除訂單/設備/醫院外，也涵蓋聯絡電話、資產編號與服務日期。
-    """
+_FIELD_DISPLAY_LABELS = {
+    "order_no": "ORDER NO. ONLY",
+    "product_raw": "PRODUCT ONLY",
+    "serial_candidates": "SERIAL NO. ONLY",
+    "hospital_raw": "CUSTOMER NAME / HOSPITAL ONLY",
+    "department_room_raw": "DEPT. / ROOM NO. ONLY",
+    "phone_candidates": "TELEPHONE NO. ONLY",
+    "service_date_raw": "ACTION DATE ONLY",
+    "fault_symptom": "FAULT SYMPTOM - REFERENCE NUMBER ONLY",
+    "action_taken": "ACTION TAKEN - REFERENCE NUMBER ONLY",
+}
+
+
+def _preprocess_field_image(image: Image.Image, strong: bool = False) -> Image.Image:
+    """黑白表格只調對比和銳度，不做會改變字形的二值化。"""
+    image = ImageOps.autocontrast(image.convert("L")).convert("RGB")
+    contrast = config.OCR_CONTRAST + (0.35 if strong else 0.0)
+    image = ImageEnhance.Contrast(image).enhance(contrast)
+    image = image.filter(ImageFilter.SHARPEN)
+    return image
+
+
+def _render_field_crop(pdf_doc: fitz.Document, page_idx: int, field: str,
+                       zoom: float, strong: bool = False) -> Image.Image:
+    """按固定印刷版面只渲染一格，避免相鄰手寫值被分配到錯誤欄位。"""
+    if field not in config.OCR_FIELD_BOXES:
+        raise ValueError(f"未知 Jobsheet 欄位：{field}")
+    left, top, right, bottom = config.OCR_FIELD_BOXES[field]
     page = pdf_doc[page_idx]
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    w, h = img.size
-    crop = img.crop((0, int(h * config.OCR_CROP_TOP), w, int(h * config.OCR_CROP_BOTTOM)))
-    # Jobsheet 是黑白表格；自動拉開紙色／墨色並輕微銳化，比單純放大更能
-    # 保留手寫字邊緣。只處理指定欄位區，不把簽名與印章等雜訊送給模型。
-    crop = ImageOps.autocontrast(crop.convert("L")).convert("RGB")
-    crop = ImageEnhance.Contrast(crop).enhance(config.OCR_CONTRAST)
-    crop = crop.filter(ImageFilter.SHARPEN)
+    rect = page.rect
+    clip = fitz.Rect(
+        rect.x0 + rect.width * left,
+        rect.y0 + rect.height * top,
+        rect.x0 + rect.width * right,
+        rect.y0 + rect.height * bottom,
+    )
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
+    image = Image.open(io.BytesIO(pix.tobytes("png")))
+    return _preprocess_field_image(image, strong=strong)
+
+
+def crop_jobsheet_field_card(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        fields,
+        zoom: float = config.OCR_ZOOM_DEFAULT,
+        strong: bool = False,
+) -> str:
+    """把固定欄位做成有明確標籤和邊框的卡片，回傳 base64 JPEG。"""
+    fields = tuple(fields)
+    if not fields:
+        raise ValueError("欄位卡至少需要一個欄位")
+    columns = 1 if len(fields) == 1 else 2
+    gap = 16
+    outer = 16
+    panel_width = (config.OCR_CARD_WIDTH - outer * 2 - gap * (columns - 1)) // columns
+    image_height = 220
+    panel_height = config.OCR_FIELD_LABEL_HEIGHT + image_height + 16
+    rows = (len(fields) + columns - 1) // columns
+    card = Image.new(
+        "RGB",
+        (config.OCR_CARD_WIDTH, outer * 2 + rows * panel_height + (rows - 1) * gap),
+        "white",
+    )
+    draw = ImageDraw.Draw(card)
+    for index, field in enumerate(fields):
+        row, column = divmod(index, columns)
+        x = outer + column * (panel_width + gap)
+        y = outer + row * (panel_height + gap)
+        draw.rectangle((x, y, x + panel_width, y + panel_height), outline="black", width=3)
+        draw.text((x + 10, y + 10), _FIELD_DISPLAY_LABELS[field], fill="black")
+        crop = _render_field_crop(pdf_doc, page_idx, field, zoom, strong=strong)
+        max_width = panel_width - 20
+        max_height = image_height - 10
+        scale = min(max_width / crop.width, max_height / crop.height)
+        resized = crop.resize(
+            (max(1, int(crop.width * scale)), max(1, int(crop.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        paste_x = x + (panel_width - resized.width) // 2
+        paste_y = y + config.OCR_FIELD_LABEL_HEIGHT + (image_height - resized.height) // 2
+        card.paste(resized, (paste_x, paste_y))
+
     buf = io.BytesIO()
-    crop.save(buf, "JPEG", quality=85)
+    card.save(buf, "JPEG", quality=90)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def crop_jobsheet_top(pdf_doc: fitz.Document, page_idx: int,
+                      zoom: float = config.OCR_ZOOM_DEFAULT) -> str:
+    """相容舊呼叫名稱；現在回傳分格欄位卡，而不是混在一起的半頁圖片。"""
+    return crop_jobsheet_field_card(
+        pdf_doc, page_idx, config.OCR_PRIMARY_CARD_FIELDS, zoom=zoom
+    )
 
 
 def crop_jobsheet_serial(pdf_doc: fitz.Document, page_idx: int,
                          zoom: float = 5.0) -> str:
-    """只渲染 SERIAL NO. 標籤及手寫值，供配對失敗後精讀。"""
-    page = pdf_doc[page_idx]
-    rect = page.rect
-    clip = fitz.Rect(
-        rect.x0 + rect.width * config.OCR_SERIAL_CROP_LEFT,
-        rect.y0 + rect.height * config.OCR_SERIAL_CROP_TOP,
-        rect.x0 + rect.width * config.OCR_SERIAL_CROP_RIGHT,
-        rect.y0 + rect.height * config.OCR_SERIAL_CROP_BOTTOM,
+    """只渲染 SERIAL NO. 一格，供有爭議時精讀。"""
+    return crop_jobsheet_field_card(
+        pdf_doc, page_idx, ("serial_candidates",), zoom=zoom, strong=True
     )
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    img = ImageOps.autocontrast(img.convert("L")).convert("RGB")
-    img = ImageEnhance.Contrast(img).enhance(config.OCR_CONTRAST)
-    img = img.filter(ImageFilter.SHARPEN)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _call_vision_once(prompt: str, image_b64: str, model: str,
@@ -192,27 +282,43 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
         # headers 前已超時。只收集最後 content，reasoning_content 不進日誌。
         request.update(reasoning_effort="low", seed=0, stream=True)
 
-    response = get_client().chat.completions.create(**request)
-    if is_kimi_k3:
-        started = time.monotonic()
-        parts = []
-        for chunk in response:
-            if time.monotonic() - started > config.KIMI_STREAM_MAX_SECONDS:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-                raise NvidiaResponseError("NVIDIA Kimi 串流超過時間限制")
-            for choice in getattr(chunk, "choices", None) or []:
-                delta = getattr(choice, "delta", None)
-                piece = getattr(delta, "content", None)
-                if isinstance(piece, str):
-                    parts.append(piece)
-        content = "".join(parts)
-    else:
-        try:
-            content = response.choices[0].message.content
-        except (AttributeError, IndexError) as exc:
-            raise NvidiaResponseError("NVIDIA 視覺模型回覆格式不完整") from exc
+    started = time.monotonic()
+    _ocr_metrics["calls"] += 1
+    response = None
+    try:
+        response = get_client().chat.completions.create(**request)
+        if is_kimi_k3:
+            stream_started = time.monotonic()
+            parts = []
+            for chunk in response:
+                if time.monotonic() - stream_started > config.KIMI_STREAM_MAX_SECONDS:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        close()
+                    raise NvidiaResponseError("NVIDIA Kimi 串流超過時間限制")
+                for choice in getattr(chunk, "choices", None) or []:
+                    delta = getattr(choice, "delta", None)
+                    piece = getattr(delta, "content", None)
+                    if isinstance(piece, str):
+                        parts.append(piece)
+            content = "".join(parts)
+        else:
+            try:
+                content = response.choices[0].message.content
+            except (AttributeError, IndexError) as exc:
+                raise NvidiaResponseError("NVIDIA 視覺模型回覆格式不完整") from exc
+    finally:
+        _ocr_metrics["seconds"] += time.monotonic() - started
+
+    usage = getattr(response, "usage", None)
+    for source, target in (
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        value = getattr(usage, source, 0) if usage is not None else 0
+        if isinstance(value, int):
+            _ocr_metrics[target] += value
     if not isinstance(content, str) or not content.strip():
         raise NvidiaResponseError("NVIDIA 視覺模型沒有回傳文字")
     return content.strip()
@@ -362,134 +468,149 @@ def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:
     return result
 
 
-def ocr_jobsheet_fields(
-        pdf_doc: fitz.Document,
-        page_idx: int,
-        zoom: float = config.OCR_ZOOM_DEFAULT,
-) -> dict:
-    """
-    忠實抄錄 ORDER / SERIAL / PRODUCT / CUSTOMER / LOCATION / PHONE / ASSET /
-    HAWO(WO) / DATE。
+_OCR_MODEL_FIELDS = (
+    "order_no", "serial_candidates", "product_raw", "hospital_raw",
+    "department_room_raw", "phone_candidates", "asset_candidates",
+    "work_order_candidates", "service_date_raw", "date_source",
+    "unreadable_fields",
+)
+_OCR_LIST_FIELDS = {
+    "serial_candidates", "phone_candidates", "asset_candidates",
+    "work_order_candidates", "unreadable_fields",
+}
 
-    視覺模型只負責「看字」，不負責挑 Asana 工作或修正常見值。模糊字元以
-    candidates 保存，讓後面的 Asana 比對用日期、電話與 asset 交叉確認。
-    常見誤讀：9→G, O→0, 0→D, l→1, S→5, C450→CX50
-    """
-    img_b64 = crop_jobsheet_top(pdf_doc, page_idx, zoom=zoom)
-    prompt = (
-        "You are a strict transcription reader, not a matching or guessing system. "
-        "Read only values visibly written in the labelled boxes of this one jobsheet image. "
-        "Treat this image independently: never invent, autocomplete, or reuse values from typical "
-        "equipment, hospitals, previous images, or the field labels themselves. Do not normalize "
-        "hospital abbreviations or product names. Preserve visible letters, digits and punctuation. "
-        "For an ambiguous serial, phone, asset or HAWO/WO number, list at most three readings that are each "
-        "actually supported by the handwriting. Never create alternatives merely to fill the list. "
-        "The service date must come from the ACTION DATE / service-date box, not a printed form date. "
-        "Use null or [] when blank or unreadable. "
-        "Return JSON only, with no markdown fences:\n"
-        "{\n"
-        '  "order_no": "raw text below ORDER NO., or null",\n'
-        '  "serial_candidates": ["raw visible reading"],\n'
-        '  "product_raw": "raw text below PRODUCT, or null",\n'
-        '  "customer_raw": "raw text in Customer Name, or null",\n'
-        '  "location_raw": "raw department, ward, floor or room text, or null",\n'
-        '  "phone_candidates": ["raw telephone reading"],\n'
-        '  "asset_candidates": ["raw equipment/asset number reading"],\n'
-        '  "work_order_candidates": ["raw HAWO or WO service reference visibly written in FAULT SYMPTOM or ACTION TAKEN"],\n'
-        '  "service_date_raw": "raw ACTION DATE / service date, or null",\n'
-        '  "date_source": "ACTION_DATE, OTHER, or null",\n'
-        '  "unreadable_fields": ["field label"]\n'
-        "}"
+
+def _today() -> date:
+    return date.today()
+
+
+def _valid_serial_token(value: str) -> bool:
+    """實檔 serial 均以 2-3 個字母起首；不自行把 1/5/2 改成 U/S/Z。"""
+    token = re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+    return bool(
+        re.fullmatch(r"[A-Z]{2,3}[A-Z0-9]{6,9}", token)
+        and sum(char.isdigit() for char in token) >= 4
     )
-    data = None
-    last_error = None
-    # 服務偶爾會在 JSON 前後加解釋。找出其中真正的 JSON；若仍不合法，
-    # 同一張圖再問一次。兩次都錯才讓 Stage B 失敗並保留來源。
-    field_order = (
-        "order_no", "serial_candidates", "product_raw", "customer_raw",
-        "location_raw", "phone_candidates", "asset_candidates",
-        "work_order_candidates", "service_date_raw", "date_source",
-        "unreadable_fields",
-    )
-    # 模型偶爾省略可選的 location/unreadable 欄位；核心四項齊全便可讀，
-    # 其餘缺項在本機補空值，避免格式小差異令整條 pipeline 失敗。
-    expected = {"order_no", "serial_candidates", "product_raw", "customer_raw"}
-    for _ in range(2):
-        raw = _call_vision(
-            prompt=prompt,
-            image_b64=img_b64,
-            max_tokens=300,
-            expects_json=True,
-        )
+
+
+def _hospital_is_plausible(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    if re.search(r"\bASSET\b", value, re.IGNORECASE):
+        return False
+    core = re.split(r"[,/\-]", value.strip(), 1)[0].strip()
+    normalized = re.sub(r"[^A-Z0-9]", "", core.upper())
+    if re.fullmatch(r"[A-Z]{2,6}", normalized):
+        return normalized in config.HOSPITAL_SHORT_ALIASES
+    return len(normalized) >= 5 and not normalized.isdigit()
+
+
+def _parse_action_date(value: Optional[str]) -> Optional[date]:
+    text = (value or "").strip().replace(".", "/").replace("-", "/")
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
-            candidate = _parse_json_object(raw, required_keys=expected)
-        except (json.JSONDecodeError, NvidiaResponseError) as exc:
-            last_error = exc
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
             continue
+    return None
 
-        list_fields = {
-            "serial_candidates", "phone_candidates", "asset_candidates",
-            "work_order_candidates", "unreadable_fields",
-        }
-        invalid_types = []
-        for key in field_order:
-            value = candidate.get(key)
-            if key in list_fields:
-                if value is not None and (
-                    not isinstance(value, list)
-                    or any(not isinstance(item, str) for item in value)
-                ):
-                    invalid_types.append(key)
-            elif value is not None and not isinstance(value, str):
+
+_ASSET_TAG_PATTERN = re.compile(
+    r"\bASSET(?:\s*(?:NO\.?))?\s*[#.:\-]?\s*"
+    r"(?P<value>(?:[0-9]{2,}(?:\s+[0-9]{2,})+|[0-9](?:[0-9\-]{2,}[0-9])))\b",
+    re.IGNORECASE,
+)
+
+
+def _tagged_asset_numbers(text: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    values = []
+    for match in _ASSET_TAG_PATTERN.finditer(text):
+        digits = re.sub(r"\D", "", match.group("value"))
+        if len(digits) >= 4 and digits not in values:
+            values.append(digits)
+    return values
+
+
+def _department_without_asset(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    # Asset 後面若另寫「6F」等房間資料，只移除 asset 本身，不把 6F 的
+    # 第一個數字吞進資產編號。
+    cleaned = _ASSET_TAG_PATTERN.sub(" ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;/#-_")
+    return cleaned or None
+
+
+def _empty_ocr_data() -> dict:
+    return {
+        key: ([] if key in _OCR_LIST_FIELDS else None)
+        for key in _OCR_MODEL_FIELDS
+    }
+
+
+def _normalize_ocr_data(candidate: dict) -> dict:
+    """型別及業務格式安全閘；所有相容欄位都在這裡單向派生。"""
+    data = _empty_ocr_data()
+    invalid_types = []
+    for key in _OCR_MODEL_FIELDS:
+        value = candidate.get(key)
+        if key in _OCR_LIST_FIELDS:
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) for item in value)
+            ):
                 invalid_types.append(key)
-        if invalid_types:
-            fields = ", ".join(sorted(invalid_types))
-            last_error = NvidiaResponseError(f"NVIDIA OCR 欄位不是文字：{fields}")
-            continue
-        # 只保留預期欄位，避免模型附帶的其他內容進入後續流程。
-        data = {
-            key: candidate.get(key, [] if key in list_fields else None)
-            for key in field_order
-        }
-        break
+            elif isinstance(value, list):
+                cleaned = []
+                for item in value:
+                    item = item.strip()
+                    if item and item.lower() not in {"null", "none", "n/a"} and item not in cleaned:
+                        cleaned.append(item)
+                data[key] = cleaned if key == "unreadable_fields" else cleaned[:3]
+        elif value is not None and not isinstance(value, str):
+            invalid_types.append(key)
+        elif isinstance(value, str) and value.strip().lower() not in {"", "null", "none", "n/a"}:
+            data[key] = value.strip()
+    if invalid_types:
+        raise NvidiaResponseError(
+            "圖片 OCR 欄位不是指定文字型別：" + ", ".join(sorted(invalid_types))
+        )
 
-    if data is None:
-        raise NvidiaResponseError("NVIDIA OCR 連續兩次回覆格式不正確") from last_error
+    def mark_unreadable(field: str) -> None:
+        if field not in data["unreadable_fields"]:
+            data["unreadable_fields"].append(field)
 
-    for key in list(data.keys()):
-        val = data.get(key)
-        if isinstance(val, str) and val.strip().lower() in ("", "null", "none", "n/a"):
-            data[key] = None
-        elif val is None and key in {
-            "serial_candidates", "phone_candidates", "asset_candidates",
-            "work_order_candidates", "unreadable_fields"
-        }:
-            data[key] = []
-        elif isinstance(val, list):
-            cleaned = []
-            for item in val:
-                item = item.strip()
-                if item and item.lower() not in ("null", "none", "n/a") and item not in cleaned:
-                    cleaned.append(item)
-            data[key] = cleaned[:3] if key != "unreadable_fields" else cleaned
-
-    # 格式安全閘：模型只抄字，但不合業務格式的值不可進 Asana 搜尋。
     order_digits = re.sub(r"\D", "", data.get("order_no") or "")
+    if data.get("order_no") and not re.fullmatch(config.ORDER_NO_REGEX, order_digits):
+        mark_unreadable("order_no")
     data["order_no"] = (
         order_digits if re.fullmatch(config.ORDER_NO_REGEX, order_digits) else None
     )
 
-    def valid_mixed(value: str, minimum: int = 6) -> bool:
-        token = re.sub(r"[^A-Z0-9]", "", value.upper())
-        return (
-            len(token) >= minimum
-            and any(ch.isalpha() for ch in token)
-            and any(ch.isdigit() for ch in token)
-        )
-
+    raw_serials = data["serial_candidates"]
     data["serial_candidates"] = [
-        value for value in data["serial_candidates"] if valid_mixed(value)
+        value for value in raw_serials if _valid_serial_token(value)
     ]
+    if raw_serials and not data["serial_candidates"]:
+        mark_unreadable("serial_candidates")
+
+    # 型號只可校正到已確認的 Philips 清單；離清單太遠便不作配對證據。
+    if data.get("product_raw"):
+        from . import asana_client
+        canonical = asana_client.normalize_product(data["product_raw"])
+        data["product"] = canonical if canonical in asana_client.KNOWN_PRODUCTS else None
+        if data["product"] is None:
+            mark_unreadable("product_raw")
+            data["product_raw"] = None
+    else:
+        data["product"] = None
+
+    if data.get("hospital_raw") and not _hospital_is_plausible(data["hospital_raw"]):
+        mark_unreadable("hospital_raw")
+        data["hospital_raw"] = None
+
     phones = []
     for value in data["phone_candidates"]:
         digits = re.sub(r"\D", "", value)
@@ -498,25 +619,165 @@ def ocr_jobsheet_fields(
         if len(digits) == 8 and digits not in phones:
             phones.append(digits)
     data["phone_candidates"] = phones
-    data["asset_candidates"] = [
-        value for value in data["asset_candidates"]
-        if len(re.sub(r"\D", "", value)) >= 4
-    ]
+
+    assets = []
+    for value in data["asset_candidates"] + _tagged_asset_numbers(
+            data.get("department_room_raw")):
+        digits = re.sub(r"\D", "", value)
+        if len(digits) >= 4 and digits not in assets:
+            assets.append(digits)
+    data["asset_candidates"] = assets[:3]
     data["work_order_candidates"] = [
         value for value in data["work_order_candidates"]
         if len(re.sub(r"\D", "", value)) >= 6
-    ]
+    ][:3]
 
-    if data.get("date_source"):
-        data["date_source"] = data["date_source"].strip().upper().replace(" ", "_")
-        if data["date_source"] not in {"ACTION_DATE", "OTHER"}:
+    parsed_date = _parse_action_date(data.get("service_date_raw"))
+    if data.get("service_date_raw"):
+        age = (_today() - parsed_date).days if parsed_date else None
+        if (
+            age is None
+            or age > config.OCR_SERVICE_DATE_MAX_AGE_DAYS
+            or age < -config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS
+        ):
+            mark_unreadable("service_date_raw")
+            data["service_date_raw"] = None
             data["date_source"] = None
+        else:
+            data["date_source"] = "ACTION_DATE"
+    else:
+        data["date_source"] = None
 
-    # 相容欄位由原始抄錄派生，不作任何猜測或自動修正。
+    # 新名稱反映欄位真正含義；舊名稱只供現有 matcher/報告相容。
+    data["customer_raw"] = data.get("hospital_raw")
+    data["location_raw"] = _department_without_asset(
+        data.get("department_room_raw")
+    )
     data["serial_no"] = next(iter(data["serial_candidates"]), None)
-    data["product"] = data["product_raw"]
-    data["customer"] = data["customer_raw"]
+    data["customer"] = data.get("hospital_raw")
     return data
+
+
+def _read_card(image_b64: str, prompt: str, required_keys: set) -> dict:
+    """同一張卡格式錯誤時只重試一次；內容看不清由後續單格複核。"""
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(
+            prompt=prompt, image_b64=image_b64, max_tokens=300, expects_json=True
+        )
+        try:
+            candidate = _parse_json_object(raw, required_keys=required_keys)
+            return _normalize_ocr_data(candidate)
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
+            last_error = exc
+    raise NvidiaResponseError("圖片 OCR 連續兩次回覆格式不正確") from last_error
+
+
+_TRANSCRIPTION_RULES = (
+    "You are a strict transcription reader, not a matching or guessing system. "
+    "Each bordered panel is already assigned to exactly one printed jobsheet field. "
+    "Read only handwriting inside that panel; never move text between panels. "
+    "Never invent, autocomplete, normalize, or use likely hospitals, products, devices, "
+    "prior images, or field labels as answers. Preserve visible characters. "
+    "Use null or [] when blank or unreadable. Return JSON only, without markdown. "
+)
+
+
+def ocr_jobsheet_fields(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        zoom: float = config.OCR_ZOOM_DEFAULT,
+) -> dict:
+    """第一輪：以清楚分隔的固定欄位卡忠實抄錄所有核對資料。"""
+    image_b64 = crop_jobsheet_top(pdf_doc, page_idx, zoom=zoom)
+    prompt = _TRANSCRIPTION_RULES + (
+        "CUSTOMER NAME / HOSPITAL is the hospital field; DEPT./ROOM is not a hospital. "
+        "Only report asset numbers visibly preceded by the printed or handwritten word Asset. "
+        "Only report HAWO/WO references visibly marked as such in the two reference panels. "
+        "The date must come only from ACTION DATE. At most three character readings may be "
+        "returned for a genuinely ambiguous number. Required shape:\n"
+        '{"order_no":null,"serial_candidates":[],"product_raw":null,'
+        '"hospital_raw":null,"department_room_raw":null,"phone_candidates":[],'
+        '"asset_candidates":[],"work_order_candidates":[],"service_date_raw":null,'
+        '"date_source":"ACTION_DATE","unreadable_fields":[]}'
+    )
+    return _read_card(
+        image_b64,
+        prompt,
+        {"order_no", "serial_candidates", "product_raw", "hospital_raw"},
+    )
+
+
+def ocr_jobsheet_identity_fields(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        zoom: float = config.OCR_IDENTITY_ZOOM,
+) -> dict:
+    """第二輪：高倍獨立複核訂單、型號、serial 和醫院，不帶首輪答案。"""
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, config.OCR_IDENTITY_CARD_FIELDS, zoom=zoom, strong=True
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "This independent card contains only identity fields. Transcribe each value exactly. "
+        "Do not infer missing serial prefixes or expand hospital abbreviations. Required shape:\n"
+        '{"order_no":null,"serial_candidates":[],"product_raw":null,'
+        '"hospital_raw":null,"unreadable_fields":[]}'
+    )
+    return _read_card(
+        image_b64,
+        prompt,
+        {"order_no", "serial_candidates", "product_raw", "hospital_raw"},
+    )
+
+
+def ocr_jobsheet_support_fields(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        zoom: float = config.OCR_SUPPORT_ZOOM,
+) -> dict:
+    """只有 Asana 證據不足時才第二次讀電話、asset、日期及參考編號。"""
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, config.OCR_SUPPORT_CARD_FIELDS, zoom=zoom, strong=True
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "Read DEPT./ROOM and TELEPHONE from their own panels. An Asset value is valid only "
+        "when the word Asset is visibly attached to it. A work-order value is valid only when "
+        "HAWO or WO is visibly attached to it. Read the date only from ACTION DATE. Required shape:\n"
+        '{"department_room_raw":null,"phone_candidates":[],"asset_candidates":[],'
+        '"work_order_candidates":[],"service_date_raw":null,'
+        '"date_source":"ACTION_DATE","unreadable_fields":[]}'
+    )
+    return _read_card(
+        image_b64,
+        prompt,
+        {"department_room_raw", "phone_candidates", "asset_candidates", "service_date_raw"},
+    )
+
+
+def ocr_jobsheet_focused_field(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        field: str,
+        zoom: float,
+) -> dict:
+    """有爭議時只重讀一格；不把先前讀數或 Asana 候選告訴模型。"""
+    allowed = {
+        "order_no", "product_raw", "serial_candidates", "hospital_raw",
+        "department_room_raw", "phone_candidates", "service_date_raw",
+    }
+    if field not in allowed:
+        raise ValueError(f"不支援單格複核：{field}")
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, (field,), zoom=zoom, strong=True
+    )
+    list_value = field in {"serial_candidates", "phone_candidates"}
+    example_value = "[]" if list_value else "null"
+    prompt = _TRANSCRIPTION_RULES + (
+        f"This image contains only the panel labelled {_FIELD_DISPLAY_LABELS[field]}. "
+        "Return only the exact visible value for that field. Do not repair unclear characters. "
+        f'Required shape: {{"{field}":{example_value},"unreadable_fields":[]}}'
+    )
+    return _read_card(image_b64, prompt, {field})
 
 
 def ocr_jobsheet_serial_candidates(
@@ -551,9 +812,7 @@ def ocr_jobsheet_serial_candidates(
         value = value.strip()
         normalized = re.sub(r"[^A-Z0-9]", "", value.upper())
         if (
-            len(normalized) >= 8
-            and any(char.isalpha() for char in normalized)
-            and any(char.isdigit() for char in normalized)
+            _valid_serial_token(value)
             and normalized not in {
                 re.sub(r"[^A-Z0-9]", "", item.upper()) for item in candidates
             }

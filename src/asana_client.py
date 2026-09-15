@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # 已知型號（正規型；比對時忽略空白與大小寫，並容許 1~2 字 OCR 誤讀）
 KNOWN_PRODUCTS = [
     "Affiniti 30", "Affiniti 50", "Affiniti 70",
-    "EPIQ 5G", "EPIQ 7G", "EPIQ Elite",
+    "EPIQ 5G", "EPIQ 7G", "EPIQ 7+", "EPIQ Elite", "EPIQ CVx",
     "CX30", "CX50",
 ]
 
@@ -39,28 +39,20 @@ _task_cache: dict = {}
 # 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
 # 與配對證據；完整的私人機構名稱仍可保留使用。
 HOSPITAL_ALIASES = {
-    "QMH": "QMH",
+    **config.HOSPITAL_SHORT_ALIASES,
     "QUEENMARYHOSPITAL": "QMH",
-    "QEH": "QEH",
     "QUEENELIZABETHHOSPITAL": "QEH",
-    "KWH": "KWH",
     "KWONGWAHHOSPITAL": "KWH",
-    "KH": "KH",
     "KOWLOONHOSPITAL": "KH",
-    "PYNEH": "PYNEH",
     "PAMELAYOUDENETHERSOLEEASTERNHOSPITAL": "PYNEH",
-    "PMH": "PMH",
     "PRINCESSMARGARETHOSPITAL": "PMH",
-    "HKCH": "HKCH",
     "HONGKONGCHILDRENSHOSPITAL": "HKCH",
-    "PWH": "PWH",
     "PRINCEOFWALESHOSPITAL": "PWH",
-    "UCH": "UCH",
     "UNITEDCHRISTIANHOSPITAL": "UCH",
-    "TMH": "TMH",
     "TUENMUNHOSPITAL": "TMH",
-    "NDH": "NDH",
     "NORTHDISTRICTHOSPITAL": "NDH",
+    "GRANTHAMHOSPITAL": "GH",
+    "TUNGWAHHOSPITAL": "TUNGWAHHOSPITAL",
 }
 
 
@@ -117,6 +109,17 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     if re.fullmatch(r"[A-Za-z]{2,6}", core):
         return None
     return core if len(_norm(core)) >= 5 else None
+
+
+def hospital_search_terms(canonical: Optional[str]) -> List[str]:
+    """同院不同短寫都用來撈池；不把這份清單交給圖片模型。"""
+    if not canonical:
+        return []
+    aliases = [
+        raw for raw, value in config.HOSPITAL_SHORT_ALIASES.items()
+        if value == canonical
+    ]
+    return list(dict.fromkeys([canonical, *aliases]))
 
 
 def extract_serial(name: str) -> Optional[str]:
@@ -249,10 +252,11 @@ def _gather_pool(order_no, serials, hosp, product,
                  phones=None, assets=None, work_orders=None) -> List[dict]:
     """用可見欄位撈候選池；真正的取捨在本機評分，不交給 Asana 猜。"""
     queries: List[str] = []
-    if hosp and product:
-        queries.append(f"{hosp} {product}")
-    if hosp:
-        queries.append(hosp)
+    hospital_terms = hospital_search_terms(hosp)
+    for term in hospital_terms:
+        if product:
+            queries.append(f"{term} {product}")
+        queries.append(term)
     if order_no:
         queries.append(order_no)
     for serial in serials or []:
@@ -286,7 +290,7 @@ def _gather_pool(order_no, serials, hosp, product,
     # typeahead 排序不是準確度排序。先用候選標題中的可靠 token 排序，再只讀
     # 最相關的一小批完整 task，避免一份單據打數十至數百次 API。
     tokens = [
-        order_no, hosp, product, *(serials or []), *(work_orders or []),
+        order_no, *hospital_terms, product, *(serials or []), *(work_orders or []),
         *(phones or []), *(assets or []),
     ]
     tokens = [_norm(token) for token in tokens if token]
@@ -470,7 +474,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("work_order")
         reasons.append("HAWO/WO")
 
-    hospital_ok = bool(hosp and _norm(name).startswith(_norm(hosp)))
+    hospital_ok = bool(hosp and hospital_core(name) == hosp)
     product_ok = bool(product and _norm(product) in _norm(name))
     if hospital_ok:
         score += 20
@@ -481,6 +485,8 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
     if hospital_ok and product_ok:
         support.add("hospital+product")
 
+    # 新 OCR 已把 Dept./Room 中純 Asset 內容移除；不可再把整段 Asset#
+    # 當作地點加分。只有舊資料完全沒有新欄位時才回退 location_raw。
     location = ocr_data.get("location_raw") or ""
     if len(_norm(location)) >= 3 and _norm(location) in haystack_norm:
         score += 5
@@ -546,8 +552,14 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     serials = _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
-    product  = normalize_product(ocr_data.get("product"))
-    hosp     = hospital_core(ocr_data.get("customer"))
+    product  = normalize_product(
+        ocr_data.get("product") or ocr_data.get("product_raw")
+    )
+    hosp     = hospital_core(
+        ocr_data.get("hospital_raw")
+        or ocr_data.get("customer")
+        or ocr_data.get("customer_raw")
+    )
     phones = _clean_candidates(ocr_data.get("phone_candidates"))
     assets = _clean_candidates(ocr_data.get("asset_candidates"))
     work_orders = _clean_candidates(ocr_data.get("work_order_candidates"))
@@ -601,7 +613,8 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     # serial 完全一致仍須日期/電話/asset，或醫院+型號一起支持；若有並列歷史
     # 工作，分數亦必須拉開。serial 錯一字時要求至少兩組額外證據。
     strong = best["support"]
-    if best["serial_dist"] == 0:
+    serial_ambiguous = bool(ocr_data.get("serial_ambiguous"))
+    if best["serial_dist"] == 0 and not serial_ambiguous:
         supported = bool(strong & {
             "date", "phone", "asset", "work_order", "hospital+product", "job_type"
         })
@@ -610,6 +623,8 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             log.info(f"  ✅ Asana 多欄核對命中（{', '.join(best['reasons'])}）")
             return best["task"], 2
     elif best["serial_dist"] <= MAX_SERIAL_DIST:
+        # 兩輪 OCR 只差一字時，即使其中一個剛好與 Asana 完全相同，也仍是
+        # 有爭議的讀數；必須按一字模糊規則要求兩組額外證據。
         supported = len(strong & {
             "date", "phone", "asset", "work_order", "hospital+product", "job_type"
         }) >= 2

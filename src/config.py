@@ -76,15 +76,59 @@ ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 ASANA_MAX_HYDRATED_CANDIDATES = 40
 
 # === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
-OCR_ZOOM_DEFAULT  = 2.0   # 手寫細字至少 2x，避免低解像度下用猜的
-OCR_ZOOM_FALLBACK = 2.5   # 舊版單次升級用（保留相容）
-OCR_CROP_TOP      = 0.10  # 從圖片高 10% 開始裁
-OCR_CROP_BOTTOM   = 0.56  # 裁到 56%，把聯絡電話、日期及 asset 一併納入
-OCR_CONTRAST      = 2.0   # 對比加強倍數
+OCR_ZOOM_DEFAULT  = 3.0   # 第一張分格欄位卡；不再把半頁表格原樣交給模型
+OCR_ZOOM_FALLBACK = 4.0   # 身分欄位（訂單/型號/serial/醫院）第二次高倍複核
+OCR_CROP_TOP      = 0.10  # 舊版上半頁裁切，保留相容但正式欄位 OCR 不再使用
+OCR_CROP_BOTTOM   = 0.56
+OCR_CONTRAST      = 2.0
+
+# Philips Jobsheet 的印刷版面固定。座標是 (left, top, right, bottom)，以整頁
+# 寬高的比例表示；每格包含印刷標籤和手寫值，四周留少量空間以容忍掃描偏移。
+# 這些範圍已用 2026-09 留下的多批實際掃描首頁逐張核對。
+OCR_FIELD_BOXES = {
+    "order_no":        (0.220, 0.108, 0.405, 0.162),
+    "product_raw":     (0.405, 0.108, 0.570, 0.162),
+    "serial_candidates": (0.570, 0.108, 0.770, 0.162),
+    "hospital_raw":    (0.055, 0.164, 0.575, 0.207),
+    "department_room_raw": (0.055, 0.198, 0.575, 0.242),
+    "phone_candidates": (0.555, 0.198, 0.955, 0.242),
+    "service_date_raw": (0.555, 0.312, 0.735, 0.365),
+    "fault_symptom":   (0.055, 0.245, 0.955, 0.315),
+    "action_taken":    (0.055, 0.307, 0.555, 0.500),
+}
+OCR_PRIMARY_CARD_FIELDS = (
+    "order_no", "product_raw", "serial_candidates", "hospital_raw",
+    "department_room_raw", "phone_candidates", "service_date_raw",
+    "fault_symptom", "action_taken",
+)
+OCR_IDENTITY_CARD_FIELDS = (
+    "order_no", "product_raw", "serial_candidates", "hospital_raw",
+)
+OCR_SUPPORT_CARD_FIELDS = (
+    "department_room_raw", "phone_candidates", "service_date_raw",
+    "fault_symptom", "action_taken",
+)
+OCR_CARD_WIDTH = 1200
+OCR_FIELD_LABEL_HEIGHT = 42
+OCR_IDENTITY_ZOOM = 4.0
+OCR_SUPPORT_ZOOM = 4.0
+OCR_FOCUSED_RETRY_ZOOMS = [5.0, 6.0]
+OCR_SERVICE_DATE_MAX_AGE_DAYS = 93
+OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS = 7
+
+# 未知的 2-6 字母短碼很容易是手寫幻覺，只有已由實際工作單核對的短碼可作
+# 醫院證據。PYN 與 PYNEH 是同院；詳細樓層仍保留在 Dept./Room 欄。
+HOSPITAL_SHORT_ALIASES = {
+    "QMH": "QMH", "QEH": "QEH", "KWH": "KWH", "KH": "KH",
+    "PYN": "PYNEH", "PYNEH": "PYNEH", "PMH": "PMH",
+    "HKCH": "HKCH", "PWH": "PWH", "UCH": "UCH", "TMH": "TMH",
+    "NDH": "NDH", "GH": "GH",
+}
 
 # === OCR 多輪交叉核對 ===
-# 至少兩個不同解像度要抄出相同欄位，才把共識資料送去 Asana。
-OCR_RETRY_ZOOMS = [2.0, 2.5, 3.0]
+# 第一輪讀完整分格卡，第二輪只複核身分欄；仍有爭議才精讀單格。
+# 舊名稱保留給測試及外部呼叫相容。
+OCR_RETRY_ZOOMS = [OCR_ZOOM_DEFAULT, OCR_IDENTITY_ZOOM]
 OCR_MATCH_CONFIRMATIONS = 2
 # 整張上半頁多輪仍配不到時，只重讀 SERIAL NO. 小格。裁小後可用更高
 # 解像度而不增加太多圖片大小，減少模型被其他手寫欄位干擾。

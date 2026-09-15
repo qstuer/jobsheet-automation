@@ -74,8 +74,8 @@ def _dry_run_ocr_preview(ocr: dict) -> str:
     labels = (
         ("serial", "serial_candidates"),
         ("product", "product_raw"),
-        ("customer", "customer_raw"),
-        ("location", "location_raw"),
+        ("hospital", "hospital_raw"),
+        ("department_room", "department_room_raw"),
         ("asset", "asset_candidates"),
         ("date", "service_date_raw"),
     )
@@ -188,9 +188,8 @@ def _near_serial_consensus(readings: list) -> list:
         for value in reading.get("serial_candidates") or []:
             normalized = _norm_evidence(value)
             plausible = (
-                len(normalized) >= 8
-                and any(char.isalpha() for char in normalized)
-                and any(char.isdigit() for char in normalized)
+                bool(re.fullmatch(r"[A-Z]{2,3}[A-Z0-9]{6,9}", normalized))
+                and sum(char.isdigit() for char in normalized) >= 4
             )
             if plausible and normalized not in seen_this_round:
                 entries.append((round_index, value, normalized))
@@ -218,14 +217,19 @@ def _consensus_ocr(readings: list) -> dict:
         "work_order_candidates", "unreadable_fields",
     }
     scalar_fields = (
-        "order_no", "product_raw", "customer_raw", "location_raw",
+        "order_no", "product_raw", "hospital_raw", "department_room_raw",
         "service_date_raw", "date_source",
     )
     for field in scalar_fields:
         buckets = {}
         for reading in readings:
             value = reading.get(field)
-            key = _norm_evidence(value)
+            if field == "hospital_raw":
+                key = _norm_evidence(asana_client.hospital_core(value))
+            elif field == "product_raw":
+                key = _norm_evidence(asana_client.normalize_product(value))
+            else:
+                key = _norm_evidence(value)
             if key:
                 buckets.setdefault(key, []).append(value)
         winners = [values for values in buckets.values() if len(values) >= 2]
@@ -242,10 +246,22 @@ def _consensus_ocr(readings: list) -> dict:
                     seen_this_round.add(key)
         result[field] = [values[0] for values in buckets.values() if len(values) >= 2][:3]
 
-    # 完全一致仍是首選；只有沒有 exact 共識時，才接受跨輪只差一字的
-    # serial 候選。這不等於配對成功，Asana 端仍會要求多項額外證據。
+    # 完全一致仍是首選；但只要任何獨立輪次曾抄出另一個有效 serial，便保留
+    # 「有爭議」標記。即使第三輪令其中一個讀數取得多數，也不能因此把曾見的
+    # 一字差異藏起來，Asana 端仍須要求至少兩組額外證據。
+    observed_serials = {
+        _norm_evidence(value)
+        for reading in readings
+        for value in reading.get("serial_candidates") or []
+        if nvidia_client._valid_serial_token(value)
+    }
+    result["serial_ambiguous"] = (
+        len(observed_serials) > 1
+        or len(result.get("serial_candidates") or []) > 1
+    )
     if not result.get("serial_candidates"):
         result["serial_candidates"] = _near_serial_consensus(readings)
+        result["serial_ambiguous"] = bool(result["serial_candidates"])
 
     # prompt 已限定 service_date_raw 只能抄 ACTION DATE。若兩輪對日期本身有
     # 共識、但模型漏填可選的 date_source，不應因此丟掉最能區分同一設備
@@ -254,87 +270,111 @@ def _consensus_ocr(readings: list) -> dict:
         result["date_source"] = "ACTION_DATE"
 
     result["serial_no"] = next(iter(result.get("serial_candidates", [])), None)
-    result["product"] = result.get("product_raw")
-    result["customer"] = result.get("customer_raw")
+    result["product"] = asana_client.normalize_product(result.get("product_raw"))
+    result["customer_raw"] = result.get("hospital_raw")
+    result["location_raw"] = nvidia_client._department_without_asset(
+        result.get("department_room_raw")
+    )
+    result["customer"] = result.get("hospital_raw")
     return result
 
 
 def _ocr_and_match(doc, job_type):
-    """先取得欄位共識，再由規則配對一次；模型本身不選 Asana 工作。"""
-    readings = []
-    last_consensus = {}
-    for i, zoom in enumerate(config.OCR_RETRY_ZOOMS, 1):
-        ocr = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=zoom)
-        # Actions log 不可印電話、asset、serial 或客戶內容；只記錄哪些欄位看得到。
-        visible_fields = [
-            key for key in (
-                "order_no", "serial_candidates", "product_raw", "customer_raw",
-                "location_raw", "phone_candidates", "asset_candidates", "service_date_raw",
-                "work_order_candidates",
-            )
-            if ocr.get(key)
-        ]
-        log.info(f"  OCR 第{i}輪({zoom}x)：已讀到 {visible_fields}")
-        readings.append(ocr)
-        if len(readings) < config.OCR_MATCH_CONFIRMATIONS:
-            log.info("  尚需另一輪抄錄確認欄位，繼續…")
-            continue
-        consensus = _consensus_ocr(readings)
-        last_consensus = consensus
-        visible_consensus = [
-            key for key in (
-                "order_no", "serial_candidates", "product_raw", "customer_raw",
-                "location_raw", "phone_candidates", "asset_candidates",
-                "service_date_raw", "work_order_candidates",
-            ) if consensus.get(key)
-        ]
-        log.info(f"  {len(readings)} 輪一致欄位：{visible_consensus}")
-        task, tier = asana_client.find_task(consensus, job_type=job_type)
-        if task is not None:
-            return task, tier, consensus
-        if i < len(config.OCR_RETRY_ZOOMS):
-            log.info("  一致證據仍不足，針對有爭議欄位再讀一輪…")
+    """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
+    nvidia_client.reset_ocr_metrics()
+    primary = nvidia_client.ocr_jobsheet_fields(
+        doc, 0, zoom=config.OCR_ZOOM_DEFAULT
+    )
+    identity = nvidia_client.ocr_jobsheet_identity_fields(
+        doc, 0, zoom=config.OCR_IDENTITY_ZOOM
+    )
+    readings = [primary, identity]
 
-    # 電話/asset/日期等已有兩項共識，但整張上半頁的 serial 仍令 Asana
-    # 無法核對時，才高倍重讀 serial 小格。這是局部精讀，不把候選名稱或
-    # 已知 serial 告訴模型；兩次精讀仍須形成共識後才能再配對。
-    rescue_evidence = sum(bool(last_consensus.get(field)) for field in (
-        "phone_candidates", "asset_candidates", "work_order_candidates",
-        "service_date_raw",
-    ))
-    if rescue_evidence >= 2:
-        focused_readings = []
-        log.info("  啟動 SERIAL NO. 小格高倍精讀…")
-        for i, zoom in enumerate(config.OCR_SERIAL_RETRY_ZOOMS, 1):
+    def visible_fields(reading):
+        return [
+            key for key in (
+                "order_no", "serial_candidates", "product_raw", "hospital_raw",
+                "department_room_raw", "phone_candidates", "asset_candidates",
+                "service_date_raw", "work_order_candidates",
+            ) if reading.get(key)
+        ]
+
+    log.info(f"  OCR 分格首讀：已讀到 {visible_fields(primary)}")
+    log.info(f"  OCR 身分欄複核：已讀到 {visible_fields(identity)}")
+    consensus = _consensus_ocr(readings)
+
+    # Order No. 可以合法留白；只有模型曾看見卻未通過格式時才精讀。
+    order_needs_focus = any(
+        "order_no" in (reading.get("unreadable_fields") or [])
+        or reading.get("order_no")
+        for reading in readings
+    ) and not consensus.get("order_no")
+    focus_fields = [
+        field for field in ("product_raw", "serial_candidates", "hospital_raw")
+        if not consensus.get(field)
+    ]
+    if order_needs_focus:
+        focus_fields.insert(0, "order_no")
+
+    for field in focus_fields:
+        log.info(f"  {field} 尚未形成可靠共識，只重讀該格")
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, field, zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                log.warning(f"  {field} 單格 {zoom}x 暫時無法完成")
+                continue
+            readings.append(reading)
+            consensus = _consensus_ocr(readings)
+            if consensus.get(field):
+                break
+
+    task, tier = asana_client.find_task(consensus, job_type=job_type)
+    if task is None and "serial_candidates" not in focus_fields:
+        # 兩張卡可能穩定地看錯同一個字；Asana 完全配不到時，再用只含 serial
+        # 的小格做兩次獨立精讀。新舊候選同時保留並標為有爭議，不能降低門檻。
+        log.info("  現有身分欄配不到 Asana，再以 SERIAL NO. 單格獨立複核")
+        serial_focus = []
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
             try:
                 candidates = nvidia_client.ocr_jobsheet_serial_candidates(
                     doc, 0, zoom=zoom
                 )
             except nvidia_client.NvidiaResponseError:
-                log.warning(f"  serial 精讀第{i}輪暫時無法完成")
+                log.warning(f"  serial 單格 {zoom}x 暫時無法完成")
                 continue
-            focused_readings.append({"serial_candidates": candidates})
-            log.info(
-                f"  serial 精讀第{i}輪({zoom}x)："
-                f"{'已讀到候選' if candidates else '未讀到可靠值'}"
+            serial_focus.append({"serial_candidates": candidates})
+        readings.extend(serial_focus)
+        consensus = _consensus_ocr(readings)
+        task, tier = asana_client.find_task(consensus, job_type=job_type)
+    if task is None:
+        # 電話、asset、日期只在確實需要時高倍複核；與首輪一致後才進 Asana。
+        log.info("  身分欄仍不足以唯一配對，讀取輔助欄位複核卡")
+        try:
+            support = nvidia_client.ocr_jobsheet_support_fields(
+                doc, 0, zoom=config.OCR_SUPPORT_ZOOM
             )
-            if len(focused_readings) < config.OCR_MATCH_CONFIRMATIONS:
-                continue
-            focused_consensus = _consensus_ocr(focused_readings)
-            focused_serials = focused_consensus.get("serial_candidates") or []
-            if not focused_serials:
-                continue
-            combined = dict(last_consensus)
-            combined["serial_candidates"] = list(dict.fromkeys(
-                list(last_consensus.get("serial_candidates") or []) + focused_serials
-            ))[:3]
-            combined["serial_no"] = combined["serial_candidates"][0]
-            task, tier = asana_client.find_task(combined, job_type=job_type)
-            if task is not None:
-                log.info("  serial 小格精讀後取得唯一可靠的 Asana 工作")
-                return task, tier, combined
-    log.warning("  多輪抄錄後仍沒有唯一可靠的 Asana 工作")
-    return None, 0, last_consensus
+            readings.append(support)
+            consensus = _consensus_ocr(readings)
+            log.info(f"  輔助欄共識：{visible_fields(consensus)}")
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        except nvidia_client.NvidiaResponseError:
+            log.warning("  輔助欄複核暫時無法完成，保留現有安全證據")
+
+    metrics = nvidia_client.get_ocr_metrics()
+    consensus["ocr_metrics"] = metrics
+    cost = metrics.get("estimated_cost_cny_upper")
+    cost_text = f"，費用上限約 RMB {cost:.4f}" if cost is not None else ""
+    log.info(
+        f"  圖片辨認共 {metrics['calls']} 次，{metrics['seconds']:.1f} 秒，"
+        f"{metrics['total_tokens']} tokens{cost_text}"
+    )
+    if task is not None:
+        return task, tier, consensus
+    log.warning("  分格複核後仍沒有唯一可靠的 Asana 工作")
+    return None, 0, consensus
 
 
 def _parse_job_type(filename: str):
@@ -451,8 +491,10 @@ def _process_split_file(filename: str, work_dir: Path,
                 "asana_task_gid": task.get("gid"),
                 "tier": tier,
                 "ocr_preview": _dry_run_ocr_preview(ocr),
+                "ocr_metrics": ocr.get("ocr_metrics", {}),
             }
         result = _finalize_match(local, task, tier, filename)
+        result["ocr_metrics"] = ocr.get("ocr_metrics", {})
     else:
         # 名稱未確認時絕不把猜測結果送到正式 OneDrive。保留完整 PDF 在私人
         # Google Drive，之後可人工核對或用改良後的 matcher 重試。
@@ -462,6 +504,7 @@ def _process_split_file(filename: str, work_dir: Path,
             return {
                 "status": "預覽：證據不足，會留待人工核對",
                 "ocr_preview": _dry_run_ocr_preview(ocr),
+                "ocr_metrics": ocr.get("ocr_metrics", {}),
             }
         if source_folder == config.GDRIVE_PENDING:
             pending_name = filename
@@ -473,7 +516,7 @@ def _process_split_file(filename: str, work_dir: Path,
         manifest = _manifest_for_job(work_dir, filename)
         _save_result(
             work_dir, manifest, filename, "pending", reason="Asana 配對證據不足",
-            pending=pending_name,
+            pending=pending_name, ocr_metrics=ocr.get("ocr_metrics", {}),
         )
         local.unlink(missing_ok=True)
         return result
@@ -483,6 +526,7 @@ def _process_split_file(filename: str, work_dir: Path,
         work_dir, manifest, filename, result["state"],
         onedrive=result.get("onedrive"), order_no=result.get("order_no"),
         asana_task_gid=result.get("asana_task_gid"),
+        ocr_metrics=result.get("ocr_metrics", {}),
     )
     # OneDrive 已接收檔案後，先把結果寫進耐久批次狀態，最後才刪來源。
     # 若狀態寫入失敗，_SPLIT 仍在，下輪會以內容比對認出既有檔而不重複上傳；
@@ -561,6 +605,19 @@ def main() -> int:
             details.append(f"預計檔名={row['planned']}")
         if row.get("ocr_preview"):
             details.append(f"OCR={row['ocr_preview']}")
+        if row.get("ocr_metrics"):
+            metrics = row["ocr_metrics"]
+            metric_text = (
+                f"圖片呼叫={metrics.get('calls', 0)}，"
+                f"耗時={metrics.get('seconds', 0):.1f}s，"
+                f"tokens={metrics.get('total_tokens', 0)}"
+            )
+            if metrics.get("estimated_cost_cny_upper") is not None:
+                metric_text += (
+                    f"，估算費用上限=RMB "
+                    f"{metrics['estimated_cost_cny_upper']:.4f}"
+                )
+            details.append(metric_text)
         log.info(f"  {row.get('file')}：{'；'.join(details)}")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:

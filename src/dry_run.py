@@ -43,13 +43,22 @@ def main() -> int:
             output = work_dir / f"{Path(target).stem}__job{index}_{job['type']}.pdf"
             pdf_utils.extract_pages(source, job["keep_pages"], output)
             with fitz.open(output) as doc:
-                task, tier, _ = processor._ocr_and_match(doc, job["type"])
+                task, tier, ocr = processor._ocr_and_match(doc, job["type"])
+            metrics = ocr.get("ocr_metrics", {})
             if task is None:
                 result = "完整，但 Asana 證據不足"
             else:
                 planned, _ = processor._planned_filename(task)
                 result = f"預計名稱：{planned}（配對層級 {tier}）"
-            report.append({"job": index, "type": job["type"], "result": result})
+            report.append({
+                "job": index,
+                "type": job["type"],
+                "result": result,
+                "calls": metrics.get("calls", 0),
+                "seconds": metrics.get("seconds", 0),
+                "tokens": metrics.get("total_tokens", 0),
+                "cost": metrics.get("estimated_cost_cny_upper"),
+            })
 
     log.info("=" * 60)
     log.info(f"只讀測試：{target}，共 {len(report)} 份；沒有修改任何雲端檔案")
@@ -60,9 +69,20 @@ def main() -> int:
         with open(summary_path, "a", encoding="utf-8") as stream:
             stream.write("## Jobsheet 全程只讀測試\n\n")
             stream.write(f"來源：`{target}`\n\n")
-            stream.write("| 工作單 | 類型 | 結果 |\n|---|---|---|\n")
+            stream.write(
+                "| 工作單 | 類型 | 結果 | 圖片呼叫 | 耗時 | tokens | "
+                "DeepSeek 費用上限 |\n"
+            )
+            stream.write("|---|---|---|---:|---:|---:|---:|\n")
             for row in report:
-                stream.write(f"| {row['job']} | {row['type']} | {row['result']} |\n")
+                cost = (
+                    f"RMB {row['cost']:.4f}" if row.get("cost") is not None else "-"
+                )
+                stream.write(
+                    f"| {row['job']} | {row['type']} | {row['result']} | "
+                    f"{row.get('calls', 0)} | {row.get('seconds', 0):.1f}s | "
+                    f"{row.get('tokens', 0)} | {cost} |\n"
+                )
     return 0
 
 

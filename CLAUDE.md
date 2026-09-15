@@ -1,6 +1,6 @@
 # Jobsheet 自動化歸檔 — 系統手冊
 
-> 最後全面檢查：2026-09-14
+> 最後全面檢查：2026-09-15
 > GitHub：<https://github.com/qstuer/jobsheet-automation>
 > 已實證：2026-05-31，一份 20 頁掃描（1 份 CM、3 份 PM）全自動切成 4 份並正確歸檔。
 > 本次翻新：修正新版 rclone 看不到 PDF、移除假成功、加入冷卻及連敗告警、替換已停用的辨認入口、補上安全重跑及測試。
@@ -8,6 +8,7 @@
 > 2026-09-11 翻新：用 52 頁實檔找出「短 PM」會令固定 6 頁規則錯位；改為尋找下一張工作單作邊界、按頁面內容去除背頁。辨認新增日期/電話/asset 交叉核對，不確定的名稱不再送 OneDrive。
 > 2026-09-12 模型更新：圖片辨認首選 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`，使用官方不思考 OCR 設定及嚴格 JSON 驗證；任何首選模型失聯時，同一批只等待一次，隨後使用已知可工作的 Llama 後備。
 > 2026-09-14 安全翻新：PM 不足四張內容頁會停止並進 `_INCOMPLETE`；多輪 OCR 改為先取得欄位共識，Asana 正式使用 PM/CM project 類型；加入視覺防重複、耐久批次報告、PENDING 單檔重試及全程只讀測試。
+> 2026-09-15 辨認翻新：用保留的多批實單校準固定欄位，半頁 OCR 改成分格欄位卡；訂單、型號、serial、醫院會高倍獨立複核，只有有爭議的格才再讀。加入醫院／部門語意隔離、serial 形狀安全閘及 DeepSeek 用量報告。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -96,20 +97,22 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 流程：
 
 1. 讀 `_SPLIT/` 的單一工作 PDF。
-2. 忠實抄錄訂單號、機身編號候選、型號、醫院/位置、電話、asset、HAWO/WO 及服務日期。
+2. 按固定印刷座標分開抄錄訂單號、機身編號候選、型號、醫院、部門/房間、電話、asset、HAWO/WO 及服務日期。
 3. 在 Asana 找候選工作，再用上述欄位交叉核對。
 4. 上傳 OneDrive，成功後才刪 `_SPLIT/` 來源。
 
-辨認會用 2.0、2.5、3.0 倍清晰度獨立抄錄。程式先保留至少兩輪一致的欄位，再用這份欄位共識查 Asana；訂單、serial 或 HAWO/WO 有爭議時才讀第三輪。模型不直接挑 Asana 工作。
+第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀，不再反覆傳送半頁表格。身分欄仍配不到 Asana 時，才第二次讀電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄。
 
-圖片先做黑白自動對比及銳化，只保留表格上半部欄位。訂單號、電話、serial、asset 及 HAWO/WO 另有本機格式檢查；不合格式的模型輸出不會送進 Asana 搜尋。若其他強欄位已有共識但仍配不到，才把固定的 `SERIAL NO.` 小格以 4x/5x/6x 高倍獨立重讀；小格至少兩輪一致後才可加入候選，提示中不提供已知機身編號。
+`Customer Name` 是醫院；`Dept./Room No.` 只可是樓層、病房或 asset。`Asset# 19130438` 會派生成 asset 證據，並從位置文字移除，絕不當作醫院或地點。內部新欄位叫 `hospital_raw`、`department_room_raw`；舊 `customer_raw`、`location_raw` 只作相容映射。
 
-視覺模型只負責照字抄錄，提示詞明確禁止猜醫院、補全機身編號或沿用先前圖片。Actions 日誌只記「哪些欄位看得到」，不印電話、asset、serial 或客戶內容。
+圖片先做黑白自動對比及銳化。訂單號、電話、serial、asset、HAWO/WO 及日期另有本機格式檢查；不合格式的輸出不會送進 Asana。serial 必須以 2 至 3 個英文字母開始、共 8 至 12 位並至少含 4 個數字；`15915F0726`、`S2N22F1275` 這類結果會觸發單格重讀，程式不會擅自補成 `US...` 或 `SZN...`。ACTION DATE 超出最近 93 日或未來超過 7 日亦不作配對證據。
+
+視覺模型只負責照字抄錄，提示詞明確禁止猜醫院、補全機身編號或沿用先前圖片；模型看不到 Asana 候選或醫院答案清單。Actions 日誌只記「哪些欄位看得到」及非敏感的呼叫次數、耗時、token 和 DeepSeek 費用上限，不印電話、asset、serial 或客戶內容。
 
 命名次序：
 
 1. Asana 名稱有 8 位訂單號：`SR#訂單號.pdf`。
-2. 找到 Asana 工作但沒有訂單號：使用完整 Asana 工作名稱。
+2. 找到 Asana 工作但沒有訂單號：使用完整 Asana 工作名稱；`/` 等 Windows/OneDrive 禁用字元統一轉成 ` - `。
 3. OneDrive 已有視覺相同內容：沿用既有檔，不重複上傳。
 4. 同一名稱但內容不同：保留第二版本，命名為 `_重掃_YYYYMMDD-HHMM`，不再用 `(1)`。
 5. 無法可靠配對：不碰 OneDrive，完整檔留在 `_PENDING`。
@@ -134,10 +137,10 @@ Asana 只找出一小批候選，最後核對在本機完成：
 6. 完成/未完成都可以是正確工作。`modified_at` 不代表服務日期；優先比較 ACTION DATE 與 Asana 描述、start/due 日期。
    兩輪都抄到相同服務日期時，即使模型漏填 `date_source`，亦視為 ACTION DATE；單輪讀數仍不會採用。
    手寫年份若明顯落在三個月範圍外（常見把 `6` 看成 `0/5`），只有在 Asana 候選日期屬最近三個月、月日相差不超過 14 天時才校正年份；最終仍須 serial 及其他證據，不能只靠日期命名。
-7. 未知短醫院碼（例如模型幻覺的 KWM、PYTV）不作搜尋或加分；詳細樓層則可比 Asana 標題更長。
+7. 只有已核對的短醫院碼才可搜尋或加分；`PYN` 與 `PYNEH` 視為同院，會用兩種短寫撈候選。未知短碼（例如模型幻覺的 PN、KWM、PYTV）會觸發醫院格重讀；詳細樓層只屬 Dept./Room，不會混入醫院名。
 8. 候選並列或證據不足，一律留在 `_PENDING`。
 
-已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/Elite`、`CX30/CX50`。
+已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/7+/Elite/CVx`、`CX30/CX50`。
 
 Asana `typeahead` 可跨 project，不再把每月 project 編號寫死。它不是完整清單，所以程式會用幾個可靠欄位分別搜尋後合併結果。
 
@@ -207,6 +210,9 @@ GitHub Secrets：
   DeepSeek-V4.1-Flash，支援圖片及 JSON；OCR 關閉 thinking，避免抄錄工作
   產生不必要的推理延遲。加入能力本身不會改正式流程，`OCR_PROVIDER` 未設定
   時仍使用 NVIDIA。
+- 2026-09-15 DeepSeek 測試輸入改為固定分格欄位卡，避免模型自行判斷相鄰
+  手寫值屬於哪一欄。正式切換條件是：私人實單 dry-run 全部名稱正確、錯誤
+  上傳為零；通過前 `OCR_PROVIDER` 仍保持 NVIDIA，通過後才改成 `deepseek`。
 - `DeepSeek V4.1 Vision Check` 只讀程式即時產生的假圖片，不接觸任何客戶
   工作單。`Jobsheet Safe Dry Run` 可逐次選 `deepseek` 或 `nvidia`，供同一份
   原始掃描比較；兩者都不移動 Drive 檔案及不寫 OneDrive。
@@ -250,6 +256,8 @@ python -m compileall -q src tests
 
 正式雲端前的安全測試：手動啟動 `Jobsheet Safe Dry Run`，輸入入口原始 PDF 的完整檔名並選擇 `deepseek` 或 `nvidia`。結果只顯示預計切頁、缺頁及預計名稱，不寫入 OneDrive。
 
+分格 OCR 回歸檢查使用本機 `tmp/` 保留的私人 PDF，不提交 GitHub。已核對的完整成品必須全部得到正確預計名稱，缺頁樣本必須停在不完整狀態，錯誤配對必須為零；達標後才把正式 `OCR_PROVIDER` 改為 `deepseek`。dry-run 報告同時列出每份工作單的圖片呼叫次數、耗時、token 及保守費用上限。
+
 只測 NVIDIA 模型能否看圖及回傳合格 JSON：在 GitHub Actions 手動執行 `NVIDIA Model Check`。它只讀一張程式即時產生的假資料圖片，不會讀 Google Drive、Asana 或 OneDrive。
 
 只測 DeepSeek V4.1 Flash 的付費 Key、圖片輸入及 JSON：手動執行 `DeepSeek V4.1 Vision Check`。這個檢查同樣只使用假圖片；成功後才以 `Jobsheet Safe Dry Run` 測一份真實掃描。
@@ -264,7 +272,7 @@ python -m compileall -q src tests
 | `src/batch_state.py` | `_REPORTS` 耐久批次狀態、重試次數及通知結果 |
 | `src/processor.py` | Stage B：辨認、Asana 配對、OneDrive 上傳 |
 | `src/dry_run.py` | 原始 PDF 全流程只讀預覽 |
-| `src/nvidia_client.py` | 圖片裁切及 NVIDIA 呼叫 |
+| `src/nvidia_client.py` | 固定欄位裁切及 NVIDIA/DeepSeek 圖片呼叫（檔名為歷史相容） |
 | `src/asana_client.py` | Asana 候選搜尋及 serial/日期/電話/asset 多欄核對 |
 | `src/rclone_helper.py` | 雲端列檔、下載、上傳、比較、刪除 |
 | `src/healthcheck.py` | 只讀列出各處理位置現況 |

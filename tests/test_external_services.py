@@ -1,5 +1,6 @@
 """外部服務故障不得被誤認成單據內容問題。"""
 import importlib.util
+import json
 import sys
 import unittest
 from datetime import date
@@ -55,10 +56,10 @@ class NvidiaResponseTests(unittest.TestCase):
     def _payload(**overrides):
         data = {
             "order_no": None,
-            "serial_candidates": ["US1234"],
+            "serial_candidates": ["US123F4567"],
             "product_raw": "CX50",
-            "customer_raw": "HKCH",
-            "location_raw": None,
+            "hospital_raw": "HKCH",
+            "department_room_raw": None,
             "phone_candidates": [],
             "asset_candidates": [],
             "work_order_candidates": [],
@@ -66,6 +67,10 @@ class NvidiaResponseTests(unittest.TestCase):
             "date_source": "ACTION_DATE",
             "unreadable_fields": [],
         }
+        if "customer_raw" in overrides:
+            overrides["hospital_raw"] = overrides.pop("customer_raw")
+        if "location_raw" in overrides:
+            overrides["department_room_raw"] = overrides.pop("location_raw")
         data.update(overrides)
         import json
         return json.dumps(data)
@@ -322,7 +327,7 @@ class NvidiaResponseTests(unittest.TestCase):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         self.assertIsNone(result["order_no"])
-        self.assertEqual(result["serial_no"], "US1234")
+        self.assertEqual(result["serial_no"], "US123F4567")
 
     def test_unrelated_json_before_ocr_json_is_skipped(self):
         wrapped = (
@@ -334,7 +339,7 @@ class NvidiaResponseTests(unittest.TestCase):
                 patch.object(nvidia_client, "_call_vision", return_value=wrapped):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
-        self.assertEqual(result["serial_no"], "US1234")
+        self.assertEqual(result["serial_no"], "US123F4567")
 
     def test_non_text_ocr_field_is_rejected(self):
         invalid = self._payload(order_no=12345678)
@@ -361,8 +366,9 @@ class NvidiaResponseTests(unittest.TestCase):
             result = nvidia_client.ocr_jobsheet_fields(MagicMock(), 0)
 
         self.assertEqual(set(result), {
-            "order_no", "serial_candidates", "product_raw", "customer_raw",
-            "location_raw", "phone_candidates", "asset_candidates",
+            "order_no", "serial_candidates", "product_raw", "hospital_raw",
+            "department_room_raw", "customer_raw", "location_raw",
+            "phone_candidates", "asset_candidates",
             "work_order_candidates", "service_date_raw", "date_source",
             "unreadable_fields",
             "serial_no", "product", "customer",
@@ -391,28 +397,98 @@ class NvidiaResponseTests(unittest.TestCase):
         self.assertEqual(["US123F4567"], result)
         self.assertTrue(call.call_args.kwargs["expects_json"])
 
+    def test_field_card_uses_fixed_panels_instead_of_half_page(self):
+        from PIL import Image
+        fields = ("order_no", "serial_candidates", "hospital_raw")
+        with patch.object(
+                nvidia_client, "_render_field_crop",
+                return_value=Image.new("RGB", (320, 90), "white"),
+        ) as render:
+            encoded = nvidia_client.crop_jobsheet_field_card(
+                MagicMock(), 0, fields, zoom=3.0
+            )
+
+        self.assertTrue(encoded)
+        self.assertEqual(
+            list(fields), [call.args[2] for call in render.call_args_list]
+        )
+
+    def test_business_gate_rejects_impossible_hospital_and_serials(self):
+        candidate = {
+            "order_no": None,
+            "serial_candidates": ["15915F0726", "S2N22F1275"],
+            "product_raw": "Affiniti 70",
+            "hospital_raw": "PN",
+            "department_room_raw": "Asset# 19130438",
+            "phone_candidates": [],
+            "asset_candidates": [],
+            "work_order_candidates": [],
+            "service_date_raw": None,
+            "date_source": None,
+            "unreadable_fields": [],
+        }
+
+        result = nvidia_client._normalize_ocr_data(candidate)
+
+        self.assertEqual([], result["serial_candidates"])
+        self.assertIsNone(result["hospital_raw"])
+        self.assertEqual(["19130438"], result["asset_candidates"])
+        self.assertIsNone(result["location_raw"])
+        self.assertIn("serial_candidates", result["unreadable_fields"])
+        self.assertIn("hospital_raw", result["unreadable_fields"])
+
+    def test_asset_parser_preserves_room_text_after_asset_number(self):
+        candidate = json.loads(self._payload(
+            department_room_raw="Asset# 19130438 6F",
+        ))
+
+        result = nvidia_client._normalize_ocr_data(candidate)
+
+        self.assertEqual(["19130438"], result["asset_candidates"])
+        self.assertEqual("6F", result["location_raw"])
+
+    def test_observed_serial_families_pass_without_autocorrection(self):
+        for value in (
+            "US915F0726", "USN16F0565", "SZN22F1275", "SG41700123",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(nvidia_client._valid_serial_token(value))
+
+    def test_old_action_date_is_removed_from_matching_evidence(self):
+        candidate = json.loads(self._payload(service_date_raw="01/01/2020"))
+        with patch.object(nvidia_client, "_today", return_value=date(2026, 9, 15)):
+            result = nvidia_client._normalize_ocr_data(candidate)
+
+        self.assertIsNone(result["service_date_raw"])
+        self.assertIsNone(result["date_source"])
+        self.assertIn("service_date_raw", result["unreadable_fields"])
+
 
 class ProcessorConsensusTests(unittest.TestCase):
     def setUp(self):
         self.ocr_a = {
             "order_no": None,
-            "serial_no": "SERIAL-A",
-            "product": "MODEL-A",
-            "customer": "CUSTOMER-A",
+            "serial_candidates": ["US123F4567"],
+            "serial_no": "US123F4567",
+            "product_raw": "CX50",
+            "product": "CX50",
+            "hospital_raw": "QMH",
+            "customer": "QMH",
+            "unreadable_fields": [],
         }
 
     def test_same_task_must_match_twice(self):
         task = {"gid": "task-1", "name": "Task 1"}
-        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
-                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
-                patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[self.ocr_a, self.ocr_a]) as ocr, \
+        with patch.object(nvidia_client, "ocr_jobsheet_fields",
+                          return_value=self.ocr_a) as ocr, \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=self.ocr_a), \
                 patch.object(asana_client, "find_task", return_value=(task, 2)):
             matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
 
         self.assertEqual(matched, task)
         self.assertEqual(tier, 2)
-        self.assertEqual(ocr.call_count, 2)
+        self.assertEqual(ocr.call_count, 1)
 
     def test_repeated_service_date_is_treated_as_action_date_when_source_is_omitted(self):
         readings = [
@@ -438,6 +514,18 @@ class ProcessorConsensusTests(unittest.TestCase):
             consensus["serial_candidates"],
         )
 
+    def test_majority_serial_stays_ambiguous_after_a_different_valid_read(self):
+        readings = [
+            {"serial_candidates": ["US915F0726"]},
+            {"serial_candidates": ["US915F072G"]},
+            {"serial_candidates": ["US915F0726"]},
+        ]
+
+        consensus = processor._consensus_ocr(readings)
+
+        self.assertEqual(["US915F0726"], consensus["serial_candidates"])
+        self.assertTrue(consensus["serial_ambiguous"])
+
     def test_non_device_words_do_not_gain_fuzzy_serial_consensus(self):
         readings = [
             {"serial_candidates": ["SERIAL-A"]},
@@ -449,26 +537,29 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual([], consensus["serial_candidates"])
 
     def test_disputed_serial_is_not_sent_to_asana_as_evidence(self):
-        other = dict(self.ocr_a, serial_no="SERIAL-B")
-        other["serial_candidates"] = ["SERIAL-B"]
-        first = dict(self.ocr_a, serial_candidates=["SERIAL-A"])
-        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
-                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
-                patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[first, other, other]), \
+        other = dict(self.ocr_a, serial_no="SG987F6543")
+        other["serial_candidates"] = ["SG987F6543"]
+        first = dict(self.ocr_a, serial_candidates=["US123F4567"])
+        with patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=first), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=other), \
+                patch.object(nvidia_client, "ocr_jobsheet_focused_field",
+                             side_effect=[other, other]), \
+                patch.object(nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value={}), \
                 patch.object(asana_client, "find_task", return_value=(None, 0)) as find:
             matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
 
         self.assertIsNone(matched)
         self.assertEqual(tier, 0)
-        self.assertNotIn("SERIAL-A", find.call_args.args[0].get("serial_candidates", []))
+        self.assertNotIn("US123F4567", find.call_args.args[0].get("serial_candidates", []))
 
     def test_asana_is_not_called_before_two_ocr_readings(self):
         task = {"gid": "task-1", "name": "Task 1"}
-        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
-                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
-                patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[self.ocr_a, self.ocr_a]), \
+        with patch.object(nvidia_client, "ocr_jobsheet_fields",
+                          return_value=self.ocr_a), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=self.ocr_a), \
                 patch.object(asana_client, "find_task", return_value=(task, 2)) as find:
             matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
 
@@ -478,19 +569,21 @@ class ProcessorConsensusTests(unittest.TestCase):
     def test_failed_full_crop_uses_focused_serial_consensus(self):
         general = {
             "serial_candidates": ["WRONG12345"],
+            "product_raw": "CX50",
+            "hospital_raw": "QMH",
             "phone_candidates": ["25956917"],
             "asset_candidates": ["19130438"],
             "service_date_raw": "18/8/2026",
             "date_source": "ACTION_DATE",
         }
         task = {"gid": "task-1", "name": "Task 1"}
-        with patch.object(config, "OCR_RETRY_ZOOMS", [2.0, 2.5, 3.0]), \
-                patch.object(config, "OCR_SERIAL_RETRY_ZOOMS", [4.0, 5.0, 6.0]), \
-                patch.object(config, "OCR_MATCH_CONFIRMATIONS", 2), \
-                patch.object(nvidia_client, "ocr_jobsheet_fields",
-                             side_effect=[general, general, general]), \
+        with patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=general), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=general), \
                 patch.object(nvidia_client, "ocr_jobsheet_serial_candidates",
                              side_effect=[["US123F4567"], ["US123F4567"]]) as focused, \
+                patch.object(nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=general), \
                 patch.object(asana_client, "find_task",
                              side_effect=[(None, 0), (None, 0), (task, 2)]) as find:
             matched, tier, consensus = processor._ocr_and_match(MagicMock(), "PM")
@@ -731,6 +824,41 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         self.assertIsNone(asana_client.hospital_core("KWM"))
         self.assertIsNone(asana_client.hospital_core("PYTV-6F"))
         self.assertEqual("QMH", asana_client.hospital_core("Queen Mary Hospital"))
+
+    def test_pyn_and_pyneh_are_the_same_hospital(self):
+        self.assertEqual("PYNEH", asana_client.hospital_core("PYN"))
+        self.assertEqual("PYNEH", asana_client.hospital_core("PYNEH"))
+
+    def test_pyneh_candidate_search_uses_both_confirmed_short_names(self):
+        self.assertEqual(
+            ["PYNEH", "PYN"],
+            asana_client.hospital_search_terms("PYNEH"),
+        )
+
+    def test_ambiguous_serial_needs_two_supporting_signals_even_if_one_is_exact(self):
+        ocr = {
+            "order_no": None,
+            "serial_candidates": ["SZN22B1280", "SZN22B128O"],
+            "serial_no": "SZN22B1280",
+            "serial_ambiguous": True,
+            "product": "EPIQ Elite",
+            "hospital_raw": "KWH",
+        }
+        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZN22B1280"}
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, _ = asana_client.find_task(ocr, job_type="PM")
+        self.assertIsNone(task)
+
+        supported = dict(
+            ocr,
+            service_date_raw="10/09/2026",
+            date_source="ACTION_DATE",
+        )
+        task_row["due_on"] = "2026-09-10"
+        with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
+            task, tier = asana_client.find_task(supported, job_type="PM")
+        self.assertEqual("task", task["gid"])
+        self.assertEqual(2, tier)
 
     def test_safe_title_removes_trailing_separators(self):
         title = asana_client.get_safe_title({
