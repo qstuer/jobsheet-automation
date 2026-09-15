@@ -24,7 +24,7 @@ from . import asana_client, config
 
 log = logging.getLogger(__name__)
 
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 DEFAULT_WINDOW_DAYS = 365 * 2
 TASK_PAGE_SIZE = 100
 PROJECT_PAGE_SIZE = 100
@@ -189,29 +189,36 @@ def _task_job_type(task: dict, project_type: Optional[str]) -> Optional[str]:
 def _name_parts(name: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
     parts = [part.strip() for part in re.split(r"\s*/\s*|\s+\|\s+", name or "")]
     location = parts[0] if parts else ""
-    product = None
-    product_variant = None
-    for part in parts[1:]:
-        family = asana_client.product_family(part)
-        if family in asana_client.KNOWN_PRODUCTS:
-            product = family
-            product_variant = part
-            break
-    if product is None:
-        for known in asana_client.KNOWN_PRODUCTS:
-            if _norm(known) in _norm(name):
-                product = asana_client.product_family(known)
-                product_variant = known
-                break
     serial = None
+    serial_part_index = None
     # Asana titles occasionally contain ordinary words that satisfy the old
     # broad ``extract_serial`` regex.  The index applies the same business
     # gate as OCR: 2–3 leading letters, 8–12 total characters, and digits.
-    for candidate in re.findall(r"\b[A-Z]{2,3}[A-Z0-9]{5,9}\b", name.upper()):
-        if 8 <= len(candidate) <= 12 and any(ch.isdigit() for ch in candidate) \
-                and sum(ch.isdigit() for ch in candidate) >= 4:
-            serial = candidate
+    for index, part in enumerate(parts):
+        for candidate in re.findall(r"\b[A-Z]{2,3}[A-Z0-9]{5,9}\b", part.upper()):
+            if 8 <= len(candidate) <= 12 and sum(ch.isdigit() for ch in candidate) >= 4:
+                serial, serial_part_index = candidate, index
+                break
+        if serial:
             break
+    product_variant = None
+    product_part_index = None
+    # Current Asana titles normally place Product immediately before Serial.
+    # This also learns products not present in KNOWN_PRODUCTS.
+    if serial_part_index is not None and serial_part_index >= 2:
+        candidate = parts[serial_part_index - 1]
+        if re.search(r"[A-Za-z]{2}", candidate) and not re.fullmatch(r"[56]\d{7}", candidate):
+            product_variant = candidate
+            product_part_index = serial_part_index - 1
+    if not product_variant:
+        for index, part in enumerate(parts[1:], 1):
+            if asana_client.product_group(part):
+                product_variant = part
+                product_part_index = index
+                break
+    if product_part_index and product_part_index > 1:
+        location = " / ".join(parts[:product_part_index])
+    product = asana_client.product_group(product_variant)
     return location, product, product_variant, serial
 
 
@@ -301,12 +308,11 @@ def _within_window(task: dict, start: date, end: date) -> bool:
 
 
 def _device_key(location: str, product: Optional[str], serial: Optional[str]) -> tuple[str, bool]:
-    product_key = _norm(asana_client.product_family(product))
     serial_key = _norm(serial)
-    if serial_key and product_key:
-        return f"{serial_key}|{product_key}", False
+    if serial_key:
+        return serial_key, False
     # 沒有 serial 只能建立弱索引；processor 絕不只靠這列自動命名。
-    fallback = f"{_norm(location)}|{product_key}"
+    fallback = f"{_norm(location)}|{_norm(asana_client.product_group(product))}"
     return f"WEAK|{fallback}", True
 
 
@@ -318,7 +324,9 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
         return None
     job_type = _task_job_type(task, project_type)
     key, weak = _device_key(location, product, serial)
-    hospital = asana_client.hospital_core(location) or location or None
+    hospital_name, location_detail = asana_client.split_hospital_location(location)
+    hospital = asana_client.hospital_core(hospital_name) or hospital_name or None
+    hospital_aliases = asana_client.hospital_aliases(hospital_name)
     # Order Numbers deliberately never enter the index.  They are only used to
     # remove title numbers from the generic-phone fallback; labelled phones such
     # as ``Phone: 61234567`` remain valid evidence.
@@ -338,7 +346,9 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
         excluded_numbers=[*indexed_order_numbers, *assets],
     )
     contacts = _contacts(f"{name}\n{notes}")
-    department_rooms = _department_rooms(f"{name}\n{notes}")
+    department_rooms = _unique([
+        location_detail, *_department_rooms(f"{name}\n{notes}")
+    ])
     work_dates = _task_dates(task)
     task_ref = {
         "gid": str(task.get("gid") or ""),
@@ -353,8 +363,10 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
         "completed": bool(task.get("completed")),
         "location": location,
         "hospital": hospital or "",
+        "hospital_aliases": hospital_aliases,
         "department_rooms": department_rooms,
         "product": product or "",
+        "product_family": product or "",
         "product_variant": product_variant or "",
         "serial": serial or "",
         "phones": phones,
@@ -366,9 +378,11 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
         "weak_identity": weak,
         "serial": serial or "",
         "product": product or "",
+        "product_families": _unique([product] if product else []),
         "product_variants": _unique([product_variant] if product_variant else []),
         "locations": _unique([location]),
         "hospitals": _unique([hospital] if hospital else []),
+        "hospital_aliases": hospital_aliases,
         "department_rooms": department_rooms,
         "phones": phones,
         "contacts": contacts,
@@ -381,7 +395,8 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
 
 def _merge_record(target: dict, incoming: dict) -> None:
     for key in (
-        "product_variants", "locations", "hospitals", "department_rooms",
+        "product_families", "product_variants", "locations", "hospitals",
+        "hospital_aliases", "department_rooms",
         "phones", "contacts", "assets", "work_dates", "job_types",
     ):
         target[key] = _unique([*(target.get(key) or []), *(incoming.get(key) or [])])
@@ -393,6 +408,157 @@ def _merge_record(target: dict, incoming: dict) -> None:
         ref.get("due_on") or ref.get("start_on") or ref.get("modified_at") or "",
         ref.get("gid") or "",
     ), reverse=True)
+
+
+def _learn_hospital_alias_groups(rows: list[dict]) -> list[dict]:
+    """Learn only aliases repeated on at least two different serial rows.
+
+    A machine can move hospital, so two names seen on one serial are never
+    enough to teach an alias.  Full names are also never merged with a different
+    full name here: learning is limited to a short code paired with one full
+    hospital name.
+    """
+    pair_serials: dict[tuple[str, str], set[str]] = {}
+    display: dict[str, str] = {}
+    for row in rows:
+        if row.get("weak_identity") or not row.get("serial"):
+            continue
+        cores = _unique(
+            asana_client.split_hospital_location(value)[0]
+            for value in row.get("locations") or []
+        )
+        shorts = [
+            value for value in cores
+            if re.fullmatch(r"[A-Za-z]{2,8}", value)
+            and not asana_client.hospital_core(value)
+        ]
+        fulls = [value for value in cores if len(re.findall(r"[A-Za-z]+", value)) >= 2]
+        for short in shorts:
+            for full in fulls:
+                short_key, full_key = _norm(short), _norm(full)
+                display.setdefault(short_key, short)
+                display.setdefault(full_key, full)
+                pair_serials.setdefault((short_key, full_key), set()).add(row["serial"])
+
+    by_short: dict[str, list[tuple[str, int]]] = {}
+    for (short, full), serials in pair_serials.items():
+        if len(serials) >= 2:
+            by_short.setdefault(short, []).append((full, len(serials)))
+    learned = {
+        short: candidates[0][0]
+        for short, candidates in by_short.items()
+        if len({full for full, _ in candidates}) == 1
+    }
+    groups = []
+    for short, full in sorted(learned.items()):
+        aliases = [display[short], display[full]]
+        groups.append({
+            "canonical": display[full], "aliases": aliases, "source": "learned",
+            "device_count": len(pair_serials[(short, full)]),
+        })
+        for row in rows:
+            keys = {
+                _norm(asana_client.split_hospital_location(value)[0])
+                for value in row.get("locations") or []
+            }
+            if short in keys or full in keys:
+                row["hospital_aliases"] = _unique([*(row.get("hospital_aliases") or []), *aliases])
+                for ref in row.get("task_refs") or []:
+                    ref_keys = {
+                        _norm(asana_client.split_hospital_location(ref.get("location"))[0]),
+                        *(_norm(value) for value in ref.get("hospital_aliases") or []),
+                    }
+                    if short in ref_keys or full in ref_keys:
+                        ref["hospital_aliases"] = _unique([
+                            *(ref.get("hospital_aliases") or []), *aliases
+                        ])
+    return groups
+
+
+def _build_location_directory(rows: list[dict], learned_groups: list[dict]) -> list[dict]:
+    """Build a human-readable hospital table without mixing task-specific rooms."""
+    learned_by_alias = {
+        _norm(alias): group
+        for group in learned_groups
+        for alias in group.get("aliases") or []
+    }
+    groups: OrderedDict[str, dict] = OrderedDict()
+
+    def ensure(core: str) -> dict:
+        normalized = _norm(core)
+        known = asana_client.hospital_core(core)
+        learned = learned_by_alias.get(normalized)
+        if known:
+            key = _norm(known)
+            official = (
+                asana_client.HOSPITAL_OFFICIAL_NAMES.get(key)
+                or asana_client.HOSPITAL_OFFICIAL_NAMES.get(str(known).upper())
+                or str(known)
+            )
+            confirmed = [
+                alias for alias, canonical in config.HOSPITAL_SHORT_ALIASES.items()
+                if _norm(canonical) == key
+            ]
+            confirmed = _unique([official, str(known), *confirmed, core])
+            learned_aliases, unconfirmed, enabled = [], [], True
+        elif learned:
+            official = learned["canonical"]
+            key = _norm(official)
+            confirmed = [official]
+            learned_aliases = list(learned.get("aliases") or [])
+            unconfirmed, enabled = [], True
+        elif len(re.findall(r"[A-Za-z]+", core)) >= 2:
+            key, official = normalized, core
+            confirmed, learned_aliases, unconfirmed, enabled = [core], [], [], True
+        else:
+            key, official = f"UNCONFIRMED|{normalized}", ""
+            confirmed, learned_aliases, unconfirmed, enabled = [], [], [core], False
+        row = groups.setdefault(key, {
+            "canonical_hospital": official,
+            "confirmed_aliases": [], "learned_aliases": [], "unconfirmed_aliases": [],
+            "historical_locations": [], "department_rooms": [],
+            "device_count": 0, "match_enabled": enabled, "alias_sources": [],
+            "_devices": set(),
+        })
+        row["confirmed_aliases"] = _unique([*row["confirmed_aliases"], *confirmed])
+        row["learned_aliases"] = _unique([*row["learned_aliases"], *learned_aliases])
+        row["unconfirmed_aliases"] = _unique([*row["unconfirmed_aliases"], *unconfirmed])
+        sources = []
+        if confirmed:
+            sources.append("confirmed")
+        if learned_aliases:
+            sources.append("learned")
+        if unconfirmed:
+            sources.append("unconfirmed")
+        row["alias_sources"] = _unique([*row["alias_sources"], *sources])
+        return row
+
+    for device in rows:
+        device_id = device.get("serial") or device.get("device_key")
+        for ref in device.get("task_refs") or []:
+            raw_location = str(ref.get("location") or ref.get("hospital") or "").strip()
+            core, derived_detail = asana_client.split_hospital_location(raw_location)
+            if not core:
+                continue
+            group = ensure(core)
+            group["historical_locations"] = _unique([
+                *group["historical_locations"], raw_location
+            ])
+            group["department_rooms"] = _unique([
+                *group["department_rooms"], derived_detail,
+                *(ref.get("department_rooms") or []),
+            ])
+            if device_id:
+                group["_devices"].add(device_id)
+
+    result = []
+    for group in groups.values():
+        group["device_count"] = len(group.pop("_devices"))
+        result.append(group)
+    return sorted(result, key=lambda item: (
+        not item["match_enabled"], _norm(item["canonical_hospital"]),
+        _norm(" ".join(item["unconfirmed_aliases"])),
+    ))
 
 
 def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
@@ -463,6 +629,8 @@ def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
             _merge_record(devices[record["device_key"]], record)
     stamp = generated_at or _iso(_now())
     rows = list(devices.values())
+    hospital_alias_groups = _learn_hospital_alias_groups(rows)
+    location_directory = _build_location_directory(rows, hospital_alias_groups)
     if existing_index:
         # Keep the old high-water mark when this scan found no newer task.
         max_modified = max(max_modified, existing_max)
@@ -488,6 +656,9 @@ def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
         "unparsed_task_count": unparsed,
         "device_count": len(rows),
         "merged_task_count": merged_count,
+        "hospital_alias_groups": hospital_alias_groups,
+        "location_count": len(location_directory),
+        "location_directory": location_directory,
         "devices": rows,
     }
 
@@ -519,13 +690,25 @@ def validate_index(index: dict) -> dict:
         raise AsanaIndexError("Asana 索引版本不相容")
     if not isinstance(index.get("devices"), list):
         raise AsanaIndexError("Asana 索引沒有 devices 清單")
+    if not isinstance(index.get("location_directory"), list):
+        raise AsanaIndexError("Asana 索引沒有統一地點表")
+    for group in index["location_directory"]:
+        if not isinstance(group, dict) or not isinstance(group.get("match_enabled"), bool):
+            raise AsanaIndexError("Asana 統一地點表包含無效醫院列")
+        for field in (
+            "confirmed_aliases", "learned_aliases", "unconfirmed_aliases",
+            "historical_locations", "department_rooms", "alias_sources",
+        ):
+            if not isinstance(group.get(field), list):
+                raise AsanaIndexError(f"Asana 統一地點欄位格式不正確：{field}")
     for row in index["devices"]:
         if not isinstance(row, dict) or not row.get("device_key"):
             raise AsanaIndexError("Asana 索引包含無效設備列")
         if not isinstance(row.get("task_refs"), list):
             raise AsanaIndexError("Asana 索引 task_refs 格式不正確")
         for field in (
-            "product_variants", "locations", "hospitals", "department_rooms",
+            "product_families", "product_variants", "locations", "hospitals",
+            "hospital_aliases", "department_rooms",
             "phones", "contacts", "assets", "work_dates", "job_types",
         ):
             if not isinstance(row.get(field), list):
@@ -533,7 +716,10 @@ def validate_index(index: dict) -> dict:
         for ref in row["task_refs"]:
             if not isinstance(ref, dict) or not ref.get("gid"):
                 raise AsanaIndexError("Asana 索引包含無效 task GID")
-            for field in ("department_rooms", "phones", "contacts", "assets", "work_dates"):
+            for field in (
+                "hospital_aliases", "department_rooms", "phones", "contacts",
+                "assets", "work_dates",
+            ):
                 if not isinstance(ref.get(field), list):
                     raise AsanaIndexError(f"Asana 索引 task 欄位格式不正確：{field}")
     return index
@@ -544,11 +730,13 @@ def write_outputs(index: dict, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "asana-device-index.json"
     csv_path = output_dir / "asana-device-index.csv"
+    location_csv_path = output_dir / "asana-location-index.csv"
     manifest_path = output_dir / "asana-device-index-manifest.json"
     json_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
     fields = [
-        "device_key", "weak_identity", "serial", "product", "product_variants",
-        "locations", "hospitals", "department_rooms", "phones", "contacts",
+        "device_key", "weak_identity", "serial", "product", "product_families",
+        "product_variants", "locations", "hospitals", "hospital_aliases",
+        "department_rooms", "phones", "contacts",
         "assets", "work_dates", "job_types",
         "task_count", "task_gids", "task_links",
     ]
@@ -562,9 +750,11 @@ def write_outputs(index: dict, output_dir: Path) -> None:
                 "weak_identity": str(bool(row.get("weak_identity"))).lower(),
                 "serial": row.get("serial") or "",
                 "product": row.get("product") or "",
+                "product_families": " ; ".join(row.get("product_families") or []),
                 "product_variants": " ; ".join(row.get("product_variants") or []),
                 "locations": " ; ".join(row.get("locations") or []),
                 "hospitals": " ; ".join(row.get("hospitals") or []),
+                "hospital_aliases": " ; ".join(row.get("hospital_aliases") or []),
                 "department_rooms": " ; ".join(row.get("department_rooms") or []),
                 "phones": " ; ".join(row.get("phones") or []),
                 "contacts": " ; ".join(row.get("contacts") or []),
@@ -575,15 +765,36 @@ def write_outputs(index: dict, output_dir: Path) -> None:
                 "task_gids": " ; ".join(ref["gid"] for ref in refs),
                 "task_links": " ; ".join(ref.get("permalink_url") or "" for ref in refs),
             })
+    location_fields = [
+        "canonical_hospital", "confirmed_aliases", "learned_aliases",
+        "unconfirmed_aliases", "historical_locations", "department_rooms",
+        "device_count", "match_enabled", "alias_sources",
+    ]
+    with location_csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=location_fields)
+        writer.writeheader()
+        for row in index["location_directory"]:
+            writer.writerow({
+                "canonical_hospital": row.get("canonical_hospital") or "",
+                "confirmed_aliases": " ; ".join(row.get("confirmed_aliases") or []),
+                "learned_aliases": " ; ".join(row.get("learned_aliases") or []),
+                "unconfirmed_aliases": " ; ".join(row.get("unconfirmed_aliases") or []),
+                "historical_locations": " ; ".join(row.get("historical_locations") or []),
+                "department_rooms": " ; ".join(row.get("department_rooms") or []),
+                "device_count": row.get("device_count") or 0,
+                "match_enabled": str(bool(row.get("match_enabled"))).lower(),
+                "alias_sources": " ; ".join(row.get("alias_sources") or []),
+            })
     manifest = {key: index.get(key) for key in (
         "schema_version", "generated_at", "window_start", "window_end",
         "max_task_modified_at", "project_count", "task_count",
         "task_count_in_window", "unparsed_task_count", "device_count",
-        "merged_task_count",
+        "merged_task_count", "location_count",
     )}
     manifest.update({
         "json_file": json_path.name,
         "csv_file": csv_path.name,
+        "location_csv_file": location_csv_path.name,
         "manifest_file": manifest_path.name,
     })
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -602,7 +813,7 @@ def load_index(path: Path, manifest_path: Optional[Path] = None) -> dict:
             raise AsanaIndexError(f"無法讀取 Asana 索引 manifest：{manifest_path}") from exc
         if not isinstance(manifest, dict):
             raise AsanaIndexError("Asana 索引 manifest 格式不正確")
-        for key in ("schema_version", "generated_at", "device_count"):
+        for key in ("schema_version", "generated_at", "device_count", "location_count"):
             if str(manifest.get(key, "")) != str(index.get(key, "")):
                 raise AsanaIndexError(f"Asana 索引與 manifest 不一致：{key}")
     return index
@@ -629,7 +840,7 @@ def main() -> int:
     print(json.dumps({key: index.get(key) for key in (
         "generated_at", "window_start", "window_end", "project_count",
         "task_count_in_window", "device_count", "unparsed_task_count",
-        "merged_task_count",
+        "merged_task_count", "location_count",
     )}, ensure_ascii=False))
     return 0
 

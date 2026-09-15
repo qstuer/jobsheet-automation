@@ -508,6 +508,36 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual(tier, 2)
         self.assertEqual(ocr.call_count, 1)
 
+    def test_close_index_tie_gets_one_constrained_candidate_pass(self):
+        reading = dict(
+            self.ocr_a,
+            contact_person_raw="Alice", department_room_raw="3F",
+            phone_candidates=["61234567"], asset_candidates=["19130438"],
+            service_date_raw="08/09/2026", date_source="ACTION_DATE",
+        )
+        candidates = [
+            {"candidate_id": "C1", "device_key": "SERIAL-1"},
+            {"candidate_id": "C2", "device_key": "SERIAL-2"},
+        ]
+        task = {"gid": "task-2", "name": "Task 2"}
+        with patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=reading), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=reading), \
+                patch.object(nvidia_client, "ocr_jobsheet_serial_candidates",
+                             return_value=["US123F4567"]), \
+                patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=reading), \
+                patch.object(asana_client, "get_close_index_candidates",
+                             return_value=candidates), \
+                patch.object(nvidia_client, "choose_device_candidate", return_value="C2") as choose, \
+                patch.object(asana_client, "find_task",
+                             side_effect=[(None, 0), (None, 0), (None, 0),
+                                          (None, 0), (task, 2)]) as find:
+            matched, tier, _ = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertEqual("task-2", matched["gid"])
+        self.assertEqual(2, tier)
+        choose.assert_called_once()
+        self.assertEqual("SERIAL-2", find.call_args.kwargs["selected_device_key"])
+
     def test_repeated_service_date_is_treated_as_action_date_when_source_is_omitted(self):
         readings = [
             {"service_date_raw": "18/8/2026", "date_source": None},

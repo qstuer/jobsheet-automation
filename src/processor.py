@@ -416,6 +416,38 @@ def _ocr_and_match(doc, job_type):
                     break
         task, tier = asana_client.find_task(consensus, job_type=job_type)
 
+    if task is None:
+        # The fixed program has already applied product, hospital and serial
+        # gates.  Only a close top-two tie reaches the vision model, with at
+        # most ten rows and no freedom to invent a table-external answer.
+        close_candidates = asana_client.get_close_index_candidates(
+            consensus, job_type=job_type
+        )
+        if close_candidates:
+            log.info(
+                "  固定搜尋剩下 %s 個接近設備，進行一次受限候選複核",
+                len(close_candidates),
+            )
+            try:
+                candidate_id = nvidia_client.choose_device_candidate(
+                    doc, 0, close_candidates
+                )
+            except nvidia_client.NvidiaResponseError:
+                candidate_id = None
+                log.warning("  候選複核暫時無法完成；不猜答案")
+            chosen = next(
+                (item for item in close_candidates
+                 if item.get("candidate_id") == candidate_id),
+                None,
+            )
+            if chosen:
+                task, tier = asana_client.find_task(
+                    consensus, job_type=job_type,
+                    selected_device_key=chosen.get("device_key"),
+                )
+            else:
+                log.info("  候選複核未能明確選擇設備，保留待核對")
+
     metrics = nvidia_client.get_ocr_metrics()
     consensus["ocr_metrics"] = metrics
     cost = metrics.get("estimated_cost_cny_upper")

@@ -81,12 +81,14 @@ jobs:
         run: python -m src.asana_index | tee /tmp/asana-index-summary.json
       - name: Replace private index files in Google Drive
         run: |
-          # JSON/CSV 先寫，manifest 最後寫；Stage B 會比對兩者版本，
+          # 設備 JSON、設備 CSV、地點 CSV 先寫，manifest 最後寫；Stage B 會比對版本，
           # 因此中途失敗不會讀到半份索引。
           rclone copyto /tmp/asana-index/asana-device-index.json \
             "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json"
           rclone copyto /tmp/asana-index/asana-device-index.csv \
             "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.csv"
+          rclone copyto /tmp/asana-index/asana-location-index.csv \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-location-index.csv"
           rclone copyto /tmp/asana-index/asana-device-index-manifest.json \
             "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json"
       - name: Write non-sensitive summary

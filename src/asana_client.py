@@ -30,11 +30,8 @@ KNOWN_PRODUCTS = [
     "CX30", "CX50",
 ]
 
-MAX_SERIAL_DIST = 3   # 設備索引容許 1–3 字 OCR 誤差；越遠要求越多其他證據
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
-INDEX_DEVICE_MIN_SCORE = 60
-INDEX_DEVICE_MIN_GAP = 15
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -60,6 +57,22 @@ HOSPITAL_ALIASES = {
     "NORTHDISTRICTHOSPITAL": "NDH",
     "GRANTHAMHOSPITAL": "GH",
     # 保留空格供 Asana typeahead 作真正的子字串搜尋；比較時仍會經 _norm。
+    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
+}
+
+HOSPITAL_OFFICIAL_NAMES = {
+    "QMH": "Queen Mary Hospital",
+    "QEH": "Queen Elizabeth Hospital",
+    "KWH": "Kwong Wah Hospital",
+    "KH": "Kowloon Hospital",
+    "PYNEH": "Pamela Youde Nethersole Eastern Hospital",
+    "PMH": "Princess Margaret Hospital",
+    "HKCH": "Hong Kong Children's Hospital",
+    "PWH": "Prince of Wales Hospital",
+    "UCH": "United Christian Hospital",
+    "TMH": "Tuen Mun Hospital",
+    "NDH": "North District Hospital",
+    "GH": "Grantham Hospital",
     "TUNGWAHHOSPITAL": "Tung Wah Hospital",
 }
 
@@ -148,6 +161,100 @@ def product_family(value: Optional[str]) -> Optional[str]:
         if distance < best_distance:
             best, best_distance = known, distance
     return best if best_distance <= MAX_PRODUCT_DIST else normalize_product(value)
+
+
+def product_group(value: Optional[str]) -> Optional[str]:
+    """Return the coarse model-independent product group used by the index.
+
+    The raw spelling is still retained separately.  Digits and suffixes are
+    deliberately ignored, so Affiniti 50/70/70G and EPIQ 7G/CVx/Elite form
+    their respective broad families.  Unknown Asana products use their first
+    meaningful alphabetic token, allowing the private table to learn products
+    without a new code release.
+    """
+    if not value:
+        return None
+    words = re.findall(r"[A-Z]+", str(value).upper())
+    words = [word for word in words if word not in {"PHILIPS", "SYSTEM", "ULTRASOUND"}]
+    if not words:
+        return None
+    joined = "".join(words)
+    for known in ("AFFINITI", "EPIQ"):
+        if joined.startswith(known):
+            return known
+    if joined.startswith("CX"):
+        return "CX"
+    return words[0] if len(words[0]) >= 2 else None
+
+
+def hospital_acronym(value: Optional[str]) -> Optional[str]:
+    """Build a conservative acronym from a full hospital name."""
+    if not value:
+        return None
+    words = re.findall(r"[A-Za-z]+", str(value))
+    if len(words) < 2:
+        return None
+    ignored = {"THE", "OF", "AND"}
+    acronym = "".join(word[0].upper() for word in words if word.upper() not in ignored)
+    return acronym if 2 <= len(acronym) <= 8 else None
+
+
+def hospital_aliases(value: Optional[str]) -> List[str]:
+    """Return safe comparison forms without turning room detail into a hospital."""
+    if not value:
+        return []
+    raw = str(value).strip()
+    # Slash/comma conventionally starts department/detail.  A hyphen is treated
+    # as detail only for a leading hospital code (e.g. GH-3F), not in a full name.
+    core = re.split(r"[,/]", raw, 1)[0].strip()
+    if re.match(r"^[A-Za-z]{2,8}\s*-", core):
+        core = core.split("-", 1)[0].strip()
+    canonical = hospital_core(core)
+    # Unknown short codes are the most common OCR hallucination (PN/KWM/PYTV).
+    # They must not pass the 33% fuzzy hospital gate.
+    if re.fullmatch(r"[A-Za-z]{2,6}", core) and not canonical:
+        return []
+    result = [core]
+    if canonical:
+        result.append(canonical)
+    acronym = hospital_acronym(core)
+    if acronym:
+        result.append(acronym)
+    return list(dict.fromkeys(item for item in result if item))
+
+
+def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
+    """Separate hospital identity from a short-code floor/room suffix."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+    core = re.split(r"[,/]", raw, 1)[0].strip()
+    detail = raw[len(core):].lstrip(" ,/").strip()
+    match = re.match(r"^(?P<hospital>[A-Za-z]{2,8})\s*-\s*(?P<detail>.+)$", core)
+    if match:
+        detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
+        core = match.group("hospital").strip()
+    return core, detail
+
+
+def _index_hospital_aliases(value: Optional[str]) -> List[str]:
+    """Expand an observed name through the embedded private location directory."""
+    aliases = hospital_aliases(value)
+    core, _ = split_hospital_location(value)
+    observed = _norm(core)
+    if not observed or _device_index is None:
+        return aliases
+    for group in _device_index.get("location_directory") or []:
+        if not group.get("match_enabled"):
+            continue
+        known = [
+            group.get("canonical_hospital") or "",
+            *(group.get("confirmed_aliases") or []),
+            *(group.get("learned_aliases") or []),
+        ]
+        if observed in {_norm(item) for item in known if item}:
+            return list(dict.fromkeys([*aliases, *known]))
+    return aliases
 
 
 def hospital_core(customer: Optional[str]) -> Optional[str]:
@@ -403,140 +510,108 @@ def _digit_distance(left: str, right: str) -> int:
     return _lev(re.sub(r"\D", "", left), re.sub(r"\D", "", right))
 
 
+def _key_similarity(left: Optional[str], right: Optional[str]) -> float:
+    left_key, right_key = _norm(left), _norm(right)
+    if not left_key or not right_key:
+        return 0.0
+    return max(0.0, 1.0 - _lev(left_key, right_key) / max(len(left_key), len(right_key)))
+
+
+def _family_similarity(left: Optional[str], right: Optional[str]) -> float:
+    """Short families are exact-only; longer names use edit similarity."""
+    left_key, right_key = _norm(left), _norm(right)
+    if not left_key or not right_key:
+        return 0.0
+    if min(len(left_key), len(right_key)) < 4:
+        return 1.0 if left_key == right_key else 0.0
+    return _key_similarity(left_key, right_key)
+
+
 def _score_index_device(row: dict, ocr_data: dict,
-                        job_type: Optional[str]) -> dict:
-    """Score one equipment row without revealing indexed values in logs."""
-    score = 0
-    support = set()
-    reasons = []
+                        job_type: Optional[str] = None) -> dict:
+    """Apply product→hospital→serial gates; ACTION DATE is deliberately absent."""
     serials = _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
     serials += [value for value in _clean_candidates(
         ocr_data.get("serial_visual_candidates")
     ) if value not in serials]
-    row_serial = _norm(row.get("serial"))
-    serial_dist = 99
-    if row_serial and serials:
-        serial_dist = min(_lev(_norm(value), row_serial) for value in serials)
-        serial_points = {0: 50, 1: 42, 2: 32, 3: 22}.get(serial_dist, 0)
-        score += serial_points
-        if serial_points:
-            support.add("serial_exact" if serial_dist == 0 else "serial_fuzzy")
-            reasons.append(f"serial distance {serial_dist}")
-
-    wanted_product = product_family(
-        ocr_data.get("product") or ocr_data.get("product_raw")
+    wanted_product = product_group(ocr_data.get("product") or ocr_data.get("product_raw"))
+    row_products = row.get("product_families") or [
+        product_group(value) for value in row.get("product_variants") or []
+    ]
+    product_similarity = max(
+        (_family_similarity(wanted_product, value) for value in row_products if value),
+        default=0.0,
     )
-    if wanted_product and _norm(wanted_product) == _norm(product_family(row.get("product"))):
-        score += 20
-        support.add("product")
-        reasons.append("product family")
-
-    wanted_hospital = hospital_core(
+    wanted_hospitals = _index_hospital_aliases(
         ocr_data.get("hospital_raw") or ocr_data.get("customer")
         or ocr_data.get("customer_raw")
     )
-    hospital_keys = {
-        _norm(hospital_core(value) or value)
-        for value in [*(row.get("hospitals") or []), *(row.get("locations") or [])]
-        if value
-    }
-    if wanted_hospital and _norm(wanted_hospital) in hospital_keys:
-        score += 20
-        support.add("hospital")
-        reasons.append("hospital")
-
-    wanted_room = ocr_data.get("department_room_raw") or ocr_data.get("location_raw")
-    room_similarity = max(
-        (_similarity(wanted_room, value) for value in row.get("department_rooms") or []),
+    row_hospitals = row.get("hospital_aliases") or [
+        alias for value in [*(row.get("hospitals") or []), *(row.get("locations") or [])]
+        for alias in hospital_aliases(value)
+    ]
+    hospital_similarity = max(
+        (_key_similarity(left, right) for left in wanted_hospitals for right in row_hospitals),
         default=0.0,
     )
-    if room_similarity >= 0.90:
-        score += 10
-        support.add("room")
-        reasons.append("room exact")
-    elif room_similarity >= 0.75:
-        score += 6
-        support.add("room")
-        reasons.append("room similar")
+    row_serial = _norm(row.get("serial"))
+    serial_similarity = max(
+        (_key_similarity(value, row_serial) for value in serials), default=0.0
+    )
+    serial_dist = min(
+        (_lev(_norm(value), row_serial) for value in serials if row_serial), default=99
+    )
 
     wanted_phones = [re.sub(r"\D", "", value) for value in ocr_data.get("phone_candidates") or []]
     row_phones = [re.sub(r"\D", "", value) for value in row.get("phones") or []]
     phone_dist = min(
         (_digit_distance(left, right) for left in wanted_phones for right in row_phones
-         if left and right and 7 <= len(left) <= 9 and 7 <= len(right) <= 9),
-        default=99,
+         if 7 <= len(left) <= 9 and 7 <= len(right) <= 9), default=99,
     )
-    if phone_dist == 0:
-        score += 20
-        support.add("phone_exact")
-        reasons.append("phone exact")
-    elif phone_dist == 1:
-        score += 10
-        support.add("phone_fuzzy")
-        reasons.append("phone differs by 1")
-
     wanted_assets = [re.sub(r"\D", "", value) for value in ocr_data.get("asset_candidates") or []]
     row_assets = [re.sub(r"\D", "", value) for value in row.get("assets") or []]
     asset_dist = min(
         (_digit_distance(left, right) for left in wanted_assets for right in row_assets
          if len(left) >= 4 and len(right) >= 4), default=99,
     )
-    if asset_dist == 0:
-        score += 18
-        support.add("asset_exact")
-        reasons.append("asset exact")
-    elif asset_dist == 1:
-        score += 8
-        support.add("asset_fuzzy")
-        reasons.append("asset differs by 1")
-
-    contact = ocr_data.get("contact_person_raw")
     contact_similarity = max(
-        (_similarity(contact, value) for value in row.get("contacts") or []),
-        default=0.0,
+        (_similarity(ocr_data.get("contact_person_raw"), value)
+         for value in row.get("contacts") or []), default=0.0,
     )
-    if contact_similarity >= 0.90:
-        score += 8
+    support = set()
+    if product_similarity >= config.INDEX_PRODUCT_MIN_SIMILARITY:
+        support.add("product")
+    if hospital_similarity >= config.INDEX_HOSPITAL_MIN_SIMILARITY:
+        support.add("hospital")
+    if serials and serial_similarity >= config.INDEX_SERIAL_MIN_SIMILARITY:
+        support.add("serial")
+    if phone_dist == 0:
+        support.add("phone_exact")
+    elif phone_dist == 1:
+        support.add("phone_fuzzy")
+    if asset_dist == 0:
+        support.add("asset_exact")
+    elif asset_dist == 1:
+        support.add("asset_fuzzy")
+    if contact_similarity >= 0.75:
         support.add("contact")
-        reasons.append("contact")
-    elif contact_similarity >= 0.75:
-        score += 5
-        support.add("contact")
-        reasons.append("contact similar")
-
-    service_date = (
-        _parse_date(ocr_data.get("service_date_raw"))
-        if ocr_data.get("date_source") == "ACTION_DATE" else None
+    eligible = (
+        not row.get("weak_identity")
+        and product_similarity >= config.INDEX_PRODUCT_MIN_SIMILARITY
+        and hospital_similarity >= config.INDEX_HOSPITAL_MIN_SIMILARITY
+        and (not serials or serial_similarity >= config.INDEX_SERIAL_MIN_SIMILARITY)
     )
-    indexed_dates = [
-        candidate
-        for ref in row.get("task_refs") or []
-        for candidate in _index_dates(ref)
-    ]
-    if service_date and indexed_dates:
-        delta = min(abs((candidate - service_date).days) for candidate in indexed_dates)
-        if delta <= 3:
-            score += 15
-            support.add("date")
-            reasons.append("date within 3 days")
-        elif delta <= 14:
-            score += 10
-            support.add("date")
-            reasons.append("date within 14 days")
-        elif delta <= 31:
-            score += 5
-            support.add("date")
-            reasons.append("date within 31 days")
-
-    if job_type and job_type in (row.get("job_types") or []):
-        score += 8
-        support.add("job_type")
-        reasons.append("job type")
+    auxiliary = (
+        (1 if phone_dist == 0 else 0), (1 if asset_dist == 0 else 0),
+        hospital_similarity, product_similarity, contact_similarity,
+    )
     return {
-        "row": row, "score": score, "serial_dist": serial_dist,
-        "support": support, "reasons": reasons,
+        "row": row, "eligible": eligible, "serial_similarity": serial_similarity,
+        "serial_dist": serial_dist, "product_similarity": product_similarity,
+        "hospital_similarity": hospital_similarity, "support": support,
+        "auxiliary": auxiliary,
     }
 
 
@@ -556,7 +631,9 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     dates = _index_dates(ref)
     if service_date and dates:
         delta = min(abs((candidate - service_date).days) for candidate in dates)
-        score += 30 if delta <= 3 else 20 if delta <= 14 else 10 if delta <= 31 else 0
+        if delta > config.INDEX_TASK_DATE_MAX_DAYS:
+            return -1000
+        score += 30 if delta <= 3 else 20 if delta <= 14 else 10
     for field, points in (("phones", 25), ("assets", 20)):
         wanted_key = "phone_candidates" if field == "phones" else "asset_candidates"
         wanted = [re.sub(r"\D", "", value) for value in ocr_data.get(wanted_key) or []]
@@ -588,7 +665,70 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     return score
 
 
-def _gather_index_pool(ocr_data: dict, job_type: Optional[str]) -> tuple[List[dict], bool]:
+def _rank_index_devices(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
+    if _device_index is None:
+        return []
+    scored = [
+        _score_index_device(row, ocr_data, job_type)
+        for row in _device_index.get("devices", [])
+    ]
+    scored = [item for item in scored if item["eligible"]]
+    serials_visible = bool(
+        ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
+        or ocr_data.get("serial_no")
+    )
+    if not serials_visible:
+        # Without serial, all four independent facts must be exact and unique.
+        scored = [item for item in scored if (
+            item["product_similarity"] == 1.0
+            and item["hospital_similarity"] == 1.0
+            and "phone_exact" in item["support"]
+            and "asset_exact" in item["support"]
+        )]
+        if len(scored) != 1:
+            return []
+    scored.sort(
+        key=lambda item: (item["serial_similarity"], *item["auxiliary"]),
+        reverse=True,
+    )
+    return scored
+
+
+def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
+    """Return at most ten private rows only when deterministic ranking is close."""
+    ranked = _rank_index_devices(ocr_data, job_type)
+    serials_visible = bool(
+        ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
+        or ocr_data.get("serial_no")
+    )
+    if not serials_visible or len(ranked) < 2:
+        return []
+    gap = ranked[0]["serial_similarity"] - ranked[1]["serial_similarity"]
+    if gap > config.INDEX_SERIAL_CLOSE_GAP:
+        return []
+    close_ranked = [
+        item for item in ranked
+        if ranked[0]["serial_similarity"] - item["serial_similarity"]
+        <= config.INDEX_SERIAL_CLOSE_GAP
+    ][:config.INDEX_VISION_CANDIDATE_LIMIT]
+    result = []
+    for number, item in enumerate(close_ranked, 1):
+        row = item["row"]
+        result.append({
+            "candidate_id": f"C{number}", "device_key": row.get("device_key"),
+            "serial": row.get("serial") or "",
+            "product_families": row.get("product_families") or [],
+            "product_variants": row.get("product_variants") or [],
+            "hospital_aliases": row.get("hospital_aliases") or [],
+            "locations": row.get("locations") or [],
+            "phones": row.get("phones") or [], "contacts": row.get("contacts") or [],
+            "assets": row.get("assets") or [],
+        })
+    return result
+
+
+def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
+                       selected_device_key: Optional[str] = None) -> tuple[List[dict], bool]:
     """Choose one device, then hydrate its historical tasks from live Asana.
 
     The boolean distinguishes a genuine index miss (safe to use typeahead) from
@@ -596,45 +736,57 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str]) -> tuple[List[di
     """
     if _device_index is None:
         return [], False
-    scored = [
+    raw_scores = [
         _score_index_device(row, ocr_data, job_type)
         for row in _device_index.get("devices", [])
     ]
-    scored = [item for item in scored if item["score"] > 0]
+    had_prefilter = any(
+        item["product_similarity"] >= config.INDEX_PRODUCT_MIN_SIMILARITY
+        and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY
+        for item in raw_scores
+    )
+    # Reuse the public ranking helper so the serial-missing four-exact-fields
+    # rule and uniqueness check cannot diverge from candidate inspection.
+    scored = _rank_index_devices(ocr_data, job_type)
     if not scored:
-        return [], False
-    scored.sort(key=lambda item: (item["score"], -item["serial_dist"]), reverse=True)
+        return [], had_prefilter
     for rank, item in enumerate(scored[:3], 1):
         log.info(
-            "  設備候選 #%s：分數=%s、serial距離=%s、證據=%s",
-            rank, item["score"], item["serial_dist"], sorted(item["support"]),
+            "  設備候選 #%s：serial相似=%s%%、產品=%s%%、醫院=%s%%、證據=%s",
+            rank, round(item["serial_similarity"] * 100),
+            round(item["product_similarity"] * 100),
+            round(item["hospital_similarity"] * 100), sorted(item["support"]),
         )
-    best = scored[0]
-    runner_score = scored[1]["score"] if len(scored) > 1 else -1
-    gap = best["score"] - runner_score
+    if selected_device_key:
+        allowed = [
+            item for item in scored
+            if scored[0]["serial_similarity"] - item["serial_similarity"]
+            <= config.INDEX_SERIAL_CLOSE_GAP
+        ][:config.INDEX_VISION_CANDIDATE_LIMIT]
+        selected = next(
+            (item for item in allowed if item["row"].get("device_key") == selected_device_key),
+            None,
+        )
+        if selected is None:
+            log.warning("  視覺複核選擇不在安全候選內，停止配對")
+            return [], True
+        best = selected
+    else:
+        best = scored[0]
     serials_visible = bool(
         ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
         or ocr_data.get("serial_no")
     )
-    non_serial = best["support"] - {"serial_exact", "serial_fuzzy"}
-    strong = non_serial & {"product", "hospital", "phone_exact", "asset_exact"}
-    accepted = (
-        not best["row"].get("weak_identity")
-        and best["score"] >= INDEX_DEVICE_MIN_SCORE
-        and gap >= INDEX_DEVICE_MIN_GAP
+    gap = (
+        best["serial_similarity"] - scored[1]["serial_similarity"]
+        if best is scored[0] and len(scored) > 1 else 1.0
     )
-    if serials_visible:
-        accepted = accepted and best["serial_dist"] <= MAX_SERIAL_DIST
-        if best["serial_dist"] in (1, 2, 3):
-            accepted = accepted and len(non_serial) >= 2 and bool(strong)
-    else:
-        accepted = accepted and {
-            "phone_exact", "asset_exact", "date"
-        }.issubset(best["support"])
+    accepted = bool(selected_device_key) or not serials_visible or len(scored) == 1 \
+        or gap > config.INDEX_SERIAL_CLOSE_GAP
     if not accepted:
         log.info(
-            "  設備索引仍有歧義：最高分=%s、分差=%s、serial距離=%s",
-            best["score"], gap, best["serial_dist"],
+            "  設備索引前兩名只相差 %s 個百分點，需要一次候選複核",
+            round(gap * 100),
         )
         return [], True
 
@@ -987,6 +1139,14 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
     date_year_corrected = False
     if service_date and task_dates:
         date_delta, date_year_corrected = _service_date_delta(service_date, task_dates)
+        if date_delta > config.INDEX_TASK_DATE_MAX_DAYS:
+            # Once ACTION DATE is readable, a task more than one month away is
+            # a different visit on the same device, not a weak candidate.
+            return {
+                "task": task, "score": -1000, "serial_dist": best_dist,
+                "support": support, "reasons": [*reasons, "date conflict"],
+                "date_delta": date_delta, "job_type": candidate_type,
+            }
         if date_delta <= 3:
             score += 50
             support.add("date")
@@ -1028,7 +1188,8 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
 
 # ── 主配對 ────────────────────────────────────────────────────
 
-def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int]:
+def find_task(ocr_data: dict, job_type: str = None,
+              selected_device_key: Optional[str] = None) -> Tuple[Optional[dict], int]:
     """
     回傳 (matched_task_or_None, tier_used)
       tier: 1=OrderNo精確, 2=醫院+型號撈池→serial唯一最近, 0=未找到
@@ -1059,7 +1220,9 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
     # once rows are found, do not broaden the search and risk a false match.
     used_index = False
     if _device_index is not None:
-        pool, index_had_candidates = _gather_index_pool(ocr_data, job_type)
+        pool, index_had_candidates = _gather_index_pool(
+            ocr_data, job_type, selected_device_key=selected_device_key
+        )
         used_index = bool(pool)
         if not pool and not index_had_candidates:
             log.info("  設備索引沒有候選，改用即時 Asana 搜尋後備")
@@ -1097,6 +1260,10 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         _candidate_score(task, ocr_data, scoring_serials, hosp, product, job_type)
         for task in pool
     ]
+    scored = [row for row in scored if row["score"] > -1000]
+    if not scored:
+        log.info("  所有歷史工作都與 ACTION DATE 相差超過一個月")
+        return None, 0
     scored.sort(key=lambda row: (row["score"], -row["serial_dist"]), reverse=True)
     for rank, row in enumerate(scored[:3], 1):
         log.info(
@@ -1111,7 +1278,7 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。
         # 此時只接受唯一候選，而且完整 task 必須同時精確包含電話、asset
         # 及最近 ACTION DATE。三項來自不同欄位，不能只靠醫院/型號猜。
-        required = {"phone_exact", "asset_exact", "date"}
+        required = {"phone_exact", "asset_exact", "hospital", "product"}
         if len(scored) == 1 and required.issubset(best["support"]):
             log.info(
                 f"  ✅ serial 未形成共識，但電話、asset、日期唯一命中"
@@ -1125,11 +1292,17 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
             "phone_exact", "phone_fuzzy", "asset_exact", "asset_fuzzy",
             "contact", "date", "hospital", "product", "room", "job_type",
         }
-        visual_limit = MAX_SERIAL_DIST if used_index else 1
+        visual_serial_ok = (
+            any(
+                _key_similarity(value, task_serial) >= config.INDEX_SERIAL_MIN_SIMILARITY
+                for value in visual_serials for task_serial in _task_serials(best["task"])
+            )
+            if used_index else best["serial_dist"] <= 1
+        )
         if (
             len(scored) == 1
             and visual_serials
-            and best["serial_dist"] <= visual_limit
+            and visual_serial_ok
             and len(visual_support) >= 2
         ):
             log.info(
@@ -1153,7 +1326,10 @@ def find_task(ocr_data: dict, job_type: str = None) -> Tuple[Optional[dict], int
         if supported and unambiguous:
             log.info(f"  ✅ Asana 多欄核對命中（{', '.join(best['reasons'])}）")
             return best["task"], 2
-    elif best["serial_dist"] <= (MAX_SERIAL_DIST if used_index else 1):
+    elif best["serial_dist"] <= (
+        max(1, int(max((len(_norm(value)) for value in scoring_serials), default=0) * 0.5))
+        if used_index else 1
+    ):
         # 索引已先鎖定設備；task 層仍須用獨立欄位分辨同一設備的歷史工作。
         # 任何 1–3 字誤差都至少要兩項額外證據及一項強設備證據。
         additional = strong & {

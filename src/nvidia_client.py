@@ -860,3 +860,47 @@ def ocr_jobsheet_serial_candidates(
         ):
             candidates.append(value)
     return candidates[:3]
+
+
+def choose_device_candidate(pdf_doc: fitz.Document, page_idx: int,
+                            candidates: list[dict]) -> Optional[str]:
+    """Resolve one close deterministic tie without permitting a table-external answer."""
+    limited = list(candidates or [])[:config.INDEX_VISION_CANDIDATE_LIMIT]
+    if not limited:
+        return None
+    public_candidates = [
+        {key: value for key, value in candidate.items() if key != "device_key"}
+        for candidate in limited
+    ]
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx,
+        (
+            "product_raw", "serial_candidates", "hospital_raw",
+            "contact_person_raw", "department_room_raw", "phone_candidates",
+            "service_date_raw", "fault_symptom",
+        ),
+        zoom=config.OCR_SUPPORT_ZOOM, strong=True,
+    )
+    prompt = (
+        "This is a constrained verification task, not open-ended OCR. Compare the visible "
+        "jobsheet fields with ONLY the numbered equipment rows below. A row may contain "
+        "historical spellings and contacts. Select a row only when the visible evidence "
+        "clearly supports it. Never invent or repair any value and never return an answer "
+        "outside the list. If strokes are unclear, candidates conflict, or no row is clearly "
+        "supported, set uncertain=true and candidate_id=null. Return JSON only: "
+        '{"candidate_id":"C1 or null","matched_fields":[],"conflicting_fields":[],"uncertain":true}. '
+        "Candidate rows: " + json.dumps(public_candidates, ensure_ascii=False)
+    )
+    raw = _call_vision(prompt, image_b64, max_tokens=500, expects_json=True)
+    result = _parse_json_object(
+        raw,
+        required_keys={"candidate_id", "matched_fields", "conflicting_fields", "uncertain"},
+    )
+    candidate_id = result.get("candidate_id")
+    valid_ids = {item.get("candidate_id") for item in limited}
+    if result.get("uncertain") is not False or candidate_id not in valid_ids:
+        return None
+    if not isinstance(result.get("matched_fields"), list) \
+            or not isinstance(result.get("conflicting_fields"), list):
+        return None
+    return candidate_id

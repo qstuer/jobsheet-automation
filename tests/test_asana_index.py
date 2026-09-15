@@ -126,6 +126,12 @@ class AsanaIndexTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual(rows[0]["task_gids"], "1")
             self.assertNotIn("order_no", rows[0])
+            with (path / "asana-location-index.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as stream:
+                locations = list(csv.DictReader(stream))
+            self.assertEqual("Queen Mary Hospital", locations[0]["canonical_hospital"])
+            self.assertEqual("true", locations[0]["match_enabled"])
 
     def test_incremental_build_reprocesses_only_changed_task(self):
         initial = asana_index.build_index([
@@ -198,7 +204,9 @@ class AsanaIndexClientTests(unittest.TestCase):
         return {
             "gid": gid, "work_dates": [date_value], "job_type": job_type,
             "location": "PYNEH", "hospital": "PYNEH",
+            "hospital_aliases": ["PYN", "PYNEH"],
             "department_rooms": [room], "product": "Affiniti 70",
+            "product_family": "AFFINITI",
             "product_variant": "Affiniti 70", "serial": "USN16F0565",
             "phones": [phone], "contacts": [contact], "assets": ["19130438"],
         }
@@ -209,10 +217,12 @@ class AsanaIndexClientTests(unittest.TestCase):
         ref = cls._ref(gid, date_value=date_value, phone=phone, contact=contact)
         ref["serial"] = serial
         return {
-            "device_key": f"{serial}|AFFINITI70", "weak_identity": False,
-            "serial": serial, "product": "Affiniti 70",
+            "device_key": serial, "weak_identity": False,
+            "serial": serial, "product": "AFFINITI",
+            "product_families": ["AFFINITI"],
             "product_variants": ["Affiniti 70", "Affiniti 70G"],
             "hospitals": ["PYNEH"], "locations": ["PYN", "PYNEH-3F"],
+            "hospital_aliases": ["PYN", "PYNEH"],
             "department_rooms": ["3F"], "phones": [phone],
             "contacts": [contact], "assets": ["19130438"],
             "work_dates": [date_value], "job_types": ["PM"],
@@ -245,16 +255,19 @@ class AsanaIndexClientTests(unittest.TestCase):
 
     def test_index_hydrates_live_task_and_order_is_read_only_at_end(self):
         index = {
-            "schema_version": 2,
+            "schema_version": 3,
             "devices": [{
-                "device_key": "US123F4567|CX50", "weak_identity": False,
-                "serial": "US123F4567", "product": "CX50",
+                "device_key": "US123F4567", "weak_identity": False,
+                "serial": "US123F4567", "product": "CX",
+                "product_families": ["CX"],
                 "product_variants": ["CX50"],
-                "hospitals": ["QMH"], "locations": ["QMH"], "phones": [],
+                "hospitals": ["QMH"], "hospital_aliases": ["QMH"],
+                "locations": ["QMH"], "phones": [],
                 "contacts": [], "assets": [], "job_types": ["PM"],
                 "task_refs": [{"gid": "123", "work_dates": ["2026-09-08"],
                                "job_type": "PM", "location": "QMH",
-                               "hospital": "QMH", "product": "CX50",
+                               "hospital": "QMH", "hospital_aliases": ["QMH"],
+                               "product": "CX", "product_family": "CX",
                                "product_variant": "CX50", "serial": "US123F4567",
                                "phones": [], "contacts": [], "assets": [],
                                "department_rooms": []}],
@@ -278,7 +291,7 @@ class AsanaIndexClientTests(unittest.TestCase):
         live_search.assert_not_called()
 
     def test_index_miss_uses_live_fallback(self):
-        asana_client.set_device_index({"schema_version": 2, "devices": []})
+        asana_client.set_device_index({"schema_version": 3, "devices": []})
         with patch.object(asana_client, "_gather_pool", return_value=[]) as live_search:
             found, tier = asana_client.find_task({"order_no": "61877075"})
         self.assertIsNone(found)
@@ -319,7 +332,7 @@ class AsanaIndexClientTests(unittest.TestCase):
         for observed in ("USN16F056G", "USN16F05GG", "USN16F0GGG"):
             with self.subTest(observed=observed):
                 asana_client.set_device_index({
-                    "schema_version": 2, "devices": [self._device()],
+                    "schema_version": 3, "devices": [self._device()],
                 })
                 with patch.object(
                     asana_client, "_fetch_task", return_value=self._live("task-1")
@@ -330,34 +343,36 @@ class AsanaIndexClientTests(unittest.TestCase):
                 fetch.assert_called_once_with("task-1")
                 fallback.assert_not_called()
 
-    def test_serial_four_errors_does_not_match_or_use_live_fallback(self):
+    def test_serial_at_fifty_percent_can_match_after_other_gates(self):
         asana_client.set_device_index({
-            "schema_version": 2, "devices": [self._device()],
+            "schema_version": 3, "devices": [self._device()],
         })
-        with patch.object(asana_client, "_fetch_task") as fetch, \
+        with patch.object(asana_client, "_fetch_task", return_value=self._live("task-1")) as fetch, \
                 patch.object(asana_client, "_gather_pool") as fallback:
             found, tier = asana_client.find_task(
                 self._ocr("USN16FGGGX"), job_type="PM"
             )
-        self.assertIsNone(found)
-        self.assertEqual(0, tier)
-        fetch.assert_not_called()
+        self.assertEqual("task-1", found["gid"])
+        self.assertEqual(2, tier)
+        fetch.assert_called_once()
         fallback.assert_not_called()
 
-    def test_fuzzy_serial_without_two_other_evidence_categories_stays_pending(self):
+    def test_missing_product_or_hospital_gate_uses_live_fallback(self):
         asana_client.set_device_index({
-            "schema_version": 2, "devices": [self._device()],
+            "schema_version": 3, "devices": [self._device()],
         })
         sparse = self._ocr(
             "USN16F056G", hospital_raw=None, department_room_raw=None,
             phone_candidates=[], contact_person_raw=None, asset_candidates=[],
             service_date_raw=None, date_source=None,
         )
-        with patch.object(asana_client, "_fetch_task") as fetch:
+        with patch.object(asana_client, "_fetch_task") as fetch, \
+                patch.object(asana_client, "_gather_pool", return_value=[]) as fallback:
             found, tier = asana_client.find_task(sparse, job_type=None)
         self.assertIsNone(found)
         self.assertEqual(0, tier)
         fetch.assert_not_called()
+        fallback.assert_called_once()
 
     def test_weak_index_row_never_auto_names_even_with_phone_asset_and_date(self):
         weak = self._device()
@@ -366,18 +381,20 @@ class AsanaIndexClientTests(unittest.TestCase):
             "serial": "",
         })
         weak["task_refs"][0]["serial"] = ""
-        asana_client.set_device_index({"schema_version": 2, "devices": [weak]})
+        asana_client.set_device_index({"schema_version": 3, "devices": [weak]})
         ocr = self._ocr(serial_candidates=[], serial_no=None)
-        with patch.object(asana_client, "_fetch_task") as fetch:
+        with patch.object(asana_client, "_fetch_task") as fetch, \
+                patch.object(asana_client, "_gather_pool") as fallback:
             found, tier = asana_client.find_task(ocr, job_type="PM")
         self.assertIsNone(found)
         self.assertEqual(0, tier)
         fetch.assert_not_called()
+        fallback.assert_not_called()
 
     def test_two_close_devices_with_small_score_gap_stay_pending(self):
         other = self._device("USN16F0566", gid="task-2")
         asana_client.set_device_index({
-            "schema_version": 2, "devices": [self._device(), other],
+            "schema_version": 3, "devices": [self._device(), other],
         })
         with patch.object(asana_client, "_fetch_task") as fetch:
             found, tier = asana_client.find_task(
@@ -396,7 +413,7 @@ class AsanaIndexClientTests(unittest.TestCase):
         device["phones"].append("69876543")
         device["contacts"].append("Bob")
         device["work_dates"].append("2026-09-14")
-        asana_client.set_device_index({"schema_version": 2, "devices": [device]})
+        asana_client.set_device_index({"schema_version": 3, "devices": [device]})
         live = {
             "older": self._live("older"),
             "newer": self._live(
@@ -411,7 +428,7 @@ class AsanaIndexClientTests(unittest.TestCase):
     def test_tied_history_is_not_resolved_by_newest_task(self):
         device = self._device(gid="older")
         device["task_refs"].append(self._ref("newer"))
-        asana_client.set_device_index({"schema_version": 2, "devices": [device]})
+        asana_client.set_device_index({"schema_version": 3, "devices": [device]})
         live = {gid: self._live(gid) for gid in ("older", "newer")}
         with patch.object(asana_client, "_fetch_task", side_effect=lambda gid: live[gid]):
             found, tier = asana_client.find_task(self._ocr(), job_type="PM")
@@ -420,7 +437,7 @@ class AsanaIndexClientTests(unittest.TestCase):
 
     def test_candidate_logs_do_not_reveal_indexed_customer_values(self):
         asana_client.set_device_index({
-            "schema_version": 2, "devices": [self._device()],
+            "schema_version": 3, "devices": [self._device()],
         })
         with patch.object(
             asana_client, "_fetch_task", return_value=self._live("task-1")

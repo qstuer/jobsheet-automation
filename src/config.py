@@ -29,6 +29,7 @@ GDRIVE_REPORTS = "googledrive:From_BrotherDevice/_REPORTS"
 GDRIVE_CONTROL = "googledrive:From_BrotherDevice/.jobsheet-control"
 GDRIVE_ASANA_INDEX_JSON = f"{GDRIVE_CONTROL}/asana-device-index.json"
 GDRIVE_ASANA_INDEX_CSV = f"{GDRIVE_CONTROL}/asana-device-index.csv"
+GDRIVE_ASANA_LOCATION_INDEX_CSV = f"{GDRIVE_CONTROL}/asana-location-index.csv"
 GDRIVE_ASANA_INDEX_MANIFEST = f"{GDRIVE_CONTROL}/asana-device-index-manifest.json"
 ONEDRIVE_OUTPUT = "onedrive:Hong Kong Sen's Healthcare/JOBSHEETS"
 
@@ -79,6 +80,14 @@ KIMI_STREAM_MAX_SECONDS = 90.0
 # === Asana ===
 ASANA_BASE_URL = "https://app.asana.com/api/1.0"
 ASANA_MAX_HYDRATED_CANDIDATES = 40
+# 私人設備表的三層安全閘。百分比使用 0–1；日期只在已鎖定設備後選
+# 歷史工作，不參與設備排名。
+INDEX_PRODUCT_MIN_SIMILARITY = 0.33
+INDEX_HOSPITAL_MIN_SIMILARITY = 0.33
+INDEX_SERIAL_MIN_SIMILARITY = 0.50
+INDEX_SERIAL_CLOSE_GAP = 0.10
+INDEX_VISION_CANDIDATE_LIMIT = 10
+INDEX_TASK_DATE_MAX_DAYS = 31
 
 # === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
 OCR_ZOOM_DEFAULT  = 3.0   # 第一張分格欄位卡；不再把半頁表格原樣交給模型
