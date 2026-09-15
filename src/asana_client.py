@@ -527,16 +527,52 @@ def _family_similarity(left: Optional[str], right: Optional[str]) -> float:
     return _key_similarity(left_key, right_key)
 
 
-def _score_index_device(row: dict, ocr_data: dict,
-                        job_type: Optional[str] = None) -> dict:
-    """Apply product→hospital→serial gates; ACTION DATE is deliberately absent."""
+def _prepare_index_query(ocr_data: dict) -> dict:
+    """Normalize work-sheet evidence once before scanning thousands of rows.
+
+    In particular, expanding a hospital through the embedded location directory
+    scans hundreds of hospital groups.  Doing that inside every device-row score
+    made a single private lookup needlessly slow.
+    """
+    if ocr_data.get("_index_query_prepared"):
+        return ocr_data
+    prepared = dict(ocr_data)
     serials = _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
     serials += [value for value in _clean_candidates(
         ocr_data.get("serial_visual_candidates")
     ) if value not in serials]
-    wanted_product = product_group(ocr_data.get("product") or ocr_data.get("product_raw"))
+    prepared.update({
+        "_index_query_prepared": True,
+        "_index_serials": serials,
+        "_index_wanted_product": product_group(
+            ocr_data.get("product") or ocr_data.get("product_raw")
+        ),
+        "_index_wanted_hospitals": _index_hospital_aliases(
+            ocr_data.get("hospital_raw") or ocr_data.get("customer")
+            or ocr_data.get("customer_raw")
+        ),
+    })
+    return prepared
+
+
+def _score_index_device(row: dict, ocr_data: dict,
+                        job_type: Optional[str] = None) -> dict:
+    """Apply product→hospital→serial gates; ACTION DATE is deliberately absent."""
+    serials = ocr_data.get("_index_serials")
+    if serials is None:
+        serials = _clean_candidates(
+            ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
+        )
+        serials += [value for value in _clean_candidates(
+            ocr_data.get("serial_visual_candidates")
+        ) if value not in serials]
+    wanted_product = ocr_data.get("_index_wanted_product")
+    if wanted_product is None:
+        wanted_product = product_group(
+            ocr_data.get("product") or ocr_data.get("product_raw")
+        )
     row_products = row.get("product_families") or [
         product_group(value) for value in row.get("product_variants") or []
     ]
@@ -544,10 +580,12 @@ def _score_index_device(row: dict, ocr_data: dict,
         (_family_similarity(wanted_product, value) for value in row_products if value),
         default=0.0,
     )
-    wanted_hospitals = _index_hospital_aliases(
-        ocr_data.get("hospital_raw") or ocr_data.get("customer")
-        or ocr_data.get("customer_raw")
-    )
+    wanted_hospitals = ocr_data.get("_index_wanted_hospitals")
+    if wanted_hospitals is None:
+        wanted_hospitals = _index_hospital_aliases(
+            ocr_data.get("hospital_raw") or ocr_data.get("customer")
+            or ocr_data.get("customer_raw")
+        )
     row_hospitals = row.get("hospital_aliases") or [
         alias for value in [*(row.get("hospitals") or []), *(row.get("locations") or [])]
         for alias in hospital_aliases(value)
@@ -665,18 +703,9 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     return score
 
 
-def _rank_index_devices(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
-    if _device_index is None:
-        return []
-    scored = [
-        _score_index_device(row, ocr_data, job_type)
-        for row in _device_index.get("devices", [])
-    ]
+def _filter_ranked_device_scores(scored: List[dict], serials_visible: bool) -> List[dict]:
+    """Apply shared safety gates and ordering to a pre-scored device table."""
     scored = [item for item in scored if item["eligible"]]
-    serials_visible = bool(
-        ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
-        or ocr_data.get("serial_no")
-    )
     if not serials_visible:
         # Without serial, all four independent facts must be exact and unique.
         scored = [item for item in scored if (
@@ -692,6 +721,19 @@ def _rank_index_devices(ocr_data: dict, job_type: Optional[str] = None) -> List[
         reverse=True,
     )
     return scored
+
+
+def _rank_index_devices(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
+    if _device_index is None:
+        return []
+    prepared = _prepare_index_query(ocr_data)
+    scored = [
+        _score_index_device(row, prepared, job_type)
+        for row in _device_index.get("devices", [])
+    ]
+    return _filter_ranked_device_scores(
+        scored, bool(prepared.get("_index_serials"))
+    )
 
 
 def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
@@ -736,8 +778,9 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
     """
     if _device_index is None:
         return [], False
+    prepared = _prepare_index_query(ocr_data)
     raw_scores = [
-        _score_index_device(row, ocr_data, job_type)
+        _score_index_device(row, prepared, job_type)
         for row in _device_index.get("devices", [])
     ]
     had_prefilter = any(
@@ -745,9 +788,11 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY
         for item in raw_scores
     )
-    # Reuse the public ranking helper so the serial-missing four-exact-fields
-    # rule and uniqueness check cannot diverge from candidate inspection.
-    scored = _rank_index_devices(ocr_data, job_type)
+    # Reuse the same safety filter as public candidate inspection without
+    # scoring all 4,000+ rows a second time.
+    scored = _filter_ranked_device_scores(
+        raw_scores, bool(prepared.get("_index_serials"))
+    )
     if not scored:
         return [], had_prefilter
     for rank, item in enumerate(scored[:3], 1):

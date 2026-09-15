@@ -151,6 +151,19 @@ class LayeredSearchTests(unittest.TestCase):
         expanded = asana_client._index_hospital_aliases("SGH")
         self.assertIn("Starlight General Hospital", expanded)
 
+    def test_location_directory_is_expanded_once_per_sheet_not_once_per_device(self):
+        asana_client.set_device_index({
+            "schema_version": 3,
+            "devices": [row("USN16F0565"), row("USN16F0566")],
+            "location_directory": [],
+        })
+        original = asana_client._index_hospital_aliases
+        with patch.object(
+            asana_client, "_index_hospital_aliases", wraps=original
+        ) as expand:
+            asana_client._rank_index_devices(ocr(), "PM")
+        self.assertEqual(1, expand.call_count)
+
     def test_serial_fifty_percent_gate(self):
         device = row("USN16F0565")
         passing = asana_client._score_index_device(device, ocr("USN16FGGGX"))
