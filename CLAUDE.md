@@ -130,6 +130,10 @@ serial 的列標記為 weak，永不自動命名。索引不保存 Order Number�
 才使用舊的即時 typeahead 搜尋後備；候選接近則直接留在 `_PENDING`，不擴大搜尋。
 索引不能取代 Asana 最終資料，也不會改動正式工作單或 OneDrive。
 
+更新解析規則後，手動刷新索引時必須勾選 `full_rebuild`，忽略舊索引並從 Asana
+完整重建；否則增量模式會沿用舊版已誤分類的電話／asset。平日資料更新則不勾選，
+只重新處理新增或修改過的工作。
+
 第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀；單格圖會裁走大部分印刷標籤及空白，只保留手寫值，並以普通／加強兩種影像避免重複同一誤讀。身分欄仍配不到 Asana 時，才第二次讀 `CONTACT PERSON`、電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄；兩張卡的聯絡人、電話或 ACTION DATE 不一致時，最後只再讀有爭議的一格。
 
 `Customer Name` 是醫院；`Dept./Room No.` 只可是樓層、病房或 asset；`CONTACT PERSON` 獨立抄成 `contact_person_raw`，不能由電話推斷。`Asset# 19130438` 會派生成 asset 證據，並從位置文字移除，絕不當作醫院或地點。醫院及部門內部欄位叫 `hospital_raw`、`department_room_raw`；舊 `customer_raw`、`location_raw` 只作相容映射。
@@ -175,6 +179,7 @@ workspace 撈成大候選池。每次仍即時讀取 Asana task 作最後確認�
    手寫年份若明顯落在三個月範圍外（常見把 `6` 看成 `0/5`），只有在 Asana 候選日期屬最近三個月、月日相差不超過 14 天時才校正年份；最終仍須 serial 及其他證據，不能只靠日期命名。
 7. 只有已核對的短醫院碼才可搜尋或加分；`PYN` 與 `PYNEH` 視為同院，會用兩種短寫撈候選。未知短碼（例如模型幻覺的 PN、KWM、PYTV）會觸發醫院格重讀；詳細樓層只屬 Dept./Room，不會混入醫院名。完整醫院名若有最多兩個 OCR 字元誤差，只在已確認清單內存在唯一最近答案時才由程式校正；候選名稱不會提供給圖片模型。
 8. 聯絡人忽略大小寫、空格及標點作低權重相似比對；因 CM/PM 對接人可不同，它不能單獨決定設備或工作。Asana 常見的 `25956917 Ms.Yan` 會拆成電話及聯絡人；`wo: 19130438` 視為工作單上的 asset/WO 證據。明確 Asset/WO 及 Order Number 不得再誤當電話。
+   電話或 asset 若因 OCR／Asana 人手輸入多一位、少一位或錯一位，只給較低的模糊分，不能單獨決勝；`EPIQ 7 Plus` 與 `EPIQ 7+` 視為同一產品系列。
 9. 同一設備的歷史工作再按 ACTION DATE、PM/CM、當次電話、聯絡人、asset 及地點排名；不以建立時間、完成狀態或最新/最舊作決勝。候選並列或證據不足，一律留在 `_PENDING`。
 
 已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/7+/Elite/CVx`、`CX30/CX50`。

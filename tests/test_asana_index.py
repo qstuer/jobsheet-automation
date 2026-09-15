@@ -81,6 +81,16 @@ class AsanaIndexTests(unittest.TestCase):
         self.assertEqual(["Ms.Yan"], record["contacts"])
         self.assertEqual(["19130438"], record["assets"])
 
+    def test_one_extra_phone_digit_is_kept_only_as_fuzzy_evidence(self):
+        record = asana_index.task_to_record(task(
+            "1",
+            "PYNEH / EPIQ Elite / SZO23B2128 / 61877080",
+            notes="Ben 60124270\nworkshop 225956184\nasset: 2311298",
+        ), "PM")
+        self.assertIn("225956184", record["phones"])
+        self.assertNotIn("61877080", record["phones"])
+        self.assertNotIn("2311298", record["phones"])
+
     def test_old_task_is_outside_two_year_window_and_order_is_not_indexed(self):
         rows = asana_index.build_index([
             task("old", "QEH / CX50 / US999F9999", modified="2022-01-01T00:00:00Z",
@@ -279,6 +289,31 @@ class AsanaIndexClientTests(unittest.TestCase):
         self.assertEqual("Affiniti 70", asana_client.product_family("Affiniti 70"))
         self.assertEqual("Affiniti 70", asana_client.product_family("Affiniti 70G"))
         self.assertEqual("CX50", asana_client.product_family("CX50"))
+
+    def test_epiq_7_plus_and_plus_symbol_share_one_product_family(self):
+        self.assertEqual("EPIQ 7+", asana_client.product_family("EPIQ 7 Plus"))
+        self.assertEqual("EPIQ 7+", asana_client.product_family("EPIQ 7+"))
+
+    def test_live_month_project_contact_and_typo_phone_match_index_rules(self):
+        live = {
+            "gid": "task",
+            "name": "PYNEH / EPIQ Elite / SZO23B2128 / 61877080",
+            "notes": "workshop 225956184\n25956917 Ms.Yan\nasset: 2311298",
+            "memberships": [{"project": {"name": "2026 Jul"}}],
+        }
+        self.assertEqual("PM", asana_client._task_job_type(live))
+        self.assertIn("Ms.Yan", asana_client._task_contacts(live))
+        self.assertIn("225956184", asana_client._task_phones(live))
+        scored = asana_client._candidate_score(
+            live,
+            {
+                "phone_candidates": ["25956184"],
+                "asset_candidates": ["2311298"],
+            },
+            serials=[], hosp=None, product=None, job_type="PM",
+        )
+        self.assertIn("phone_fuzzy", scored["support"])
+        self.assertIn("asset_exact", scored["support"])
 
     def test_serial_one_two_or_three_errors_can_match_with_multiple_fields(self):
         for observed in ("USN16F056G", "USN16F05GG", "USN16F0GGG"):

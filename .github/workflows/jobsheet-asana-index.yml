@@ -13,6 +13,11 @@ on:
         description: '索引結束日期（YYYY-MM-DD；留空為今天）'
         required: false
         type: string
+      full_rebuild:
+        description: '忽略舊索引並完整重建（解析規則更新時使用）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -51,6 +56,7 @@ jobs:
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
       - name: Restore previous index when available
+        if: ${{ !inputs.full_rebuild }}
         run: |
           if rclone lsf "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" >/dev/null 2>&1; then
             rclone copyto \
@@ -60,6 +66,9 @@ jobs:
           else
             echo 'No previous index; building the initial two-year index.'
           fi
+      - name: Announce full rebuild
+        if: ${{ inputs.full_rebuild }}
+        run: echo 'Full rebuild requested; old parsed values will not be reused.'
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Build private Asana device index

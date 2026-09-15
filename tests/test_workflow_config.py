@@ -91,6 +91,13 @@ class WorkflowConfigTests(unittest.TestCase):
             self.assertIn("vars.ASANA_WORKSPACE_GID", text)
             self.assertNotIn("secrets.ASANA_WORKSPACE_GID", text)
 
+    def test_asana_index_can_discard_stale_parsed_values_on_full_rebuild(self):
+        workflow = ROOT / ".github" / "workflows" / "jobsheet-asana-index.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("full_rebuild:", text)
+        self.assertIn("if: ${{ !inputs.full_rebuild }}", text)
+        self.assertIn("if: ${{ inputs.full_rebuild }}", text)
+
 
 class AppsScriptSafetyTests(unittest.TestCase):
     def test_dispatch_busy_state_is_checked_before_and_after_upload_wait(self):

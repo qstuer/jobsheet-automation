@@ -128,13 +128,22 @@ def product_family(value: Optional[str]) -> Optional[str]:
     """
     if not value:
         return None
-    normalized = _norm(value)
-    normalized = re.sub(r"G$", "", normalized) if normalized.startswith("AFFINITI") else normalized
+    def family_key(raw: str) -> str:
+        normalized = _norm(raw)
+        if normalized.startswith("AFFINITI"):
+            normalized = re.sub(r"G$", "", normalized)
+        # Engineers use both the printed ``EPIQ 7+`` and the written
+        # ``EPIQ 7 Plus``.  They are one product family; raw spellings remain
+        # in the private index for audit.
+        if normalized.startswith("EPIQ"):
+            normalized = re.sub(r"PLUS$", "", normalized)
+        return normalized
+
+    normalized = family_key(value)
     best = None
     best_distance = 99
     for known in KNOWN_PRODUCTS:
-        known_norm = _norm(known)
-        family_norm = re.sub(r"G$", "", known_norm) if known_norm.startswith("AFFINITI") else known_norm
+        family_norm = family_key(known)
         distance = _lev(normalized, family_norm)
         if distance < best_distance:
             best, best_distance = known, distance
@@ -456,7 +465,8 @@ def _score_index_device(row: dict, ocr_data: dict,
     row_phones = [re.sub(r"\D", "", value) for value in row.get("phones") or []]
     phone_dist = min(
         (_digit_distance(left, right) for left in wanted_phones for right in row_phones
-         if left and right and len(left) == len(right)), default=99,
+         if left and right and 7 <= len(left) <= 9 and 7 <= len(right) <= 9),
+        default=99,
     )
     if phone_dist == 0:
         score += 20
@@ -471,7 +481,7 @@ def _score_index_device(row: dict, ocr_data: dict,
     row_assets = [re.sub(r"\D", "", value) for value in row.get("assets") or []]
     asset_dist = min(
         (_digit_distance(left, right) for left in wanted_assets for right in row_assets
-         if left and right and len(left) == len(right)), default=99,
+         if len(left) >= 4 and len(right) >= 4), default=99,
     )
     if asset_dist == 0:
         score += 18
@@ -553,7 +563,7 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
         stored = [re.sub(r"\D", "", value) for value in ref.get(field) or []]
         if any(left and left == right for left in wanted for right in stored):
             score += points
-        elif any(left and right and len(left) == len(right) and _digit_distance(left, right) == 1
+        elif any(left and right and _digit_distance(left, right) == 1
                  for left in wanted for right in stored):
             score += points // 2
     contact = ocr_data.get("contact_person_raw")
@@ -753,7 +763,17 @@ def _task_job_type(task: dict) -> Optional[str]:
     text = _task_container_text(task).upper()
     if not text:
         return None
-    pm = bool(re.search(r"\bPM\b|PREVENTI(?:VE|ATIVE)|PLANNED\s+MAINT", text))
+    # 現行例行 PM project 也會只叫 ``2026 Jun``。這項判斷必須與建立
+    # 索引時一致，否則索引找到正確工作，最後即時核對卻會丟失 PM 證據。
+    monthly_pm = bool(re.search(
+        r"(?:^|\s)20\d{2}\s+(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|"
+        r"APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|"
+        r"OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)(?:\s|$)",
+        text,
+    ))
+    pm = monthly_pm or bool(re.search(
+        r"\bPM\b|PREVENTI(?:VE|ATIVE)|PLANNED\s+MAINT", text
+    ))
     cm = bool(re.search(r"\bCM\b|CORRECTIVE|REPAIR|SERVICE\s+REQUEST", text))
     if pm == cm:
         return None
@@ -771,6 +791,17 @@ def _task_contacts(task: dict) -> List[str]:
     for value in matches:
         value = re.split(r"\b(?:phone|tel|mobile|asset)\b", value, 1,
                          flags=re.IGNORECASE)[0].strip(" .,:;-")
+        if sum(char.isalpha() for char in value) >= 2:
+            contacts.append(value)
+    # PM 工作常直接寫成 ``25956917 Ms.Yan``，沒有 Contact 標籤。
+    # 電話只用來定位同一行；人名仍獨立保存和低權重比較。
+    for value in re.findall(
+        r"(?im)(?:\+?852[ -]?)?\d{4}[ -]?\d{4}\s+"
+        r"([A-Z][A-Z .'-]{1,39})\s*$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        value = value.strip(" .,:;-")
         if sum(char.isalpha() for char in value) >= 2:
             contacts.append(value)
     return list(dict.fromkeys(contacts))
@@ -807,8 +838,10 @@ def _task_phones(task: dict) -> List[str]:
     excluded = set(re.findall(r"(?<!\d)[56]\d{7}(?!\d)", task.get("name") or ""))
     excluded.update(_task_assets(task))
     excluded.update(_task_work_orders(task))
+    # Asana 人手輸入偶爾在八位電話前後多打一位；保留 7–9 位只供
+    # 一字編輯距離比對。Order、asset、WO 仍先排除，不能成為電話證據。
     return [value for value in _task_digit_tokens(task)
-            if len(value) == 8 and value not in excluded]
+            if 7 <= len(value) <= 9 and value not in excluded]
 
 
 def _task_assets(task: dict) -> List[str]:
@@ -872,7 +905,8 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("phone_exact")
         reasons.append("phone")
     elif any(
-        len(value) == len(candidate) == 8 and _lev(value, candidate) == 1
+        7 <= len(value) <= 9 and 7 <= len(candidate) <= 9
+        and _lev(value, candidate) == 1
         for value in phones for candidate in task_phones
     ):
         score += 20
@@ -888,7 +922,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("asset_exact")
         reasons.append("asset")
     elif any(
-        len(value) == len(candidate) and len(value) >= 4 and _lev(value, candidate) == 1
+        len(value) >= 4 and len(candidate) >= 4 and _lev(value, candidate) == 1
         for value in assets for candidate in task_assets
     ):
         score += 15

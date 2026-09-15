@@ -226,17 +226,22 @@ def _phones(text: str, *, excluded_numbers: Iterable[str] = ()) -> list[str]:
     excluded = {re.sub(r"\D", "", value) for value in excluded_numbers}
     result = []
     labeled = [match.group("value") for match in _LABELED_PHONE_RE.finditer(text or "")]
-    candidates = labeled or _PHONE_RE.findall(text or "")
+    candidates = labeled or [
+        *_PHONE_RE.findall(text or ""),
+        # 人手輸入有時在八位電話多／少打一位。保留 7–9 位純數字作
+        # 低分模糊證據；Order、Asset/WO 會由 caller 先列入排除清單。
+        *re.findall(r"(?<!\d)\d{7,9}(?!\d)", text or ""),
+    ]
     for value in candidates:
         digits = re.sub(r"\D", "", value)
         if len(digits) == 11 and digits.startswith("852"):
             digits = digits[3:]
-        if len(digits) == 8:
+        if 7 <= len(digits) <= 9:
             if digits in excluded and not labeled:
                 continue
             # 香港電話不會以 0/1 開頭；這類未標籤八位數通常是
             # Asset Number。明確寫有 Phone/Tel 的值仍照原文保留。
-            if not labeled and digits[0] in {"0", "1"}:
+            if not labeled and len(digits) == 8 and digits[0] in {"0", "1"}:
                 continue
             result.append(digits)
     return _unique(result)
