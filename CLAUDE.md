@@ -105,7 +105,8 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 ### Asana 設備索引（只作縮小候選）
 
 手動工作 `Jobsheet - Refresh Asana Device Index` 會掃描目前 workspace 的 PM/CM
-project，建立近兩年的設備索引。每部設備一列，以 `serial + product family` 作主鍵；
+project，建立近兩年的設備索引。純月份名稱（例如 `2026 Jun`）是現行例行 PM
+project，亦必須納入；不能只靠 project 名稱有沒有 `PM` 三個字。每部設備一列，以 `serial + product family` 作主鍵；
 `Affiniti 70` 與 `Affiniti 70G` 歸入同系列，但保留所有實際寫法。同一列累積醫院正式名
 及簡寫、詳細地點、部門/房間、電話、聯絡人、asset 及日期；每個歷史工作亦獨立保存
 當次資料、PM/CM 類型、Asana task GID 及連結，CM 和 PM 聯絡人不會互相覆蓋。沒有
@@ -173,7 +174,7 @@ workspace 撈成大候選池。每次仍即時讀取 Asana task 作最後確認�
    兩輪都抄到相同服務日期時，即使模型漏填 `date_source`，亦視為 ACTION DATE；兩輪不一致時只重讀日期格，單輪讀數仍不會採用。
    手寫年份若明顯落在三個月範圍外（常見把 `6` 看成 `0/5`），只有在 Asana 候選日期屬最近三個月、月日相差不超過 14 天時才校正年份；最終仍須 serial 及其他證據，不能只靠日期命名。
 7. 只有已核對的短醫院碼才可搜尋或加分；`PYN` 與 `PYNEH` 視為同院，會用兩種短寫撈候選。未知短碼（例如模型幻覺的 PN、KWM、PYTV）會觸發醫院格重讀；詳細樓層只屬 Dept./Room，不會混入醫院名。完整醫院名若有最多兩個 OCR 字元誤差，只在已確認清單內存在唯一最近答案時才由程式校正；候選名稱不會提供給圖片模型。
-8. 聯絡人忽略大小寫、空格及標點作低權重相似比對；因 CM/PM 對接人可不同，它不能單獨決定設備或工作。電話和 asset 必須按 Asana 描述中的相應標籤抽取，不能把 Order Number 誤當電話。
+8. 聯絡人忽略大小寫、空格及標點作低權重相似比對；因 CM/PM 對接人可不同，它不能單獨決定設備或工作。Asana 常見的 `25956917 Ms.Yan` 會拆成電話及聯絡人；`wo: 19130438` 視為工作單上的 asset/WO 證據。明確 Asset/WO 及 Order Number 不得再誤當電話。
 9. 同一設備的歷史工作再按 ACTION DATE、PM/CM、當次電話、聯絡人、asset 及地點排名；不以建立時間、完成狀態或最新/最舊作決勝。候選並列或證據不足，一律留在 `_PENDING`。
 
 已知型號：`Affiniti 30/50/70`、`EPIQ 5G/7G/7+/Elite/CVx`、`CX30/CX50`。

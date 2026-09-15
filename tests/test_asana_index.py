@@ -48,6 +48,39 @@ class AsanaIndexTests(unittest.TestCase):
         self.assertEqual(refs["2"]["phones"], ["61234569"])
         self.assertEqual(rows["merged_task_count"], 1)
 
+    def test_unlabelled_asset_number_is_not_indexed_as_phone(self):
+        record = asana_index.task_to_record(task(
+            "1",
+            "PYN / Affiniti 70 / US123F4567",
+            notes="Asset# 19130438\nSecondary asset 1281993",
+        ), "PM")
+        self.assertEqual(["19130438", "1281993"], record["assets"])
+        self.assertEqual([], record["phones"])
+
+    def test_labelled_phone_is_kept_while_asset_is_excluded(self):
+        record = asana_index.task_to_record(task(
+            "1",
+            "PYN / Affiniti 70 / US123F4567",
+            notes="Phone: 25956917\nAsset# 19130438",
+        ), "PM")
+        self.assertEqual(["25956917"], record["phones"])
+        self.assertEqual(["19130438"], record["assets"])
+
+    def test_month_named_projects_are_pm(self):
+        self.assertEqual("PM", asana_index._project_is_pm_cm("2026 Jun"))
+        self.assertEqual("PM", asana_index._project_is_pm_cm("2025 September"))
+        self.assertIsNone(asana_index._project_is_pm_cm("2026 rollout"))
+
+    def test_unlabelled_contact_after_phone_and_wo_are_indexed(self):
+        record = asana_index.task_to_record(task(
+            "1",
+            "PYN / Affiniti 70 / US123F4567 / 61877075",
+            notes="1 / 2 PMS\n25956917 Ms.Yan\nwo: 19130438",
+        ), "PM")
+        self.assertEqual(["25956917"], record["phones"])
+        self.assertEqual(["Ms.Yan"], record["contacts"])
+        self.assertEqual(["19130438"], record["assets"])
+
     def test_old_task_is_outside_two_year_window_and_order_is_not_indexed(self):
         rows = asana_index.build_index([
             task("old", "QEH / CX50 / US999F9999", modified="2022-01-01T00:00:00Z",

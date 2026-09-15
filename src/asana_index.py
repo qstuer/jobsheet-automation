@@ -38,7 +38,7 @@ _LABELED_PHONE_RE = re.compile(
     r"(?P<value>(?:\+?852[ -]?)?\d{4}[ -]?\d{4})"
 )
 _ASSET_RE = re.compile(
-    r"\bASSET(?:\s*(?:NO\.?))?\s*[#.:\-]?\s*"
+    r"\b(?:ASSET(?:\s*(?:NO\.?))?|W\.?O\.?|WORK\s*ORDER)\s*[#.:\-]?\s*"
     r"(?P<value>(?:\d[\d\- ]{3,}\d|\d{4,}))\b",
     re.IGNORECASE,
 )
@@ -49,6 +49,17 @@ _ROOM_RE = re.compile(
 _CONTACT_RE = re.compile(
     r"(?im)\b(?:contact(?:\s+person)?|attn\.?|attention)\s*[:#-]?\s*"
     r"(?P<value>[^\r\n,;|/]{2,50})"
+)
+_CONTACT_AFTER_PHONE_RE = re.compile(
+    r"(?im)(?:\+?852[ -]?)?\d{4}[ -]?\d{4}\s+"
+    r"(?P<value>[A-Z][A-Z .'-]{1,39})\s*$",
+    re.IGNORECASE,
+)
+_MONTHLY_PM_PROJECT_RE = re.compile(
+    r"^\s*20\d{2}\s+(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|"
+    r"MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|"
+    r"NOV(?:EMBER)?|DEC(?:EMBER)?)\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -107,6 +118,10 @@ def _request(url: str, params: dict, *, timeout: int = 30) -> dict:
 
 def _project_is_pm_cm(name: Optional[str]) -> Optional[str]:
     text = str(name or "").upper()
+    # Philips 的例行 PM 專案亦會只用「2026 Jun」這類月份名稱；這是
+    # 現行 Asana 結構，不可因標題沒有 PM 三個字而漏掉整月工作。
+    if _MONTHLY_PM_PROJECT_RE.fullmatch(text):
+        return "PM"
     pm = bool(re.search(r"\bPM\b|PREVENTI(?:VE|ATIVE)|PLANNED\s+MAINT", text))
     cm = bool(re.search(r"\bCM\b|CORRECTIVE|REPAIR|SERVICE\s+REQUEST", text))
     if pm == cm:
@@ -219,6 +234,10 @@ def _phones(text: str, *, excluded_numbers: Iterable[str] = ()) -> list[str]:
         if len(digits) == 8:
             if digits in excluded and not labeled:
                 continue
+            # 香港電話不會以 0/1 開頭；這類未標籤八位數通常是
+            # Asset Number。明確寫有 Phone/Tel 的值仍照原文保留。
+            if not labeled and digits[0] in {"0", "1"}:
+                continue
             result.append(digits)
     return _unique(result)
 
@@ -249,6 +268,12 @@ def _contacts(text: str) -> list[str]:
         value = re.sub(r"\s+", " ", match.group("value")).strip(" .,:;-")
         value = re.split(r"\b(?:phone|tel|mobile|asset)\b", value, 1,
                          flags=re.IGNORECASE)[0].strip(" .,:;-")
+        if sum(char.isalpha() for char in value) >= 2:
+            values.append(value)
+    # 很多 task description 只寫「25956917 Ms.Yan」，沒有 Contact
+    # 標籤；電話後同一行的純姓名仍可作低權重聯絡人證據。
+    for match in _CONTACT_AFTER_PHONE_RE.finditer(text or ""):
+        value = re.sub(r"\s+", " ", match.group("value")).strip(" .,:;-")
         if sum(char.isalpha() for char in value) >= 2:
             values.append(value)
     return _unique(values)
@@ -301,9 +326,13 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
     # A bare eight-digit number in a task title is also conventionally an
     # Order Number.  It is excluded only from the unlabelled-phone fallback.
     indexed_order_numbers += re.findall(r"(?<!\d)[56]\d{7}(?!\d)", name)
-    phones = _phones(combined_text, excluded_numbers=indexed_order_numbers)
-    contacts = _contacts(f"{name}\n{notes}")
     assets = _assets(f"{name}\n{notes}")
+    # 已被明確標成 Asset 的數字不可再變成未標籤電話證據。
+    phones = _phones(
+        combined_text,
+        excluded_numbers=[*indexed_order_numbers, *assets],
+    )
+    contacts = _contacts(f"{name}\n{notes}")
     department_rooms = _department_rooms(f"{name}\n{notes}")
     work_dates = _task_dates(task)
     task_ref = {
