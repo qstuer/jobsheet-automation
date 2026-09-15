@@ -72,23 +72,38 @@ def _planned_filename(task: dict) -> tuple[str, str]:
 
 
 def _dry_run_ocr_preview(ocr: dict) -> str:
-    """只在私有 dry-run 報告列出核對所需欄位；電話不寫入 Actions 日誌。"""
+    """Actions 只列出成功讀到哪些欄位，絕不輸出客戶資料原文。"""
     labels = (
         ("serial", "serial_candidates"),
         ("product", "product_raw"),
         ("hospital", "hospital_raw"),
         ("department_room", "department_room_raw"),
+        ("phone", "phone_candidates"),
+        ("contact", "contact_person_raw"),
         ("asset", "asset_candidates"),
         ("date", "service_date_raw"),
     )
-    parts = []
+    readable = []
     for label, key in labels:
         value = ocr.get(key)
         if isinstance(value, list):
-            value = "/".join(str(item) for item in value if item)
+            value = any(item for item in value)
         if value:
-            parts.append(f"{label}={value}")
-    return "; ".join(parts)
+            readable.append(label)
+    return (
+        "已讀欄位=" + ",".join(readable)
+        if readable else "未讀到可用欄位"
+    )
+
+
+def _public_planned_filename(row: dict, dry_run: bool) -> str:
+    """dry-run 的真正檔名只留在記憶體，不寫入公開 Actions 紀錄。"""
+    planned = row.get("planned")
+    if not planned:
+        return ""
+    if dry_run:
+        return "已產生（隱藏客戶資料）"
+    return str(planned)
 
 
 def _confirmed_pdf_name(value: str) -> str:
@@ -657,8 +672,9 @@ def main() -> int:
     log.info("=" * 60)
     for row in main_report:
         details = [row.get("status")]
-        if row.get("planned"):
-            details.append(f"預計檔名={row['planned']}")
+        public_planned = _public_planned_filename(row, dry_run)
+        if public_planned:
+            details.append(f"預計檔名={public_planned}")
         if row.get("ocr_preview"):
             details.append(f"OCR={row['ocr_preview']}")
         if row.get("ocr_metrics"):
@@ -683,10 +699,11 @@ def main() -> int:
             "|---|---|---|---|",
         ]
         for row in main_report:
+            public_planned = _public_planned_filename(row, dry_run)
             cells = (
                 row.get("file") or "",
                 row.get("status") or "",
-                row.get("planned") or "-",
+                public_planned or "-",
                 row.get("ocr_preview") or "-",
             )
             cells = tuple(str(value).replace("|", "\\|").replace("\n", " ")

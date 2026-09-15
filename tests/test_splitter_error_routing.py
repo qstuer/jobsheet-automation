@@ -298,12 +298,25 @@ class ProcessorPendingTests(unittest.TestCase):
             )
         self.assertEqual("預覽：可以可靠配對", result["status"])
         self.assertEqual("SR#61932685.pdf", result["planned"])
-        self.assertIn("serial=US123", result["ocr_preview"])
+        self.assertIn("serial", result["ocr_preview"])
+        self.assertIn("phone", result["ocr_preview"])
+        self.assertNotIn("US123", result["ocr_preview"])
         self.assertNotIn("25551234", result["ocr_preview"])
         upload.assert_not_called()
         move.assert_not_called()
         delete.assert_not_called()
         save.assert_not_called()
+
+    def test_dry_run_public_summary_hides_planned_filename(self):
+        row = {"planned": "SR#61932685.pdf"}
+        self.assertEqual(
+            "已產生（隱藏客戶資料）",
+            processor._public_planned_filename(row, dry_run=True),
+        )
+        self.assertEqual(
+            "SR#61932685.pdf",
+            processor._public_planned_filename(row, dry_run=False),
+        )
 
     def test_success_is_recorded_before_google_source_is_deleted(self):
         filename = "scan__job1_PM.pdf"
