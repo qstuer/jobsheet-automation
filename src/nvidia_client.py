@@ -142,11 +142,17 @@ def _preprocess_field_image(image: Image.Image, strong: bool = False) -> Image.I
 
 
 def _render_field_crop(pdf_doc: fitz.Document, page_idx: int, field: str,
-                       zoom: float, strong: bool = False) -> Image.Image:
+                       zoom: float, strong: bool = False,
+                       focused: bool = False) -> Image.Image:
     """按固定印刷版面只渲染一格，避免相鄰手寫值被分配到錯誤欄位。"""
     if field not in config.OCR_FIELD_BOXES:
         raise ValueError(f"未知 Jobsheet 欄位：{field}")
-    left, top, right, bottom = config.OCR_FIELD_BOXES[field]
+    boxes = (
+        config.OCR_FOCUSED_FIELD_BOXES
+        if focused and field in config.OCR_FOCUSED_FIELD_BOXES
+        else config.OCR_FIELD_BOXES
+    )
+    left, top, right, bottom = boxes[field]
     page = pdf_doc[page_idx]
     rect = page.rect
     clip = fitz.Rect(
@@ -166,6 +172,7 @@ def crop_jobsheet_field_card(
         fields,
         zoom: float = config.OCR_ZOOM_DEFAULT,
         strong: bool = False,
+        focused: bool = False,
 ) -> str:
     """把固定欄位做成有明確標籤和邊框的卡片，回傳 base64 JPEG。"""
     fields = tuple(fields)
@@ -190,7 +197,9 @@ def crop_jobsheet_field_card(
         y = outer + row * (panel_height + gap)
         draw.rectangle((x, y, x + panel_width, y + panel_height), outline="black", width=3)
         draw.text((x + 10, y + 10), _FIELD_DISPLAY_LABELS[field], fill="black")
-        crop = _render_field_crop(pdf_doc, page_idx, field, zoom, strong=strong)
+        crop = _render_field_crop(
+            pdf_doc, page_idx, field, zoom, strong=strong, focused=focused
+        )
         max_width = panel_width - 20
         max_height = image_height - 10
         scale = min(max_width / crop.width, max_height / crop.height)
@@ -219,7 +228,8 @@ def crop_jobsheet_serial(pdf_doc: fitz.Document, page_idx: int,
                          zoom: float = 5.0) -> str:
     """只渲染 SERIAL NO. 一格，供有爭議時精讀。"""
     return crop_jobsheet_field_card(
-        pdf_doc, page_idx, ("serial_candidates",), zoom=zoom, strong=True
+        pdf_doc, page_idx, ("serial_candidates",), zoom=zoom,
+        strong=zoom >= 6.0, focused=True,
     )
 
 
@@ -768,7 +778,8 @@ def ocr_jobsheet_focused_field(
     if field not in allowed:
         raise ValueError(f"不支援單格複核：{field}")
     image_b64 = crop_jobsheet_field_card(
-        pdf_doc, page_idx, (field,), zoom=zoom, strong=True
+        pdf_doc, page_idx, (field,), zoom=zoom,
+        strong=zoom >= 6.0, focused=True,
     )
     list_value = field in {"serial_candidates", "phone_candidates"}
     example_value = "[]" if list_value else "null"

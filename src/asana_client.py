@@ -52,7 +52,8 @@ HOSPITAL_ALIASES = {
     "TUENMUNHOSPITAL": "TMH",
     "NORTHDISTRICTHOSPITAL": "NDH",
     "GRANTHAMHOSPITAL": "GH",
-    "TUNGWAHHOSPITAL": "TUNGWAHHOSPITAL",
+    # 保留空格供 Asana typeahead 作真正的子字串搜尋；比較時仍會經 _norm。
+    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
 }
 
 
@@ -474,7 +475,9 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("work_order")
         reasons.append("HAWO/WO")
 
-    hospital_ok = bool(hosp and hospital_core(name) == hosp)
+    hospital_ok = bool(
+        hosp and _norm(hospital_core(name)) == _norm(hosp)
+    )
     product_ok = bool(product and _norm(product) in _norm(name))
     if hospital_ok:
         score += 20

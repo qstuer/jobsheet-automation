@@ -101,7 +101,7 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 3. 在 Asana 找候選工作，再用上述欄位交叉核對。
 4. 上傳 OneDrive，成功後才刪 `_SPLIT/` 來源。
 
-第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀，不再反覆傳送半頁表格。身分欄仍配不到 Asana 時，才第二次讀電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄。
+第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀；單格圖會裁走大部分印刷標籤及空白，只保留手寫值，並以普通／加強兩種影像避免重複同一誤讀。身分欄仍配不到 Asana 時，才第二次讀電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄；兩張卡的 ACTION DATE 不一致時，最後只再讀日期格。
 
 `Customer Name` 是醫院；`Dept./Room No.` 只可是樓層、病房或 asset。`Asset# 19130438` 會派生成 asset 證據，並從位置文字移除，絕不當作醫院或地點。內部新欄位叫 `hospital_raw`、`department_room_raw`；舊 `customer_raw`、`location_raw` 只作相容映射。
 
@@ -135,7 +135,7 @@ Asana 只找出一小批候選，最後核對在本機完成：
 5. 機身編號只可容許 1 個字的辨認差異；此時至少還要兩組證據支持。
    若 serial 三輪仍無法形成共識，只有在候選池恰好剩一筆，而且電話、asset、ACTION DATE 三項都與該完整 Asana task 精確相符時才可通過；缺任何一項仍送 `_PENDING`。
 6. 完成/未完成都可以是正確工作。`modified_at` 不代表服務日期；優先比較 ACTION DATE 與 Asana 描述、start/due 日期。
-   兩輪都抄到相同服務日期時，即使模型漏填 `date_source`，亦視為 ACTION DATE；單輪讀數仍不會採用。
+   兩輪都抄到相同服務日期時，即使模型漏填 `date_source`，亦視為 ACTION DATE；兩輪不一致時只重讀日期格，單輪讀數仍不會採用。
    手寫年份若明顯落在三個月範圍外（常見把 `6` 看成 `0/5`），只有在 Asana 候選日期屬最近三個月、月日相差不超過 14 天時才校正年份；最終仍須 serial 及其他證據，不能只靠日期命名。
 7. 只有已核對的短醫院碼才可搜尋或加分；`PYN` 與 `PYNEH` 視為同院，會用兩種短寫撈候選。未知短碼（例如模型幻覺的 PN、KWM、PYTV）會觸發醫院格重讀；詳細樓層只屬 Dept./Room，不會混入醫院名。
 8. 候選並列或證據不足，一律留在 `_PENDING`。

@@ -363,6 +363,29 @@ def _ocr_and_match(doc, job_type):
         except nvidia_client.NvidiaResponseError:
             log.warning("  輔助欄複核暫時無法完成，保留現有安全證據")
 
+    if task is None and not consensus.get("service_date_raw") and any(
+        reading.get("service_date_raw")
+        or "service_date_raw" in (reading.get("unreadable_fields") or [])
+        for reading in readings
+    ):
+        # ACTION DATE 是區分同一設備不同月份 PM 的關鍵。完整卡兩輪不一致
+        # 時，只再讀日期小格；使用普通/加強兩種影像，避免把同一個確定性
+        # 誤讀當成兩次獨立證據。
+        log.info("  ACTION DATE 兩輪不一致，只重讀日期格")
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "service_date_raw", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                log.warning(f"  日期單格 {zoom}x 暫時無法完成")
+                continue
+            readings.append(reading)
+            consensus = _consensus_ocr(readings)
+            if consensus.get("service_date_raw"):
+                break
+        task, tier = asana_client.find_task(consensus, job_type=job_type)
+
     metrics = nvidia_client.get_ocr_metrics()
     consensus["ocr_metrics"] = metrics
     cost = metrics.get("estimated_cost_cny_upper")

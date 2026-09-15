@@ -96,6 +96,17 @@ OCR_FIELD_BOXES = {
     "fault_symptom":   (0.055, 0.245, 0.955, 0.315),
     "action_taken":    (0.055, 0.307, 0.555, 0.500),
 }
+# 單格複核只保留手寫值附近，避免印刷標籤與表格線佔去大部分像素。
+# 外層欄位卡仍會顯示可靠的欄位名稱，因此模型毋須靠原表格標籤猜欄位。
+OCR_FOCUSED_FIELD_BOXES = {
+    "order_no":          (0.220, 0.122, 0.405, 0.162),
+    "product_raw":       (0.405, 0.122, 0.570, 0.162),
+    "serial_candidates": (0.570, 0.120, 0.770, 0.166),
+    "hospital_raw":      (0.180, 0.166, 0.575, 0.207),
+    "department_room_raw": (0.180, 0.198, 0.575, 0.242),
+    "phone_candidates":  (0.670, 0.198, 0.955, 0.242),
+    "service_date_raw":   (0.555, 0.323, 0.735, 0.365),
+}
 OCR_PRIMARY_CARD_FIELDS = (
     "order_no", "product_raw", "serial_candidates", "hospital_raw",
     "department_room_raw", "phone_candidates", "service_date_raw",

@@ -413,6 +413,18 @@ class NvidiaResponseTests(unittest.TestCase):
             list(fields), [call.args[2] for call in render.call_args_list]
         )
 
+    def test_focused_field_card_uses_value_only_crop(self):
+        from PIL import Image
+        with patch.object(
+                nvidia_client, "_render_field_crop",
+                return_value=Image.new("RGB", (320, 90), "white"),
+        ) as render:
+            nvidia_client.crop_jobsheet_field_card(
+                MagicMock(), 0, ("serial_candidates",), focused=True
+            )
+
+        self.assertTrue(render.call_args.kwargs["focused"])
+
     def test_business_gate_rejects_impossible_hospital_and_serials(self):
         candidate = {
             "order_no": None,
@@ -594,8 +606,49 @@ class ProcessorConsensusTests(unittest.TestCase):
         self.assertEqual(2, focused.call_count)
         self.assertEqual(3, find.call_count)
 
+    def test_disputed_action_date_gets_one_field_recheck(self):
+        primary = dict(self.ocr_a, service_date_raw="18/8/2026",
+                       date_source="ACTION_DATE")
+        identity = dict(self.ocr_a)
+        support = {"service_date_raw": "19/8/2026",
+                   "date_source": "ACTION_DATE", "unreadable_fields": []}
+        focused = {"service_date_raw": "18/8/2026",
+                   "date_source": "ACTION_DATE", "unreadable_fields": []}
+        task = {"gid": "task-1", "name": "Task 1"}
+        with patch.object(nvidia_client, "ocr_jobsheet_fields",
+                          return_value=primary), \
+                patch.object(nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=identity), \
+                patch.object(nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=support), \
+                patch.object(nvidia_client, "ocr_jobsheet_serial_candidates",
+                             return_value=["US123F4567"]), \
+                patch.object(nvidia_client, "ocr_jobsheet_focused_field",
+                             return_value=focused) as reread, \
+                patch.object(asana_client, "find_task",
+                             side_effect=[(None, 0), (None, 0),
+                                          (None, 0), (task, 2)]):
+            matched, tier, consensus = processor._ocr_and_match(MagicMock(), "PM")
+
+        self.assertEqual("task-1", matched["gid"])
+        self.assertEqual(2, tier)
+        self.assertEqual("18/8/2026", consensus["service_date_raw"])
+        reread.assert_called_once_with(
+            unittest.mock.ANY, 0, "service_date_raw",
+            zoom=config.OCR_FOCUSED_RETRY_ZOOMS[0],
+        )
+
 
 class AsanaMatchSafetyTests(unittest.TestCase):
+    def test_tung_wah_search_keeps_spaces_for_typeahead(self):
+        canonical = asana_client.hospital_core("Tung Wah Hospital")
+
+        self.assertEqual("Tung Wah Hospital", canonical)
+        self.assertEqual(
+            ["Tung Wah Hospital"],
+            asana_client.hospital_search_terms(canonical),
+        )
+
     def test_recent_task_can_correct_obviously_misread_service_year(self):
         ocr = {
             "order_no": None,
