@@ -36,6 +36,23 @@ def row(serial, *, phone="61234567", asset="19130438", hospital="PYNEH"):
     }
 
 
+def dated_row(serial, *, hospital="PYNEH", phone="25956206",
+              due_on="2026-08-20", completed_at="2026-08-19T05:28:07Z"):
+    device = row(serial, phone=phone, hospital=hospital)
+    device.update({
+        "product": "EPIQ", "product_families": ["EPIQ"],
+        "product_variants": ["EPIQ Elite"],
+    })
+    ref = device["task_refs"][0]
+    ref.update({
+        "product": "EPIQ", "product_family": "EPIQ",
+        "product_variant": "EPIQ Elite", "due_on": due_on,
+        "completed_at": completed_at, "work_dates": [due_on],
+    })
+    device["work_dates"] = [due_on]
+    return device
+
+
 def ocr(serial="USN16F0565", **values):
     data = {
         "serial_candidates": [serial] if serial else [], "serial_no": serial or None,
@@ -243,6 +260,77 @@ class LayeredSearchTests(unittest.TestCase):
         self.assertGreaterEqual(asana_client._score_index_task_ref(ref, ocr(), "PM"), 0)
         ref = dict(ref, work_dates=["2026-07-01"])
         self.assertEqual(-1000, asana_client._score_index_task_ref(ref, ocr(), "PM"))
+
+    def _date_joint_choice(self, devices, **changes):
+        values = ocr(
+            "US121B0509", product_raw="EPIQ Elite", hospital_raw="PYN",
+            phone_candidates=["25956206"], service_date_raw="19/08/2026",
+            date_source="ACTION_DATE",
+        )
+        values.update(changes)
+        asana_client.set_device_index({"schema_version": 3, "devices": devices})
+        prepared = asana_client._prepare_index_query(values)
+        scored = [
+            asana_client._score_index_device(device, prepared, "PM")
+            for device in devices
+        ]
+        return asana_client._select_date_joint_device(scored, prepared, "PM")
+
+    def test_date_joint_evidence_corrects_one_serial_character(self):
+        wrong_exact = dated_row(
+            "US121B0509", hospital="TMH", phone="24685160",
+            due_on="2026-08-12", completed_at="2026-08-12T07:35:59Z",
+        )
+        correct = dated_row("US121B0506")
+        selected, ambiguous = self._date_joint_choice([wrong_exact, correct])
+        self.assertFalse(ambiguous)
+        self.assertEqual("US121B0506", selected["row"]["serial"])
+
+    def test_date_joint_evidence_requires_matching_hospital(self):
+        selected, ambiguous = self._date_joint_choice([
+            dated_row("US121B0506", hospital="TMH"),
+        ])
+        self.assertIsNone(selected)
+        self.assertFalse(ambiguous)
+
+    def test_date_joint_evidence_requires_exact_phone(self):
+        selected, ambiguous = self._date_joint_choice([
+            dated_row("US121B0506", phone="25956207"),
+        ])
+        self.assertIsNone(selected)
+        self.assertFalse(ambiguous)
+
+    def test_date_joint_evidence_requires_date_within_one_day(self):
+        selected, ambiguous = self._date_joint_choice([
+            dated_row(
+                "US121B0506", due_on="2026-08-17",
+                completed_at="2026-08-17T05:28:07Z",
+            ),
+        ])
+        self.assertIsNone(selected)
+        self.assertFalse(ambiguous)
+
+    def test_date_joint_evidence_never_corrects_two_serial_characters(self):
+        selected, ambiguous = self._date_joint_choice([
+            dated_row("US121B0566"),
+        ])
+        self.assertIsNone(selected)
+        self.assertFalse(ambiguous)
+
+    def test_date_joint_evidence_keeps_multiple_devices_pending(self):
+        selected, ambiguous = self._date_joint_choice([
+            dated_row("US121B0506"), dated_row("US121B0508"),
+        ])
+        self.assertIsNone(selected)
+        self.assertTrue(ambiguous)
+
+    def test_structured_dates_take_precedence_over_old_note_dates(self):
+        ref = dated_row("US121B0506")["task_refs"][0]
+        ref["work_dates"] = ["2024-01-01", "2026-08-20"]
+        self.assertEqual(
+            [date(2026, 8, 20), date(2026, 8, 19)],
+            asana_client._index_dates(ref),
+        )
 
     def test_candidate_resolver_accepts_only_listed_c_number(self):
         candidates = [{"candidate_id": "C1", "device_key": "secret", "serial": "ABC12345"}]

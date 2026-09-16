@@ -504,12 +504,23 @@ def _gather_pool(order_no, serials, hosp, product,
 
 
 def _index_dates(ref: dict) -> List[date]:
+    # Structured Asana dates describe this task itself. Notes often contain
+    # dates copied from older PM visits, so they are only a fallback when both
+    # the due date and completion date are unavailable.
+    formal = [
+        _parse_date(str(value))
+        for value in (ref.get("due_on"), ref.get("completed_at"))
+        if value
+    ]
+    formal = list(dict.fromkeys(value for value in formal if value))
+    if formal:
+        return formal
     values = []
     for value in ref.get("work_dates") or []:
         parsed = _parse_date(str(value))
         if parsed:
             values.append(parsed)
-    return values
+    return list(dict.fromkeys(values))
 
 
 def _text_norm(value: Optional[str]) -> str:
@@ -721,6 +732,95 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     return score
 
 
+def _formal_index_ref_dates(ref: dict) -> List[date]:
+    """Return only task-level Asana dates safe for cross-device correction."""
+    values = [ref.get("due_on"), ref.get("completed_at")]
+    parsed = [_parse_date(str(value)) for value in values if value]
+    return list(dict.fromkeys(value for value in parsed if value))
+
+
+def _select_date_joint_device(scored: List[dict], ocr_data: dict,
+                              job_type: Optional[str]) -> tuple[Optional[dict], bool]:
+    """Resolve a one-character serial typo using one coherent task record.
+
+    Device rows aggregate years of locations and contacts. This exceptional
+    correction therefore requires product, hospital, full phone, PM/CM and a
+    formal Asana date to agree on the same historical task. The boolean is
+    true when more than one device meets every condition, which must remain
+    pending instead of falling back to ordinary serial ranking.
+    """
+    if job_type not in {"PM", "CM"} or ocr_data.get("date_source") != "ACTION_DATE":
+        return None, False
+    service_date = _parse_date(ocr_data.get("service_date_raw"))
+    serials = ocr_data.get("_index_serials") or _clean_candidates(
+        ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
+    )
+    wanted_product = ocr_data.get("_index_wanted_product") or product_group(
+        ocr_data.get("product") or ocr_data.get("product_raw")
+    )
+    wanted_hospitals = ocr_data.get("_index_wanted_hospitals") or _index_hospital_aliases(
+        ocr_data.get("hospital_raw") or ocr_data.get("customer")
+        or ocr_data.get("customer_raw")
+    )
+    wanted_phones = {
+        re.sub(r"\D", "", value)
+        for value in ocr_data.get("phone_candidates") or []
+        if 7 <= len(re.sub(r"\D", "", value)) <= 9
+    }
+    if not service_date or not serials or not wanted_product \
+            or not wanted_hospitals or not wanted_phones:
+        return None, False
+
+    matched_devices = []
+    for item in scored:
+        if item["row"].get("weak_identity") or item["serial_dist"] > 1:
+            continue
+        matching_refs = []
+        for ref in item["row"].get("task_refs") or []:
+            if ref.get("job_type") != job_type:
+                continue
+            ref_product = product_group(
+                ref.get("product_family") or ref.get("product")
+                or ref.get("product_variant")
+            )
+            if not ref_product or _family_similarity(wanted_product, ref_product) < 1.0:
+                continue
+            ref_hospitals = ref.get("hospital_aliases") or hospital_aliases(
+                ref.get("hospital") or ref.get("location")
+            )
+            if not any(
+                _key_similarity(left, right) == 1.0
+                for left in wanted_hospitals for right in ref_hospitals
+            ):
+                continue
+            ref_phones = {
+                re.sub(r"\D", "", value) for value in ref.get("phones") or []
+            }
+            if not wanted_phones.intersection(ref_phones):
+                continue
+            formal_dates = _formal_index_ref_dates(ref)
+            if not formal_dates or min(
+                abs((candidate - service_date).days) for candidate in formal_dates
+            ) > 1:
+                continue
+            matching_refs.append(ref)
+        if matching_refs:
+            matched_devices.append((item, matching_refs))
+
+    # Multiple devices with the same complete evidence are genuinely
+    # ambiguous, irrespective of which serial happens to be closest.
+    if len(matched_devices) > 1:
+        log.info("  日期联合证据仍对应多部设备，保留待核对")
+        return None, True
+    if len(matched_devices) != 1:
+        return None, False
+    selected, _ = matched_devices[0]
+    if selected["serial_dist"] != 1:
+        return None, False
+    log.info("  Serial 单字符错误由日期、医院、产品、电话及工作类型联合纠正")
+    return selected, False
+
+
 def _filter_ranked_device_scores(scored: List[dict], serials_visible: bool) -> List[dict]:
     """Apply shared safety gates and ordering to a pre-scored device table."""
     scored = [item for item in scored if item["eligible"]]
@@ -757,6 +857,10 @@ def _rank_index_devices(ocr_data: dict, job_type: Optional[str] = None) -> List[
 def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -> List[dict]:
     """Return at most ten private rows only when deterministic ranking is close."""
     ranked = _rank_index_devices(ocr_data, job_type)
+    prepared = _prepare_index_query(ocr_data)
+    _, joint_ambiguous = _select_date_joint_device(ranked, prepared, job_type)
+    if joint_ambiguous:
+        return []
     serials_visible = bool(
         ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
         or ocr_data.get("serial_no")
@@ -801,6 +905,11 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         _score_index_device(row, prepared, job_type)
         for row in _device_index.get("devices", [])
     ]
+    joint_device, joint_ambiguous = _select_date_joint_device(
+        raw_scores, prepared, job_type
+    )
+    if joint_ambiguous:
+        return [], True
     had_prefilter = any(
         item["product_similarity"] >= config.INDEX_PRODUCT_MIN_SIMILARITY
         and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY
@@ -820,7 +929,9 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
             round(item["product_similarity"] * 100),
             round(item["hospital_similarity"] * 100), sorted(item["support"]),
         )
-    if selected_device_key:
+    if joint_device is not None:
+        best = joint_device
+    elif selected_device_key:
         allowed = [
             item for item in scored
             if scored[0]["serial_similarity"] - item["serial_similarity"]
@@ -844,7 +955,8 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         best["serial_similarity"] - scored[1]["serial_similarity"]
         if best is scored[0] and len(scored) > 1 else 1.0
     )
-    accepted = bool(selected_device_key) or not serials_visible or len(scored) == 1 \
+    accepted = joint_device is not None or bool(selected_device_key) \
+        or not serials_visible or len(scored) == 1 \
         or gap > config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
     if not accepted:
         log.info(
