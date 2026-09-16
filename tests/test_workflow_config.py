@@ -81,6 +81,16 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertNotIn("jobsheet-process", text.lower())
         self.assertIn("python -m src.dry_run", text)
 
+    def test_twenty_sample_backtest_is_manual_and_read_only(self):
+        workflow = ROOT / ".github" / "workflows" / "jobsheet-backtest.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("python -m src.backtest", text)
+        self.assertIn(".jobsheet-control/backtest-20", text)
+        self.assertNotIn("repository_dispatch", text)
+        self.assertNotIn("onedrive:", text.lower())
+        self.assertNotIn("rclone move", text.lower())
+
     def test_asana_workspace_id_is_not_treated_as_a_secret(self):
         for workflow_name in (
             "jobsheet-process.yml", "jobsheet-order-lookup.yml",

@@ -10,6 +10,7 @@
 > 2026-09-14 安全翻新：PM 不足四張內容頁會停止並進 `_INCOMPLETE`；多輪 OCR 改為先取得欄位共識，Asana 正式使用 PM/CM project 類型；加入視覺防重複、耐久批次報告、PENDING 單檔重試及全程只讀測試。
 > 2026-09-15 辨認翻新：用保留的多批實單校準固定欄位，半頁 OCR 改成分格欄位卡；訂單、型號、serial、醫院會高倍獨立複核，只有有爭議的格才再讀。加入醫院／部門語意隔離、serial 形狀安全閘及 DeepSeek 用量報告。
 > 2026-09-15 配對翻新：私人 Asana 索引改為真正一個 Serial 一行；程序先按產品大類、醫院及 Serial 分層模糊搜尋，只有前兩名非常接近時才把最多 10 行交給圖片模型作受限複核。
+> 2026-09-16 回測工具：新增手動 `Jobsheet 20-Sample Backtest`，从 Google Drive 私人控制目录读取 20 份匿名实单及答案，只做 OCR／Asana 核对；不会写入或移动 Google Drive／OneDrive，公开摘要只显示 B01–B20、结果及用量。
 
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
@@ -148,6 +149,17 @@ task GID 即時讀完整名稱、描述、日期、project 和 Order Number，�
 更新解析規則後，手動刷新索引時必須勾選 `full_rebuild`，忽略舊索引並從 Asana
 完整重建；否則增量模式會沿用舊版已誤分類的電話／asset。平日資料更新則不勾選，
 只重新處理新增或修改過的工作。
+
+### 20 份私人實單回測
+
+手動工作 `Jobsheet 20-Sample Backtest` 只用作改版后的回归检查。20 份 PDF 和私人答案
+放在 `.jobsheet-control/backtest-20/`，文件只以 `B01`–`B20` 识别；工作会先拒绝完全重复的
+PDF，再使用当前设备索引逐份执行正式 OCR 与 Asana 最终读取。它直接调用只读辨认核心，
+不会读取正式 `_SPLIT` 队列，也没有任何 OneDrive 上传、Google Drive 移动或删除路径。
+公开 Actions 摘要只显示匿名编号、PASS/FAIL、图片调用次数、时间、tokens 和费用上限；
+Serial、电话、联系人、地点、Asana task 及预期答案都留在私人运行记忆体内。回测不通过
+属于模型品质结果，不会触发正式 pipeline 的连续失败告警；基础设施或私人清单损坏才令
+workflow 失败。
 
 第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀；單格圖會裁走大部分印刷標籤及空白，只保留手寫值，並以普通／加強兩種影像避免重複同一誤讀。身分欄仍配不到 Asana 時，才第二次讀 `CONTACT PERSON`、電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄；兩張卡的聯絡人、電話或 ACTION DATE 不一致時，最後只再讀有爭議的一格。
 

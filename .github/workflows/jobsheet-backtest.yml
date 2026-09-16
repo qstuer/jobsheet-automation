@@ -1,0 +1,79 @@
+name: Jobsheet 20-Sample Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ocr_provider:
+        description: '本次回测使用的图片服务'
+        required: true
+        default: deepseek
+        type: choice
+        options:
+          - deepseek
+          - nvidia
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-private-backtest
+  cancel-in-progress: false
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download private fixtures and current index
+        run: |
+          mkdir -p /tmp/jobsheet-backtest
+          rclone copy \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20" \
+            /tmp/jobsheet-backtest
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
+            /tmp/asana-device-index.json
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
+            /tmp/asana-device-index-manifest.json
+      - run: pip install -r requirements.txt
+      - name: Run 20 private samples without cloud writes
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest.json
+          OCR_PROVIDER: ${{ inputs.ocr_provider }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
+        run: python -m src.backtest
+      - name: Cleanup private files and rclone config
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -rf /tmp/jobsheet-backtest /tmp/asana-device-index.json /tmp/asana-device-index-manifest.json
