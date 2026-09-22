@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import fitz
@@ -204,10 +205,7 @@ def _near_serial_consensus(readings: list) -> list:
         seen_this_round = set()
         for value in reading.get("serial_candidates") or []:
             normalized = _norm_evidence(value)
-            plausible = (
-                bool(re.fullmatch(r"[A-Z]{2,3}[A-Z0-9]{6,9}", normalized))
-                and sum(char.isdigit() for char in normalized) >= 4
-            )
+            plausible = nvidia_client._valid_serial_token(value)
             if plausible and normalized not in seen_this_round:
                 entries.append((round_index, value, normalized))
                 seen_this_round.add(normalized)
@@ -229,6 +227,7 @@ def _consensus_ocr(readings: list) -> dict:
     if not readings:
         return {}
     result = {}
+    consensus_rejections = {}
     list_fields = {
         "serial_candidates", "phone_candidates", "asset_candidates",
         "work_order_candidates", "unreadable_fields",
@@ -245,12 +244,17 @@ def _consensus_ocr(readings: list) -> dict:
                 key = _norm_evidence(asana_client.hospital_core(value))
             elif field == "product_raw":
                 key = _norm_evidence(asana_client.normalize_product(value))
+            elif field == "service_date_raw":
+                parsed = nvidia_client._parse_action_date(value)
+                key = parsed.isoformat() if parsed else ""
             else:
                 key = _norm_evidence(value)
             if key:
                 buckets.setdefault(key, []).append(value)
         winners = [values for values in buckets.values() if len(values) >= 2]
         result[field] = winners[0][0] if len(winners) == 1 else None
+        if not result[field] and any(reading.get(field) for reading in readings):
+            consensus_rejections[field] = "conflicting_readings" if len(buckets) > 1 else "insufficient_valid_readings"
 
     for field in list_fields:
         buckets = {}
@@ -262,6 +266,8 @@ def _consensus_ocr(readings: list) -> dict:
                     buckets.setdefault(key, []).append(value)
                     seen_this_round.add(key)
         result[field] = [values[0] for values in buckets.values() if len(values) >= 2][:3]
+        if field != "unreadable_fields" and buckets and not result[field]:
+            consensus_rejections[field] = "no_repeated_candidate"
 
     # 完全一致仍是首選；但只要任何獨立輪次曾抄出另一個有效 serial，便保留
     # 「有爭議」標記。即使第三輪令其中一個讀數取得多數，也不能因此把曾見的
@@ -285,12 +291,17 @@ def _consensus_ocr(readings: list) -> dict:
     if not result.get("serial_candidates"):
         result["serial_candidates"] = _near_serial_consensus(readings)
         result["serial_ambiguous"] = bool(result["serial_candidates"])
+        if result["serial_candidates"]:
+            consensus_rejections.pop("serial_candidates", None)
 
     # prompt 已限定 service_date_raw 只能抄 ACTION DATE。若兩輪對日期本身有
     # 共識、但模型漏填可選的 date_source，不應因此丟掉最能區分同一設備
     # 不同月份 PM 的證據。單輪日期仍不會通過上方共識。
     if result.get("service_date_raw") and not result.get("date_source"):
         result["date_source"] = "ACTION_DATE"
+        consensus_rejections.pop("date_source", None)
+    parsed = nvidia_client._parse_action_date(result.get("service_date_raw"))
+    result["service_date_iso"] = parsed.isoformat() if parsed else None
 
     result["serial_no"] = next(iter(result.get("serial_candidates", [])), None)
     result["product"] = asana_client.normalize_product(result.get("product_raw"))
@@ -299,6 +310,19 @@ def _consensus_ocr(readings: list) -> dict:
         result.get("department_room_raw")
     )
     result["customer"] = result.get("hospital_raw")
+    # This private trace is never a source of matching evidence or a log entry.
+    # Keep every pass, including values subsequently rejected or outvoted.
+    result["_ocr_audit"] = {
+        "readings": [deepcopy({
+            "context": reading.get("_read_context", {}),
+            **reading.get("_ocr_audit", {
+                "raw": {key: reading[key] for key in nvidia_client._OCR_MODEL_FIELDS if key in reading},
+                "normalized": {key: value for key, value in reading.items() if not key.startswith("_")},
+                "rejections": {},
+            }),
+        }) for reading in readings],
+        "consensus_rejections": consensus_rejections,
+    }
     return result
 
 
@@ -311,7 +335,11 @@ def _ocr_and_match(doc, job_type):
     identity = nvidia_client.ocr_jobsheet_identity_fields(
         doc, 0, zoom=config.OCR_IDENTITY_ZOOM
     )
-    readings = [primary, identity]
+    def contextual(reading, stage, zoom, field=None):
+        return {**reading, "_read_context": {"stage": stage, "zoom": zoom, "field": field}}
+
+    readings = [contextual(primary, "primary", config.OCR_ZOOM_DEFAULT),
+                contextual(identity, "identity", config.OCR_IDENTITY_ZOOM)]
 
     def visible_fields(reading):
         return [
@@ -349,7 +377,7 @@ def _ocr_and_match(doc, job_type):
             except nvidia_client.NvidiaResponseError:
                 log.warning(f"  {field} 單格 {zoom}x 暫時無法完成")
                 continue
-            readings.append(reading)
+            readings.append(contextual(reading, "focused_identity", zoom, field))
             consensus = _consensus_ocr(readings)
             if consensus.get(field):
                 break
@@ -362,13 +390,16 @@ def _ocr_and_match(doc, job_type):
         serial_focus = []
         for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
             try:
-                candidates = nvidia_client.ocr_jobsheet_serial_candidates(
-                    doc, 0, zoom=zoom
+                reading = nvidia_client.ocr_jobsheet_serial_candidates(
+                    doc, 0, zoom=zoom, with_audit=True
                 )
             except nvidia_client.NvidiaResponseError:
                 log.warning(f"  serial 單格 {zoom}x 暫時無法完成")
                 continue
-            serial_focus.append({"serial_candidates": candidates})
+            # Compatibility for older callers/test fixtures returning a list.
+            if isinstance(reading, list):
+                reading = nvidia_client._normalize_ocr_data({"serial_candidates": reading})
+            serial_focus.append(contextual(reading, "serial_recheck", zoom, "serial_candidates"))
         readings.extend(serial_focus)
         consensus = _consensus_ocr(readings)
         task, tier = asana_client.find_task(consensus, job_type=job_type)
@@ -379,7 +410,7 @@ def _ocr_and_match(doc, job_type):
             support = nvidia_client.ocr_jobsheet_support_fields(
                 doc, 0, zoom=config.OCR_SUPPORT_ZOOM
             )
-            readings.append(support)
+            readings.append(contextual(support, "support", config.OCR_SUPPORT_ZOOM))
             consensus = _consensus_ocr(readings)
             log.info(f"  輔助欄共識：{visible_fields(consensus)}")
             task, tier = asana_client.find_task(consensus, job_type=job_type)
@@ -410,7 +441,7 @@ def _ocr_and_match(doc, job_type):
                 except nvidia_client.NvidiaResponseError:
                     log.warning(f"  {labels[field]} 單格 {zoom}x 暫時無法完成")
                     continue
-                readings.append(reading)
+                readings.append(contextual(reading, "focused_support", zoom, field))
                 consensus = _consensus_ocr(readings)
                 if consensus.get(field):
                     break

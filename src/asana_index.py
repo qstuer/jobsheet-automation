@@ -21,7 +21,7 @@ from typing import Iterable, Optional
 
 import requests
 
-from . import asana_client, config
+from . import asana_client, config, product_catalog
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +211,10 @@ def _task_job_type(task: dict, project_type: Optional[str]) -> Optional[str]:
 
 
 def _name_parts(name: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+    return _name_parts_with_review(name)[:4]
+
+
+def _name_parts_with_review(name: str) -> tuple:
     parts = [part.strip() for part in re.split(r"\s*/\s*|\s+\|\s+", name or "")]
     location = parts[0] if parts else ""
     serial = None
@@ -225,25 +229,45 @@ def _name_parts(name: str) -> tuple[str, Optional[str], Optional[str], Optional[
                 break
         if serial:
             break
+    candidates = []
+    # Never scan the tail after Serial for a product: it commonly contains
+    # CM, an engineer, Order Number or HAWO. Location remains a separate slot.
+    stop = serial_part_index + 1 if serial_part_index is not None else len(parts)
+    for index in range(1, stop):
+        candidate = parts[index]
+        if index == serial_part_index:
+            candidate = re.split(re.escape(serial), candidate, flags=re.I)[0].strip(" _,-;:")
+        info = product_catalog.inspect_product(candidate)
+        if product_catalog.indexable(info):
+            candidates.append((index, info))
+    confirmed = [item for item in candidates if item[1]["status"] in {"confirmed", "group_only"}]
+    chosen = None
+    review = {"status": "rejected", "reason": "no_safe_product_segment"}
+    if confirmed:
+        identities = {item[1]["canonical"] for item in confirmed}
+        if len(identities) == 1:
+            chosen = confirmed[0]
+        else:
+            review["reason"] = "conflicting_product_segments"
+    elif serial_part_index is not None:
+        # Preserve extensibility for unknown model-like names, but only in
+        # the conventional Product slot and mark them as unconfirmed.
+        positional = [item for item in candidates if item[0] in {serial_part_index - 1, serial_part_index}]
+        if len(positional) == 1:
+            chosen = positional[0]
     product_variant = None
     product_part_index = None
-    # Current Asana titles normally place Product immediately before Serial.
-    # This also learns products not present in KNOWN_PRODUCTS.
-    if serial_part_index is not None and serial_part_index >= 2:
-        candidate = parts[serial_part_index - 1]
-        if re.search(r"[A-Za-z]{2}", candidate) and not re.fullmatch(r"[56]\d{7}", candidate):
-            product_variant = candidate
-            product_part_index = serial_part_index - 1
-    if not product_variant:
-        for index, part in enumerate(parts[1:], 1):
-            if asana_client.product_group(part):
-                product_variant = part
-                product_part_index = index
-                break
+    if chosen:
+        product_part_index, info = chosen
+        product_variant = info["variant"]
+        review = {"status": info["status"], "reason": info["reason"]}
     if product_part_index and product_part_index > 1:
-        location = " / ".join(parts[:product_part_index])
+        # Skip explicit job/reference segments, not departments or rooms.
+        location = " / ".join(part for index, part in enumerate(parts[:product_part_index])
+                              if index == 0 or product_catalog.inspect_product(part)["reason"] not in {
+                                  "job_type_not_product", "reference_not_product", "identifier_not_product"})
     product = asana_client.product_group(product_variant)
-    return location, product, product_variant, serial
+    return location, product, product_variant, serial, review
 
 
 def _phones(text: str, *, excluded_numbers: Iterable[str] = ()) -> list[str]:
@@ -342,7 +366,7 @@ def _device_key(location: str, product: Optional[str], serial: Optional[str]) ->
 
 def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[dict]:
     name = str(task.get("name") or "").strip()
-    location, product, product_variant, serial = _name_parts(name)
+    location, product, product_variant, serial, product_review = _name_parts_with_review(name)
     notes = str(task.get("notes") or "")
     if not location and not product and not serial:
         return None
@@ -392,6 +416,8 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
         "product": product or "",
         "product_family": product or "",
         "product_variant": product_variant or "",
+        "product_parse_status": product_review["status"],
+        "product_parse_reason": product_review["reason"],
         "serial": serial or "",
         "phones": phones,
         "contacts": contacts,
@@ -604,6 +630,8 @@ def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
     old_unparsed = 0
     if existing_index:
         validate_index(existing_index)
+        if existing_index.get("product_parser_version") != product_catalog.PARSER_VERSION:
+            raise AsanaIndexError("產品解析版本已更新，請完整重建索引，不能增量沿用舊產品欄")
         existing_max = str(existing_index.get("max_task_modified_at") or "")
         old_unparsed = int(existing_index.get("unparsed_task_count") or 0)
         for original in existing_index.get("devices") or []:
@@ -674,6 +702,7 @@ def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
     merged_count = max(0, sum(len(row.get("task_refs") or []) for row in rows) - len(rows))
     return {
         "schema_version": INDEX_SCHEMA_VERSION,
+        "product_parser_version": product_catalog.PARSER_VERSION,
         "generated_at": stamp,
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),
@@ -694,6 +723,8 @@ def build_index(tasks: Iterable[dict], *, generated_at: Optional[str] = None,
 def build_from_asana(*, window_start: Optional[date] = None,
                      window_end: Optional[date] = None,
                      existing_index: Optional[dict] = None) -> dict:
+    if existing_index and existing_index.get("product_parser_version") != product_catalog.PARSER_VERSION:
+        raise AsanaIndexError("產品解析版本已更新，請完整重建索引，不能增量沿用舊產品欄")
     projects = list(iter_projects())
     tasks: OrderedDict[str, dict] = OrderedDict()
     for project in projects:
@@ -814,7 +845,7 @@ def write_outputs(index: dict, output_dir: Path) -> None:
                 "alias_sources": " ; ".join(row.get("alias_sources") or []),
             })
     manifest = {key: index.get(key) for key in (
-        "schema_version", "generated_at", "window_start", "window_end",
+        "schema_version", "product_parser_version", "generated_at", "window_start", "window_end",
         "max_task_modified_at", "project_count", "task_count",
         "task_count_in_window", "unparsed_task_count", "device_count",
         "merged_task_count", "location_count",

@@ -88,6 +88,8 @@ INDEX_SERIAL_MIN_SIMILARITY = 0.50
 INDEX_SERIAL_CLOSE_GAP = 0.10
 INDEX_VISION_CANDIDATE_LIMIT = 10
 INDEX_TASK_DATE_MAX_DAYS = 31
+# Asset 只加輔助分；編輯相似率以整數百分比四捨五入後比較。
+ASSET_MIN_SIMILARITY_PERCENT = 70
 
 # === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
 OCR_ZOOM_DEFAULT  = 3.0   # 第一張分格欄位卡；不再把半頁表格原樣交給模型

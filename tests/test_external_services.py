@@ -374,7 +374,9 @@ class NvidiaResponseTests(unittest.TestCase):
             "work_order_candidates", "service_date_raw", "date_source",
             "unreadable_fields",
             "serial_no", "product", "customer",
+            "_ocr_audit", "service_date_iso",
         })
+        self.assertNotIn("notes", result["_ocr_audit"]["raw"])
 
     def test_ocr_prompt_contains_no_realistic_example_values(self):
         response = self._payload(

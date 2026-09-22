@@ -32,6 +32,9 @@ KNOWN_PRODUCTS = [
 
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
+PRODUCT_GROUP_NAMES = {"EPIQ", "Affiniti", "CX"}
+# Confirmed spelling variant, not permission to invent a missing suffix.
+OCR_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G", *sorted(PRODUCT_GROUP_NAMES)]
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -121,16 +124,30 @@ def _lev(a: str, b: str) -> int:
 
 
 def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
-    """把 OCR 型號對照已知清單校正（EPLQ 5G → EPIQ 5G）。太離譜則原樣回傳。"""
+    """Only normalize unambiguous spellings; never invent model digits/suffixes."""
     if not ocr_product:
         return None
-    target = _norm(ocr_product)
-    best, best_d = None, 99
-    for p in KNOWN_PRODUCTS:
-        d = _lev(target, _norm(p))
-        if d < best_d:
-            best_d, best = d, p
-    return best if best_d <= MAX_PRODUCT_DIST else ocr_product
+    # Keep '+' meaningful (the general evidence normalizer drops punctuation).
+    def key(value):
+        return re.sub(r"[^A-Z0-9+]", "", value.upper())
+    target = key(ocr_product)
+    if target == "EPIQ7PLUS":
+        return "EPIQ 7+"
+    exact = [p for p in OCR_PRODUCT_NAMES if key(p) == target]
+    if exact:
+        return exact[0]
+    # A broad family is useful evidence in its own right, not a blank model.
+    # Typo correction must preserve all observed model numbers and '+' signs.
+    candidates = [p for p in OCR_PRODUCT_NAMES
+                  if re.findall(r"\d+", key(p)) == re.findall(r"\d+", target)
+                  and ("+" in key(p)) == ("+" in target)
+                  and (not re.search(r"\d", target)
+                       or re.split(r"\d+", key(p))[-1] == re.split(r"\d+", target)[-1])]
+    distances = [(p, _lev(target, key(p))) for p in candidates]
+    best_d = min((d for _, d in distances), default=99)
+    best = [p for p, d in distances if d == best_d]
+    # Very short tokens are too ambiguous to correct by edit distance.
+    return best[0] if len(target) >= 4 and best_d <= MAX_PRODUCT_DIST and len(best) == 1 else ocr_product
 
 
 def product_family(value: Optional[str]) -> Optional[str]:
@@ -142,26 +159,8 @@ def product_family(value: Optional[str]) -> Optional[str]:
     """
     if not value:
         return None
-    def family_key(raw: str) -> str:
-        normalized = _norm(raw)
-        if normalized.startswith("AFFINITI"):
-            normalized = re.sub(r"G$", "", normalized)
-        # Engineers use both the printed ``EPIQ 7+`` and the written
-        # ``EPIQ 7 Plus``.  They are one product family; raw spellings remain
-        # in the private index for audit.
-        if normalized.startswith("EPIQ"):
-            normalized = re.sub(r"PLUS$", "", normalized)
-        return normalized
-
-    normalized = family_key(value)
-    best = None
-    best_distance = 99
-    for known in KNOWN_PRODUCTS:
-        family_norm = family_key(known)
-        distance = _lev(normalized, family_norm)
-        if distance < best_distance:
-            best, best_distance = known, distance
-    return best if best_distance <= MAX_PRODUCT_DIST else normalize_product(value)
+    canonical = normalize_product(value)
+    return "Affiniti 70" if canonical == "Affiniti 70G" else canonical
 
 
 def product_group(value: Optional[str]) -> Optional[str]:
@@ -539,6 +538,36 @@ def _digit_distance(left: str, right: str) -> int:
     return _lev(re.sub(r"\D", "", left), re.sub(r"\D", "", right))
 
 
+def _asset_similarity_percent(left: str, right: str) -> int:
+    """Digit edit similarity, rounded half-up; absent/short IDs add nothing."""
+    left = re.sub(r"\D", "", str(left or ""))
+    right = re.sub(r"\D", "", str(right or ""))
+    if min(len(left), len(right)) < 4:
+        return 0
+    length = max(len(left), len(right))
+    matched = length - _lev(left, right)
+    # Integer arithmetic avoids float boundaries and Python's bankers' round.
+    return (200 * matched + length) // (2 * length)
+
+
+def _asset_match_level(wanted, stored) -> int:
+    """0=no bonus, 1=fuzzy bonus, 2=exact bonus; never a negative score.
+
+    Use the best pair once, not one bonus per repeated/historical value.
+    Rounded 100% is not necessarily an exact identifier.
+    """
+    lefts = {re.sub(r"\D", "", str(value or "")) for value in (wanted or [])}
+    rights = {re.sub(r"\D", "", str(value or "")) for value in (stored or [])}
+    lefts = {value for value in lefts if len(value) >= 4}
+    rights = {value for value in rights if len(value) >= 4}
+    if lefts & rights:
+        return 2
+    if any(_asset_similarity_percent(left, right) >= config.ASSET_MIN_SIMILARITY_PERCENT
+           for left in lefts for right in rights):
+        return 1
+    return 0
+
+
 def _key_similarity(left: Optional[str], right: Optional[str]) -> float:
     left_key, right_key = _norm(left), _norm(right)
     if not left_key or not right_key:
@@ -637,11 +666,8 @@ def _score_index_device(row: dict, ocr_data: dict,
         (_digit_distance(left, right) for left in wanted_phones for right in row_phones
          if 7 <= len(left) <= 9 and 7 <= len(right) <= 9), default=99,
     )
-    wanted_assets = [re.sub(r"\D", "", value) for value in ocr_data.get("asset_candidates") or []]
-    row_assets = [re.sub(r"\D", "", value) for value in row.get("assets") or []]
-    asset_dist = min(
-        (_digit_distance(left, right) for left in wanted_assets for right in row_assets
-         if len(left) >= 4 and len(right) >= 4), default=99,
+    asset_level = _asset_match_level(
+        ocr_data.get("asset_candidates"), row.get("assets"),
     )
     contact_similarity = max(
         (_similarity(ocr_data.get("contact_person_raw"), value)
@@ -658,9 +684,9 @@ def _score_index_device(row: dict, ocr_data: dict,
         support.add("phone_exact")
     elif phone_dist == 1:
         support.add("phone_fuzzy")
-    if asset_dist == 0:
+    if asset_level == 2:
         support.add("asset_exact")
-    elif asset_dist == 1:
+    elif asset_level == 1:
         support.add("asset_fuzzy")
     if contact_similarity >= 0.75:
         support.add("contact")
@@ -671,7 +697,7 @@ def _score_index_device(row: dict, ocr_data: dict,
         and (not serials or serial_similarity >= config.INDEX_SERIAL_MIN_SIMILARITY)
     )
     auxiliary = (
-        (1 if phone_dist == 0 else 0), (1 if asset_dist == 0 else 0),
+        (1 if phone_dist == 0 else 0), asset_level,
         hospital_similarity, product_similarity, contact_similarity,
     )
     return {
@@ -692,7 +718,7 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     if job_type and ref_type == job_type:
         score += 20
     service_date = (
-        _parse_date(ocr_data.get("service_date_raw"))
+        _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
         if ocr_data.get("date_source") == "ACTION_DATE" else None
     )
     dates = _index_dates(ref)
@@ -701,8 +727,11 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
         if delta > config.INDEX_TASK_DATE_MAX_DAYS:
             return -1000
         score += 30 if delta <= 3 else 20 if delta <= 14 else 10
-    for field, points in (("phones", 25), ("assets", 20)):
-        wanted_key = "phone_candidates" if field == "phones" else "asset_candidates"
+    # Asset is a bonus only and uses the same 70% rule at all three layers.
+    asset_level = _asset_match_level(ocr_data.get("asset_candidates"), ref.get("assets"))
+    score += 20 if asset_level == 2 else 10 if asset_level == 1 else 0
+    for field, points in (("phones", 25),):
+        wanted_key = "phone_candidates"
         wanted = [re.sub(r"\D", "", value) for value in ocr_data.get(wanted_key) or []]
         stored = [re.sub(r"\D", "", value) for value in ref.get(field) or []]
         if any(left and left == right for left in wanted for right in stored):
@@ -751,7 +780,7 @@ def _select_date_joint_device(scored: List[dict], ocr_data: dict,
     """
     if job_type not in {"PM", "CM"} or ocr_data.get("date_source") != "ACTION_DATE":
         return None, False
-    service_date = _parse_date(ocr_data.get("service_date_raw"))
+    service_date = _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
     serials = ocr_data.get("_index_serials") or _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
@@ -1240,21 +1269,15 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("phone_fuzzy")
         reasons.append("phone differs by 1")
 
-    assets = [re.sub(r"\D", "", value)
-              for value in ocr_data.get("asset_candidates", [])]
-    task_assets = _task_assets(task)
-    if any(len(value) >= 4 and value == candidate
-           for value in assets for candidate in task_assets):
+    asset_level = _asset_match_level(ocr_data.get("asset_candidates"), _task_assets(task))
+    if asset_level == 2:
         score += 35
         support.add("asset_exact")
         reasons.append("asset")
-    elif any(
-        len(value) >= 4 and len(candidate) >= 4 and _lev(value, candidate) == 1
-        for value in assets for candidate in task_assets
-    ):
+    elif asset_level == 1:
         score += 15
         support.add("asset_fuzzy")
-        reasons.append("asset differs by 1")
+        reasons.append("asset similarity bonus")
 
     work_orders = [re.sub(r"\D", "", value)
                    for value in ocr_data.get("work_order_candidates", [])]
@@ -1308,7 +1331,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
 
     service_date = None
     if ocr_data.get("date_source") == "ACTION_DATE":
-        service_date = _parse_date(ocr_data.get("service_date_raw"))
+        service_date = _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
     task_dates = _task_dates(task)
     date_delta = None
     date_year_corrected = False

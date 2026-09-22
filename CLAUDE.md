@@ -12,6 +12,8 @@
 > 2026-09-15 配對翻新：私人 Asana 索引改為真正一個 Serial 一行；程序先按產品大類、醫院及 Serial 分層模糊搜尋，只有前兩名非常接近時才把最多 10 行交給圖片模型作受限複核。
 > 2026-09-16 回測工具：新增手動 `Jobsheet 20-Sample Backtest`，从 Google Drive 私人控制目录读取 20 份匿名实单及答案，只做 OCR／Asana 核对；不会写入或移动 Google Drive／OneDrive，公开摘要只显示 B01–B20、结果及用量。
 
+> 2026-09-17 分步改善：先修回測判分，Serial 相同不代表選對當次工作；進度見 `docs/JOBSHEET_IMPROVEMENT_PROGRESS.md`。本機修改不代表已部署，未完成私人答案核對前不得宣稱全體驗收通過。
+
 這是本專案唯一主要說明。人或 AI 接手時，先讀完本檔；不要從舊聊天猜目前架構。
 
 ## 1. 這套系統做甚麼
@@ -150,6 +152,46 @@ task GID 即時讀完整名稱、描述、日期、project 和 Order Number，�
 完整重建；否則增量模式會沿用舊版已誤分類的電話／asset。平日資料更新則不勾選，
 只重新處理新增或修改過的工作。
 
+2026-09-18本機產品解析改善（未部署）：不再直接把Serial前一段或任意含字母的
+文字當產品。已確認產品優先在Serial之前的欄段尋找；CM／PM、HAWO／WO、訂單號、
+Serial及明顯非產品文字不能成為產品。`CM10`／`CM12`並非獨立`CM`類型碼，不會一律刪除。
+未知但形狀合理的產品只在正常產品位置保留，標為未確認；多個已確認型號互相衝突則不猜。
+task參考增加 `product_parse_status`／`product_parse_reason`，不保存完整任務標題或Order Number。
+索引schema仍為3，另加 `product_parser_version=1`；增量刷新遇到舊解析版本會在Asana
+查詢前要求完整重建。Stage B仍可讀舊schema 3，不會因本機開發中斷正式流程。
+
+`src/product_catalog.py`可從本機索引生成私人產品小表（JSON及Markdown），不連網，
+不替換正式索引，也不自動加入OCR提示。分開「既有清單確認的型號／同款寫法」、
+「只到大類」及「待核對」；不同Serial計數，不把同一設備多次PM當成多部設備。
+頻率不會自動升格成確認。表中不包含Serial、task GID、Order Number、電話或完整標題；
+待核對文字仍視為私人資料，必須留在本機忽略的 `tmp/`，不放Git或公開日誌。
+
+```powershell
+python -m src.product_catalog --index tmp/rebuilt-index/asana-device-index.json --output-dir tmp/product-review-20260918
+```
+
+這份表只反映已保存的索引快照。旧索引缺乏完整原標題，不能據此宣稱已修好全部設備
+的產品歸屬；完整修復仍須獲准後重新讀Asana建立索引。產品與Serial規律提示另一步實作。
+
+### 產品／Serial 聯合辨認實驗（本機，尚未啟用）
+
+`src/vision_knowledge.py`從新解析版、產品已確認的設備資料統計常見序號格式。
+至少3部不同設備才成為常見提示；同一設備的重複工作不加樣本數，未確認或大類衝突的
+設備不參與。模型只收到產品詞表、已確認醫院簡寫及序號長度／字母數字位置／字母前綴，
+沒有完整Serial、task答案或固定數字。少見格式不能因此被判錯，清楚筆跡優先。
+
+實驗入口 `nvidia_client.read_joint_identity_image` 同看產品、Serial及醫院格，
+分別回傳原始抄錄與輔助判斷；輔助判斷不覆蓋原文、不算第二票、不直接作上傳依據。
+含`?`的Serial只留私人診斷，不會刪除問號後拿剩下的字串去配對。
+正式Stage B的首讀／複核入口目前未接入這份知識，避免未驗收便改自動流程。
+
+`python -m src.vision_experiment`可對單一PDF做無知識／有知識的同圖對照；使用目前
+配置的同一模型、不切後備、不查Asana、不切頁、不上傳。必須提供已排除該機器全部
+歷史工作的私人知識檔，與PDF的SHA-256一致；輸出只允許本機tmp，已存在則拒絕覆蓋。
+未給`--allow-model-calls`只做準備檢查；給了亦須有對應供應商環境密鑰，否則在呼叫前停止。
+模型回覆成功不等於答對：工具先記 `NOT_SCORED`，原文及輔助結果需對照獨立原件答案評分。
+2026-09-18已備妥20份私人對照輸入；本機無模型key，尚未真實對照。詳見分步進度文件。
+
 ### 20 份私人實單回測
 
 手動工作 `Jobsheet 20-Sample Backtest` 只用作改版后的回归检查。20 份 PDF 和私人答案
@@ -160,6 +202,69 @@ PDF，再使用当前设备索引逐份执行正式 OCR 与 Asana 最终读取�
 Serial、电话、联系人、地点、Asana task 及预期答案都留在私人运行记忆体内。回测不通过
 属于模型品质结果，不会触发正式 pipeline 的连续失败告警；基础设施或私人清单损坏才令
 workflow 失败。
+
+回測答案清單現支援 schema 2（不是設備索引 schema）：樣本需有
+`review_status=confirmed|unreviewed` 及 `reference_date`（`YYYY-MM-DD` 或 null）。
+有日期時，`reference_date_source` 只能是 `original_upload` 或 `scan_record`，不能
+以重跑當日補值。此階段日期只保存供驗收，尚未改動正式配對日期規則。
+已確認答案必須有私人 `review_note`，以及以下一種 `expected`：
+
+- `kind=match`：保存 `serial`、`task_gid`、`filename`（完整安全 PDF 名稱）；三者及 Asana PM／CM 都吻合才算配對通過。
+- `kind=pending`：經獨立核對確定不能唯一選擇；程式不得回傳任何 task。
+
+舊 schema 1 仍可診斷，但 Serial／訂單吻合也只標 `UNVERIFIED`，不算嚴格通過。
+schema 2 答案仍有爭議時用 `review_status=unreviewed`；`expected.kind=unreviewed`
+表示尚無答案。不得把當次配對器選中的 task 當正解。
+報告分列設備、具體工作、預計名稱、Asana 類型、圈選及頁數，它不是全流程通過率。
+回測先從原件讀取圈選，清單類型只用來判分，不作模型提示。讀不清、非CM／PM或
+與已核實類型不符時停止該份配對，圈選標FAIL；即使預期pending也不能因此算通過。
+圈選通過才把實際讀到的類型交給配對器；模型用量包含圈選及其一次放寬框重讀。
+逐欄準確率及全流程仍標 `NOT_TESTED`；這些本機改動尚未完成真實模型回測或上線。
+CM 非 1 頁、PM 非 4 頁的正確配對只算 `DIAGNOSTIC_ONLY`；頁數正確仍不能代表
+checklist 內容完整。同 task 的不同 PDF 標為重複工作，未知 task 時不宣稱工作互異。
+
+欄位卡的PDF渲染倍率與輸出尺寸同步增加：3x寬1200px、4x寬1600px、5x寬2000px、
+6x寬2400px，最高6x，避免放大後又縮回1200px。這不能復原掃描原件沒有的細節，
+也不等於模型準確率已提高。提示詞同時抄錄打印、打字及手寫值，不把印刷欄名當答案。
+圈選只接受單獨CM／PM／FCO／INS；解釋句、否定句或多個選項一律UNKNOWN，不猜類型。
+
+2026-09-18本機第三步（尚未部署）：每次成功解析的OCR欄位分開保存原始抄錄、
+整理後資料及拒絕原因，放在私人記憶體 `_ocr_audit`。最終辨認結果保留每輪的階段、
+倍率、欄位和快照；包括格式不合的Serial、未知醫院碼、被排除的產品／電話／日期。
+這份診斷資料不參與配對，不寫公開日誌或批次報告，亦不會自動上傳／持久化。
+原有 `*_raw` 名稱為兼容保留，仍是通過安全檢查的值；真正未修改的模型抄錄看
+`_ocr_audit.raw`（多輪結果在 `_ocr_audit.readings`）。不完整JSON及錯誤型別仍報錯重試。
+
+同一天的日/月/年、兩位年份、不同分隔符及明確年/月/日寫法按日期本身取得共識，
+新增 `service_date_iso` 供Asana比較，保留原來顯示文字。仍須至少兩輪一致；不合法日期、
+明確非ACTION DATE及超出现有時間範圍的日期不能用診斷原文復活。上傳日期後備尚未加入。
+
+2026-09-18本機第五步A（尚未部署）：Asset統一使用數字編輯相似率，按較長編號長度
+計算並四捨五入為整數百分比；至少70%才加輔助分，完全相同加更多。設備排名、歷史task
+預選及最後即時task核對共用同一判準；空白、少於4位、缺失或不符都不扣分。同一欄多個
+候選／歷史寫法只取最佳一組，不重複累加。電話仍沿用原有規則，不能套用Asset的寬鬆門檻。
+Serial可辨認時不要求Asset必填；Serial完全讀不到的舊版四項精確身份救援暫未放寬，
+70%模糊Asset不能冒充那項規則的精確證據。此步沒有更改日期規則，亦未完成真實回測。
+
+產品只讀到 `EPIQ`、`Affiniti` 或 `CX` 時保留大類，不補造數字或後綴。校正不能更改
+已有型號數字／數字後綴；最近寫法並列時不按清單順序猜。已確認 `Affiniti 70G`
+寫法仍保留，`EPIQ 7 Plus`與`EPIQ 7+`可整理為同款；私人產品詞表及Serial規律尚未建立。
+
+本機只讀盤點（不呼叫模型、Asana 或雲端）：
+
+```powershell
+$env:JOBSHEET_BACKTEST_DIR = 'tmp/backtest-20-upload'
+python -m src.backtest --audit-fixtures
+```
+
+只回傳匿名編號、頁數、答案／日期準備狀態及重複工作關係。私人答案必須留在
+已忽略的本機 `tmp/` 或 Google Drive 私人控制資料夾，不提交 Git。
+已覆核答案可附 `source_sha256`（64位小寫十六進位）；有指紋時必須與實際PDF完全
+吻合，否則在OCR前停止。匿名檔名不能取代來源核對，同名舊預覽不得當作當前原件。
+2026-09-17本機私人覆核清單另存 `manifest-reviewed.json`：19份確認工作、1份跨頁
+身份衝突仍未確認；這是人工／Asana資料核對，不是模型準確率。尚未替換雲端舊清單，
+測試新清單時須明確設定 `JOBSHEET_BACKTEST_MANIFEST` 指向它。完整進度及原件限制見
+`docs/JOBSHEET_IMPROVEMENT_PROGRESS.md`。
 
 第一輪把固定格子裁開，組成有清楚標籤及邊框的欄位卡；第二輪只以 4x 高倍獨立複核 `ORDER NO.`、`PRODUCT`、`SERIAL NO.`、`Customer Name`。兩輪不一致或不合格式時，只把有爭議的一格以 5x/6x 重讀；單格圖會裁走大部分印刷標籤及空白，只保留手寫值，並以普通／加強兩種影像避免重複同一誤讀。身分欄仍配不到 Asana 時，才第二次讀 `CONTACT PERSON`、電話、asset、HAWO/WO 及 ACTION DATE 等輔助欄；兩張卡的聯絡人、電話或 ACTION DATE 不一致時，最後只再讀有爭議的一格。
 
