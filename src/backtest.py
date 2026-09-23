@@ -281,6 +281,18 @@ def _checkpoint(rows: list[dict]) -> None:
         temporary.replace(path)
 
 
+def _select_samples(samples: list[dict], selection: str) -> list[dict]:
+    """Private test branch can run a tiny subset before the full 20-sample retry."""
+    if not selection.strip():
+        return samples
+    requested = [part.strip() for part in selection.split(",")]
+    available = {sample["sample_id"] for sample in samples}
+    if (not all(requested) or len(requested) != len(set(requested))
+            or set(requested) - available):
+        raise BacktestError("回測樣本選擇無效")
+    return [sample for sample in samples if sample["sample_id"] in requested]
+
+
 def run() -> list[dict]:
     fixture_dir = Path(os.environ.get(BACKTEST_DIR_ENV, "/tmp/jobsheet-backtest"))
     manifest_path = Path(
@@ -288,6 +300,7 @@ def run() -> list[dict]:
     )
     samples = _load_manifest(manifest_path)
     inventory = {row["sample_id"]: row for row in audit_fixtures(samples, fixture_dir)}
+    samples = _select_samples(samples, os.environ.get("JOBSHEET_BACKTEST_SAMPLE_IDS", ""))
 
     index_path = Path(os.environ.get(INDEX_FILE_ENV, "/tmp/asana-device-index.json"))
     index_manifest = Path(
@@ -325,8 +338,8 @@ def run() -> list[dict]:
         _append_summary(rows, Path(summary_path))
     passed = sum(row["status"] == "PASS" for row in rows)
     log.info(
-        "严格配对通过=%s/20；答案未核验=%s；不是全流程验收；OneDrive 写入=0",
-        passed, sum(row["status"] == "UNVERIFIED" for row in rows),
+        "严格配对通过=%s/%s；答案未核验=%s；不是全流程验收；OneDrive 写入=0",
+        passed, len(rows), sum(row["status"] == "UNVERIFIED" for row in rows),
     )
     return rows
 

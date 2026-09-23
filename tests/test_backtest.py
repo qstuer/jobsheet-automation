@@ -12,6 +12,14 @@ from src import backtest
 
 
 class BacktestTests(unittest.TestCase):
+    def test_small_trial_selects_only_named_samples_without_changing_manifest(self):
+        samples = [{"sample_id": f"B{number:02d}"} for number in range(1, 21)]
+        self.assertEqual(samples, backtest._select_samples(samples, ""))
+        self.assertEqual(samples[1:3], backtest._select_samples(samples, "B03,B02"))
+        for invalid in ("B02,B02", "B21", "B02,", ","):
+            with self.assertRaises(backtest.BacktestError):
+                backtest._select_samples(samples, invalid)
+
     def test_main_rejects_cloud_file_operations(self):
         def attempt_write():
             backtest.rclone_helper.run_result("copyto", "local.pdf", "onedrive:forbidden")

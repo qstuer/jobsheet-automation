@@ -344,6 +344,11 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
             _ocr_metrics[target] += value
     if not isinstance(content, str) or not content.strip():
         raise NvidiaResponseError("NVIDIA 視覺模型沒有回傳文字")
+    if max_tokens == 64 and not expects_json and not is_kimi_k3:
+        # 圈選診斷只記完成狀態和字數；不記模型原文或工作單內容。
+        finish = getattr(response.choices[0], "finish_reason", None)
+        finish = finish if finish in {"stop", "length", "content_filter"} else "other"
+        log.info("圈選辨認回覆：model=%s finish=%s chars=%d", model, finish, len(content))
     return content.strip()
 
 
@@ -464,10 +469,34 @@ _CMPM_PROMPT = (
 )
 
 
+def _parse_job_nature_reply(reply: str) -> str:
+    """只接受單一肯定選項；標點/簡短句式不應令清楚圈選失敗。"""
+    raw = re.sub(r"\s+", " ", reply.strip().upper()).strip(" `\"'")
+    raw = raw.replace('"', "").replace("'", "").replace("`", "")
+    option = r"(CM|PM|FCO|INS)"
+    patterns = (
+        rf"{option}[.!]?",
+        rf"{option} \((?:CIRCLED|MARKED|SELECTED)\)[.!]?",
+        rf"(?:THE )?(?:CIRCLED|MARKED|SELECTED) (?:OPTION|WORD|CHOICE) (?:IS )?{option}[.!]?",
+        rf"(?:THE )?WORD {option} IS (?:CIRCLED|MARKED|SELECTED)[.!]?",
+        rf"{option} IS (?:THE )?(?:CIRCLED|MARKED|SELECTED) (?:OPTION|WORD|CHOICE)[.!]?",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, raw)
+        if match:
+            return match.group(1)
+    # Do not extract an option from negation, uncertainty, multiple choices,
+    # or the model echoing the four choices in the prompt.
+    found = set(re.findall(r"\b(?:CM|PM|FCO|INS)\b", raw))
+    reason = "multiple" if len(found) > 1 else "no_option" if not found else "unsupported"
+    log.info("圈選辨認無法採納：reason=%s chars=%d", reason, len(reply))
+    return "UNKNOWN"
+
+
 def _read_job_nature(img_b64: str) -> str:
-    raw = _call_vision(prompt=_CMPM_PROMPT, image_b64=img_b64, max_tokens=10).strip().upper()
-    # Even a single option in an explanation (e.g. 'not PM') is not a choice.
-    return raw if raw in {"CM", "PM", "FCO", "INS"} else "UNKNOWN"
+    # 後備 Llama 過去只給 10 tokens，可能截斷短句；64 仍只容許短答。
+    raw = _call_vision(prompt=_CMPM_PROMPT, image_b64=img_b64, max_tokens=64)
+    return _parse_job_nature_reply(raw)
 
 
 def detect_cm_pm(pdf_doc: fitz.Document, page_idx: int) -> str:

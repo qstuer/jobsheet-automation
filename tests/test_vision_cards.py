@@ -49,13 +49,23 @@ class VisionCardTests(unittest.TestCase):
         self.assertIn("printed, typed and handwritten VALUES", rules)
         self.assertIn("ignore printed field labels", rules)
 
-    def test_circle_requires_exact_single_answer_not_negation_or_explanation(self):
-        for reply in ("not PM", "UNKNOWN PM", "probably CM", "PM or CM", "PM.", ""):
+    def test_circle_accepts_short_affirmative_reply_but_not_a_guess(self):
+        for reply in ("not PM", "UNKNOWN PM", "probably CM", "PM or CM",
+                      "The choices are CM, PM, FCO and INS", "PM is not circled", ""):
             with patch.object(nvidia_client, "_call_vision", return_value=reply):
                 self.assertEqual("UNKNOWN", nvidia_client._read_job_nature("synthetic"))
-        for reply in ("PM", " cm ", "FCO", "INS"):
+        for reply, expected in (("PM", "PM"), (" cm ", "CM"),
+                                ("FCO", "FCO"), ("INS", "INS"),
+                                ("PM.", "PM"), ("The circled option is PM.", "PM"),
+                                ('The word "CM" is circled.', "CM"),
+                                ("PM is the circled word.", "PM")):
             with patch.object(nvidia_client, "_call_vision", return_value=reply):
-                self.assertEqual(reply.strip().upper(), nvidia_client._read_job_nature("synthetic"))
+                self.assertEqual(expected, nvidia_client._read_job_nature("synthetic"))
+
+    def test_circle_request_has_room_for_short_fallback_sentence(self):
+        with patch.object(nvidia_client, "_call_vision", return_value="PM") as call:
+            self.assertEqual("PM", nvidia_client._read_job_nature("synthetic"))
+        self.assertEqual(64, call.call_args.kwargs["max_tokens"])
 
     def test_unknown_circle_gets_only_one_wider_retry(self):
         with patch.object(nvidia_client, "crop_job_nature", return_value="synthetic") as crop, \
