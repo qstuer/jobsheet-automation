@@ -65,17 +65,16 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           echo "089345ec6c4bc16d5896217bd7fe48560455cdcc4b8241f32dca9c2f1550a766  /tmp/jobsheet-backtest/manifest-reviewed-20260923.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Trial B02/B03 circle gate without cloud writes
+      - name: Run 20 private samples without cloud writes
         env:
-          JOBSHEET_BACKTEST_SAMPLE_IDS: B02,B03
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          OCR_PROVIDER: nvidia
+          OCR_PROVIDER: ${{ inputs.ocr_provider || vars.OCR_PROVIDER || 'nvidia' }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          NVIDIA_MODEL: meta/llama-3.2-11b-vision-instruct
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
           ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
