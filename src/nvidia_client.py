@@ -43,6 +43,11 @@ def reset_ocr_metrics() -> None:
         _ocr_metrics[key] = 0.0 if key == "seconds" else 0
 
 
+def reset_model_availability() -> None:
+    """Reset temporary outage state between independent read-only test samples."""
+    _unavailable_models.clear()
+
+
 def get_ocr_metrics() -> dict:
     """回傳呼叫次數、耗時、token 與 DeepSeek 費用上限，不含單據內容。"""
     result = dict(_ocr_metrics)

@@ -184,6 +184,19 @@ def _evaluate_result(task: dict | None, sample: dict, page_count: int,
     }
 
 
+def _evaluate_service_error(sample: dict, page_count: int) -> dict:
+    """A provider outage is not an OCR mismatch or an incorrect Asana match."""
+    count_ok = page_count == (4 if sample["job_type"] == "PM" else 1)
+    return {
+        "status": "SERVICE_ERROR", "device_check": "NOT_TESTED",
+        "task_check": "NOT_TESTED", "filename_check": "NOT_TESTED",
+        "task_type_check": "NOT_TESTED", "page_count": page_count,
+        "page_check": "COUNT_ONLY" if count_ok else "INCOMPLETE_OR_UNEXPECTED",
+        "circle_check": "NOT_TESTED", "field_accuracy": "NOT_TESTED",
+        "full_pipeline_check": "NOT_TESTED",
+    }
+
+
 def audit_fixtures(samples: list[dict], fixture_dir: Path) -> list[dict]:
     """Offline readiness inventory. No model, Asana or cloud calls."""
     _validate_files(samples, fixture_dir)
@@ -215,6 +228,7 @@ def audit_fixtures(samples: list[dict], fixture_dir: Path) -> list[dict]:
 
 def _append_summary(rows: list[dict], path: Path) -> None:
     passed = sum(row["status"] == "PASS" for row in rows)
+    service_errors = sum(row["status"] == "SERVICE_ERROR" for row in rows)
     pending_expected = sum(row["expected_pending"] for row in rows)
     unverified = sum(row["status"] == "UNVERIFIED" for row in rows)
     repeated_work = sum(bool(row.get("same_work_as")) for row in rows)
@@ -226,7 +240,8 @@ def _append_summary(rows: list[dict], path: Path) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write("## Jobsheet 20 份私人只讀回測\n\n")
         stream.write(
-            f"严格配对通过：**{passed}/{len(rows)}**；未核验答案：{unverified}；预期安全待确认：{pending_expected}；"
+            f"严格配对通过：**{passed}/{len(rows)}**；圖片服務錯誤：{service_errors}；"
+            f"未核验答案：{unverified}；预期安全待确认：{pending_expected}；"
             "OneDrive 写入：**0**。\n\n"
         )
         stream.write("这不是全流程通过率：圈选独立列出；逐栏准确率、checklist 内容与切页尚未验收。页数正确也不代表完整。\n\n")
@@ -312,12 +327,24 @@ def run() -> list[dict]:
     for sample in samples:
         sample_id = sample["sample_id"]
         log.info("[%s] 开始只读 OCR + Asana 核对", sample_id)
+        # These historical PDFs are independent trials. A temporary failure
+        # on one must not make every later sample a false model failure.
+        nvidia_client.reset_model_availability()
         with fitz.open(fixture_dir / sample["filename"]) as doc:
             if doc.page_count < 1:
                 raise BacktestError(f"{sample_id} 是空白 PDF")
             page_count = doc.page_count
-            task, detected, metrics = _read_sample(doc, sample["job_type"])
-        evaluation = _evaluate_result(task, sample, page_count, detected)
+            try:
+                task, detected, metrics = _read_sample(doc, sample["job_type"])
+            except nvidia_client.NvidiaResponseError:
+                # Never log raw provider replies: a model could echo private
+                # jobsheet text. Keep an anonymous service-error checkpoint.
+                log.warning("[%s] 圖片服務本份暫時無法完成，繼續下一份", sample_id)
+                task, detected = None, None
+                metrics = nvidia_client.get_ocr_metrics()
+                evaluation = _evaluate_service_error(sample, page_count)
+            else:
+                evaluation = _evaluate_result(task, sample, page_count, detected)
         status = evaluation["status"]
         log.info("[%s] %s（客户资料已隐藏）", sample_id, status)
         rows.append({

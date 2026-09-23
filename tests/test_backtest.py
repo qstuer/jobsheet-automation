@@ -287,6 +287,31 @@ class BacktestTests(unittest.TestCase):
             self.assertNotIn("USN16F0565", text)
             self.assertNotIn("61932689", text)
 
+    def test_service_outage_is_not_scored_as_a_bad_match_and_next_sample_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = self._manifest(root)
+            fake_doc = MagicMock()
+            fake_doc.__enter__.return_value.page_count = 4
+            with patch.dict(os.environ, {backtest.BACKTEST_DIR_ENV: str(root),
+                                         backtest.BACKTEST_MANIFEST_ENV: str(manifest),
+                                         "JOBSHEET_BACKTEST_SAMPLE_IDS": "B01,B02",
+                                         "GITHUB_STEP_SUMMARY": ""}), \
+                 patch("src.backtest.asana_index.load_index", return_value={}), \
+                 patch("src.backtest.asana_client.set_device_index"), \
+                 patch("src.backtest.fitz.open", return_value=fake_doc), \
+                 patch("src.backtest.nvidia_client.reset_model_availability") as reset, \
+                 patch("src.backtest.nvidia_client.get_ocr_metrics", return_value={"calls": 1}), \
+                 patch("src.backtest._read_sample", side_effect=[
+                     backtest.nvidia_client.NvidiaResponseError("private response"),
+                     (None, "PM", {"calls": 1}),
+                 ]):
+                rows = backtest.run()
+            self.assertEqual(["SERVICE_ERROR", "UNVERIFIED"], [r["status"] for r in rows])
+            self.assertEqual("NOT_TESTED", rows[0]["circle_check"])
+            self.assertEqual(2, reset.call_count)
+            self.assertNotIn("private response", json.dumps(rows))
+
     def test_run_never_calls_upload_move_delete_or_full_processor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
