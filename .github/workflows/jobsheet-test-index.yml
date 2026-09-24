@@ -1,0 +1,66 @@
+name: Jobsheet - Build Test-Only Asana Index
+
+# Isolated branch and private output path: never replace the live Stage B index.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-test-index.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-test-only-index
+  cancel-in-progress: false
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore private Google Drive access
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Full rebuild from Asana into runner only
+        env:
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          ASANA_INDEX_OUTPUT_DIR: /tmp/asana-test-index
+        run: python -m src.asana_index
+      - name: Store test-only index in private control folder
+        run: |
+          target="googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924"
+          rclone mkdir "$target"
+          rclone copyto /tmp/asana-test-index/asana-device-index.json "$target/asana-device-index.json"
+          rclone copyto /tmp/asana-test-index/asana-device-index.csv "$target/asana-device-index.csv"
+          rclone copyto /tmp/asana-test-index/asana-location-index.csv "$target/asana-location-index.csv"
+          rclone copyto /tmp/asana-test-index/asana-device-index-manifest.json "$target/asana-device-index-manifest.json"
+      - name: Remove runner credentials and private index
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -rf /tmp/asana-test-index
