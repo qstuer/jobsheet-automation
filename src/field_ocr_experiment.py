@@ -86,8 +86,10 @@ def _single(doc: fitz.Document, field: str, context: bool) -> dict:
             "Known hospital abbreviations include PYN, PYNEH, GH, KWH, QMH, "
             "QEH, KH, PMH, HKCH, PWH, UCH, and TMH. PYN and PYNEH refer "
             "to the same hospital. This is spelling context, NOT a list to choose "
-            "from. Copy the visible spelling and any suffix such as floor/room; "
-            "do not replace it with an assumed hospital name. "
+            "from. Copy the visible spelling and any suffix such as floor/room. "
+            "Preserve a visible hyphen or slash between the hospital name and "
+            "floor/room code; do not replace it with a space or omit it. "
+            "Do not replace it with an assumed hospital name. "
         ) if context else ""
         label = "CUSTOMER NAME / HOSPITAL"
     prompt = (
@@ -102,13 +104,14 @@ def _single(doc: fitz.Document, field: str, context: bool) -> dict:
     return _ask(image, prompt, {field})
 
 
-def _load_samples(folder: Path, manifest_path: Path) -> list[dict]:
+def _load_samples(folder: Path, manifest_path: Path,
+                  sample_ids: tuple[str, ...] = SAMPLE_IDS) -> list[dict]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 2 or len(manifest.get("samples", [])) != 20:
         raise ValueError("Private reviewed manifest is missing or invalid")
     selected = []
     for sample in manifest["samples"]:
-        if sample.get("sample_id") not in SAMPLE_IDS:
+        if sample.get("sample_id") not in sample_ids:
             continue
         if sample.get("review_status") != "confirmed":
             raise ValueError("Selected sample is not independently reviewed")
@@ -121,7 +124,7 @@ def _load_samples(folder: Path, manifest_path: Path) -> list[dict]:
         if not all(sample.get("observed_fields", {}).get(field) for field in FIELDS):
             raise ValueError("Selected sample has no independently observed truth")
         selected.append(sample)
-    if len(selected) != len(SAMPLE_IDS):
+    if len(selected) != len(sample_ids):
         raise ValueError("Private sample set is incomplete")
     return selected
 
@@ -130,8 +133,14 @@ def run() -> dict:
     folder = Path(os.environ["JOBSHEET_BACKTEST_DIR"])
     manifest = Path(os.environ["JOBSHEET_BACKTEST_MANIFEST"])
     report_path = Path(os.environ["JOBSHEET_FIELD_REPORT"])
+    requested = os.environ.get("JOBSHEET_FIELD_SAMPLE_IDS", "")
+    sample_ids = tuple(item.strip() for item in requested.split(",") if item.strip()) \
+        if requested else SAMPLE_IDS
+    if not sample_ids or len(sample_ids) != len(set(sample_ids)) \
+            or any(item not in SAMPLE_IDS for item in sample_ids):
+        raise ValueError("Field experiment sample selection is invalid")
     rows = []
-    for sample in _load_samples(folder, manifest):
+    for sample in _load_samples(folder, manifest, sample_ids):
         sid = sample["sample_id"]
         nvidia_client.reset_model_availability()
         nvidia_client.reset_ocr_metrics()

@@ -39,10 +39,10 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-      - name: Download only nine private PDFs and reviewed answers
+      - name: Download only two private PDFs and reviewed answers
         run: |
           mkdir -p /tmp/jobsheet-field-test
-          for id in B01 B03 B04 B06 B09 B13 B15 B19 B20; do
+          for id in B13 B20; do
             rclone copyto \
               "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${id}.pdf" \
               "/tmp/jobsheet-field-test/${id}.pdf"
@@ -57,6 +57,7 @@ jobs:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-field-test
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-field-test/manifest-reviewed-20260923.json
           JOBSHEET_FIELD_REPORT: /tmp/jobsheet-field-results.json
+          JOBSHEET_FIELD_SAMPLE_IDS: B13,B20
           OCR_PROVIDER: deepseek
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
