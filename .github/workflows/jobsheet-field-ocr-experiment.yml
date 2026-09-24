@@ -1,11 +1,6 @@
 name: Jobsheet Product and Location OCR Experiment
 
 on:
-  push:
-    branches: [codex/backtest-reviewed-20260923]
-    paths:
-      - src/field_ocr_experiment.py
-      - .github/workflows/jobsheet-field-ocr-experiment.yml
   workflow_dispatch:
 
 permissions:
