@@ -1,0 +1,76 @@
+name: Jobsheet Product and Location OCR Experiment
+
+on:
+  push:
+    branches: [codex/backtest-reviewed-20260923]
+    paths:
+      - src/field_ocr_experiment.py
+      - .github/workflows/jobsheet-field-ocr-experiment.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-field-ocr-experiment
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v1.75.0/rclone-v1.75.0-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv rclone-v1.75.0-linux-amd64/rclone /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download only nine private PDFs and reviewed answers
+        run: |
+          mkdir -p /tmp/jobsheet-field-test
+          for id in B01 B03 B04 B06 B09 B13 B15 B19 B20; do
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${id}.pdf" \
+              "/tmp/jobsheet-field-test/${id}.pdf"
+          done
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260923.json" \
+            /tmp/jobsheet-field-test/manifest-reviewed-20260923.json
+          echo "089345ec6c4bc16d5896217bd7fe48560455cdcc4b8241f32dca9c2f1550a766  /tmp/jobsheet-field-test/manifest-reviewed-20260923.json" | sha256sum -c -
+      - run: pip install -r requirements.txt
+      - name: Compare only product and hospital OCR
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-field-test
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-field-test/manifest-reviewed-20260923.json
+          JOBSHEET_FIELD_REPORT: /tmp/jobsheet-field-results.json
+          OCR_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: python -m src.field_ocr_experiment
+      - name: Preserve anonymous scores only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: field-ocr-anonymous-scores
+          path: /tmp/jobsheet-field-results.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove private files and credentials
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -rf /tmp/jobsheet-field-test

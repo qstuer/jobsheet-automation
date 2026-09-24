@@ -1,8 +1,6 @@
 name: Jobsheet 20-Sample Backtest
 
 on:
-  push:
-    branches: [codex/backtest-reviewed-20260923]
   workflow_dispatch:
     inputs:
       ocr_provider:
