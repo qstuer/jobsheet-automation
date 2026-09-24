@@ -11,6 +11,13 @@ on:
         options:
           - deepseek
           - nvidia
+  # The workflow is absent from main, so its manual Run button is hidden.
+  # Only an edit to this test workflow may start the isolated read-only run.
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-backtest.yml
 
 permissions:
   contents: read
@@ -46,17 +53,20 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-      - name: Download private fixtures and current index
+      - name: Download private fixtures and test-only index
         run: |
           mkdir -p /tmp/jobsheet-backtest
-          rclone copy \
-            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20" \
-            /tmp/jobsheet-backtest
+          for n in $(seq -w 1 20); do
+            id="B${n}"
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${id}.pdf" \
+              "/tmp/jobsheet-backtest/${id}.pdf"
+          done
           rclone copyto \
-            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924/asana-device-index.json" \
             /tmp/asana-device-index.json
           rclone copyto \
-            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924/asana-device-index-manifest.json" \
             /tmp/asana-device-index-manifest.json
           rclone copyto \
             "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260923.json" \
@@ -68,7 +78,7 @@ jobs:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          OCR_PROVIDER: ${{ inputs.ocr_provider || vars.OCR_PROVIDER || 'nvidia' }}
+          OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.
           JOBSHEET_CONTEXT_FIELD_OCR: '1'
