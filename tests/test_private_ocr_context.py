@@ -1,7 +1,7 @@
 """Synthetic tests: no private index row or real jobsheet is committed."""
 import unittest
 
-from src import private_ocr_context
+from src import nvidia_client, private_ocr_context
 
 
 class PrivateOcrContextTests(unittest.TestCase):
@@ -39,6 +39,16 @@ class PrivateOcrContextTests(unittest.TestCase):
         for index in ({}, {"schema_version": 3, "devices": [], "location_directory": []}):
             with self.assertRaises(ValueError):
                 private_ocr_context.build_vocabulary(index)
+
+    def test_full_hospital_name_is_not_replaced_by_code_context(self):
+        vocabulary = {
+            "hospital_codes": ["AA", "AB"],
+            "same_hospital_codes": [["AA", "AB"]],
+        }
+        prompt = nvidia_client._context_field_prompt("hospital_raw", vocabulary)
+        self.assertIn("multi-word hospital name or a short uppercase code", prompt)
+        self.assertIn("do not shorten it or substitute", prompt)
+        self.assertLess(prompt.index("do not shorten it"), prompt.index("AA, AB"))
 
 
 if __name__ == "__main__":

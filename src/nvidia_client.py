@@ -975,6 +975,11 @@ def _context_field_prompt(field: str, vocabulary: dict) -> str:
         codes = ", ".join(vocabulary["hospital_codes"])
         groups = "; ".join(" / ".join(group) for group in vocabulary["same_hospital_codes"])
         guidance = (
+            "First decide from the handwriting whether the value is a multi-word "
+            "hospital name or a short uppercase code. If it is a name, copy every "
+            "visible word in order; do not shorten it or substitute a related "
+            "institution. Only when the value itself is a short code may the "
+            "following spelling context help distinguish its letters. "
             f"Confirmed hospital abbreviations in the private index include {codes}. "
             + (f"These code groups each refer to one hospital: {groups}. " if groups else "")
             + "This is spelling context, NOT a list to choose "

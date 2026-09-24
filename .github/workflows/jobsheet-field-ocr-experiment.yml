@@ -3,7 +3,8 @@ name: Jobsheet Product and Location OCR Experiment
 on:
   workflow_dispatch:
   # The test-only workflow is absent from main, so GitHub hides its manual
-  # Run button. A push touching this file runs one isolated read-only trial.
+  # Run button. A push touching this file runs an isolated read-only trial.
+  # Trial 2 checks whether full hospital names survive abbreviation context.
   push:
     branches:
       - codex/backtest-reviewed-20260923
