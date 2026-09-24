@@ -24,7 +24,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, asana_index, batch_state, config, nvidia_client, rclone_helper
+from . import asana_client, asana_index, batch_state, config, nvidia_client, private_ocr_context, rclone_helper
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -36,6 +36,7 @@ SOURCE_QUEUE_ENV = config.JOBSHEET_SOURCE_QUEUE_ENV
 CONFIRMED_FILENAME_ENV = "JOBSHEET_CONFIRMED_FILENAME"
 ASANA_INDEX_FILE_ENV = "ASANA_INDEX_LOCAL_FILE"
 ASANA_INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
+CONTEXT_FIELD_OCR_ENV = "JOBSHEET_CONTEXT_FIELD_OCR"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -335,11 +336,9 @@ def _ocr_and_match(doc, job_type):
     identity = nvidia_client.ocr_jobsheet_identity_fields(
         doc, 0, zoom=config.OCR_IDENTITY_ZOOM
     )
+    context_fields = os.environ.get(CONTEXT_FIELD_OCR_ENV) == "1"
     def contextual(reading, stage, zoom, field=None):
         return {**reading, "_read_context": {"stage": stage, "zoom": zoom, "field": field}}
-
-    readings = [contextual(primary, "primary", config.OCR_ZOOM_DEFAULT),
-                contextual(identity, "identity", config.OCR_IDENTITY_ZOOM)]
 
     def visible_fields(reading):
         return [
@@ -352,7 +351,29 @@ def _ocr_and_match(doc, job_type):
 
     log.info(f"  OCR 分格首讀：已讀到 {visible_fields(primary)}")
     log.info(f"  OCR 身分欄複核：已讀到 {visible_fields(identity)}")
+    if context_fields:
+        # The scored single-field card is authoritative for these two fields.
+        # Keep the earlier raw readings in their private audit snapshots, but
+        # do not let two matching mistakes on broad cards become OCR votes.
+        primary = {**primary, "product_raw": None, "hospital_raw": None}
+        identity = {**identity, "product_raw": None, "hospital_raw": None}
+    readings = [contextual(primary, "primary", config.OCR_ZOOM_DEFAULT),
+                contextual(identity, "identity", config.OCR_IDENTITY_ZOOM)]
+    if context_fields:
+        vocabulary = private_ocr_context.build_vocabulary(asana_client._device_index)
+        for field in ("product_raw", "hospital_raw"):
+            for _ in range(2):
+                reading = nvidia_client.ocr_jobsheet_context_field(doc, 0, field, vocabulary)
+                readings.append(contextual(reading, "context_field", 5.0, field))
     consensus = _consensus_ocr(readings)
+    if context_fields and not all(
+            consensus.get(field) for field in ("product_raw", "hospital_raw")):
+        # One model response cannot decide the hospital or product, and old
+        # broad-card readings cannot rescue a disagreement. No Asana match is
+        # attempted, so an uncertain card cannot produce a OneDrive upload.
+        consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+        log.warning("  產品或醫院單格兩輪未一致，保留待核對")
+        return None, 0, consensus
 
     # Order No. 可以合法留白；只有模型曾看見卻未通過格式時才精讀。
     order_needs_focus = any(
@@ -362,7 +383,7 @@ def _ocr_and_match(doc, job_type):
     ) and not consensus.get("order_no")
     focus_fields = [
         field for field in ("product_raw", "serial_candidates", "hospital_raw")
-        if not consensus.get(field)
+        if not consensus.get(field) and (not context_fields or field == "serial_candidates")
     ]
     if order_needs_focus:
         focus_fields.insert(0, "order_no")

@@ -45,6 +45,12 @@ jobs:
           rclone copyto \
             "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260923.json" \
             /tmp/jobsheet-field-test/manifest-reviewed-20260923.json
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
+            /tmp/jobsheet-field-test/asana-device-index.json
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
+            /tmp/jobsheet-field-test/asana-device-index-manifest.json
           echo "089345ec6c4bc16d5896217bd7fe48560455cdcc4b8241f32dca9c2f1550a766  /tmp/jobsheet-field-test/manifest-reviewed-20260923.json" | sha256sum -c -
       - run: pip install -r requirements.txt
       - name: Compare only product and hospital OCR
@@ -53,6 +59,8 @@ jobs:
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-field-test/manifest-reviewed-20260923.json
           JOBSHEET_FIELD_REPORT: /tmp/jobsheet-field-results.json
           JOBSHEET_FIELD_SAMPLE_IDS: B01,B03,B04,B06,B09,B13,B15,B19,B20
+          ASANA_INDEX_LOCAL_FILE: /tmp/jobsheet-field-test/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/jobsheet-field-test/asana-device-index-manifest.json
           OCR_PROVIDER: deepseek
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}

@@ -554,7 +554,7 @@ def _valid_serial_token(value: str) -> bool:
 def _visible_serial_token(value: str) -> Optional[str]:
     """保留模型實際抄到的 serial 形狀，但不把它升格為有效 serial。
 
-    例如 S2N22F1275 仍會被正式格式閘拒絕；這份原始讀數只可在 Asana
+    例如字母與數字錯位的讀數仍會被正式格式閘拒絕；這份原始讀數只可在 Asana
     已由其他欄位縮到唯一候選後，作一字距離的交叉核對。
     """
     if "?" in (value or ""):
@@ -954,6 +954,60 @@ def ocr_jobsheet_focused_field(
         f"This image contains only the panel labelled {_FIELD_DISPLAY_LABELS[field]}. "
         "Return only the exact visible value for that field. Do not repair unclear characters. "
         f'Required shape: {{"{field}":{example_value},"unreadable_fields":[]}}'
+    )
+    return _read_card(image_b64, prompt, {field})
+
+
+def _context_field_prompt(field: str, vocabulary: dict) -> str:
+    """單格提示只接收私人索引投影，不把客戶詞彙寫進程式碼。"""
+    if field == "product_raw":
+        families = ", ".join(vocabulary["product_families"])
+        models = ", ".join(vocabulary["product_models"])
+        guidance = (
+            f"Confirmed product families in the private index include {families}. "
+            f"Confirmed model spellings include {models}. "
+            "This is spelling context, NOT a multiple-choice test. "
+            "Copy only the model variant actually supported by the handwriting; "
+            "if only the family is visible, return only the family. "
+        )
+        label = "PRODUCT"
+    elif field == "hospital_raw":
+        codes = ", ".join(vocabulary["hospital_codes"])
+        groups = "; ".join(" / ".join(group) for group in vocabulary["same_hospital_codes"])
+        guidance = (
+            f"Confirmed hospital abbreviations in the private index include {codes}. "
+            + (f"These code groups each refer to one hospital: {groups}. " if groups else "")
+            + "This is spelling context, NOT a list to choose "
+            "from. Copy the visible spelling and any suffix such as floor/room. "
+            "Preserve a visible hyphen or slash between the hospital name and "
+            "floor/room code; do not replace it with a space or omit it. "
+            "Do not replace it with an assumed hospital name. "
+        )
+        label = "CUSTOMER NAME / HOSPITAL"
+    else:
+        raise ValueError("Context OCR is limited to product and hospital")
+    return (
+        f"This image contains one {label} value field. "
+        "Read printed or handwritten VALUE only, not the field label. "
+        + guidance
+        + "If a value is crossed out and replaced, use only the uncrossed "
+        "replacement. Return null if no value is visible. Never make up "
+        "missing characters. "
+        f'Return only JSON: {{"{field}":null}} (replace null with the exact visible string).'
+    )
+
+
+def ocr_jobsheet_context_field(
+        pdf_doc: fitz.Document,
+        page_idx: int,
+        field: str,
+        vocabulary: dict,
+        zoom: float = 5.0,
+) -> dict:
+    """隔離測試用的產品／醫院單格讀取；不接收 Asana 候選或舊 OCR 答案。"""
+    prompt = _context_field_prompt(field, vocabulary)
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, (field,), zoom=zoom, focused=True,
     )
     return _read_card(image_b64, prompt, {field})
 

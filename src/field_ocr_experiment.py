@@ -14,7 +14,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, nvidia_client
+from . import asana_client, asana_index, nvidia_client, private_ocr_context
 
 
 FIELDS = ("product_raw", "hospital_raw")
@@ -68,39 +68,23 @@ def _paired(doc: fitz.Document) -> dict:
     return _ask(image, prompt, set(FIELDS))
 
 
-def _single(doc: fitz.Document, field: str, context: bool) -> dict:
+def _single(doc: fitz.Document, field: str, context: bool, vocabulary: dict) -> dict:
     image = nvidia_client.crop_jobsheet_field_card(
         doc, 0, (field,), zoom=5.0, focused=True,
     )
-    if field == "product_raw":
-        guidance = (
-            "Known Philips product families include Affiniti, EPIQ, and CX. "
-            "Common models include Affiniti 30/50/70/70G, EPIQ 5G/7G/7+/Elite/CVx, "
-            "and CX30/CX50. This is spelling context, NOT a multiple-choice test. "
-            "Copy only the model variant actually supported by the handwriting; "
-            "if only the family is visible, return only the family. "
-        ) if context else ""
-        label = "PRODUCT"
+    if context:
+        # Keep the scored experiment and the opt-in backtest on the same prompt.
+        prompt = nvidia_client._context_field_prompt(field, vocabulary)
     else:
-        guidance = (
-            "Known hospital abbreviations include PYN, PYNEH, GH, KWH, QMH, "
-            "QEH, KH, PMH, HKCH, PWH, UCH, and TMH. PYN and PYNEH refer "
-            "to the same hospital. This is spelling context, NOT a list to choose "
-            "from. Copy the visible spelling and any suffix such as floor/room. "
-            "Preserve a visible hyphen or slash between the hospital name and "
-            "floor/room code; do not replace it with a space or omit it. "
-            "Do not replace it with an assumed hospital name. "
-        ) if context else ""
-        label = "CUSTOMER NAME / HOSPITAL"
-    prompt = (
-        f"This image contains one {label} value field. "
-        "Read printed or handwritten VALUE only, not the field label. "
-        + guidance
-        + "If a value is crossed out and replaced, use only the uncrossed "
-        "replacement. Return null if no value is visible. Never make up "
-        "missing characters. "
-        f'Return only JSON: {{"{field}":null}} (replace null with the exact visible string).'
-    )
+        label = "PRODUCT" if field == "product_raw" else "CUSTOMER NAME / HOSPITAL"
+        prompt = (
+            f"This image contains one {label} value field. "
+            "Read printed or handwritten VALUE only, not the field label. "
+            "If a value is crossed out and replaced, use only the uncrossed "
+            "replacement. Return null if no value is visible. Never make up "
+            "missing characters. "
+            f'Return only JSON: {{"{field}":null}} (replace null with the exact visible string).'
+        )
     return _ask(image, prompt, {field})
 
 
@@ -133,6 +117,11 @@ def run() -> dict:
     folder = Path(os.environ["JOBSHEET_BACKTEST_DIR"])
     manifest = Path(os.environ["JOBSHEET_BACKTEST_MANIFEST"])
     report_path = Path(os.environ["JOBSHEET_FIELD_REPORT"])
+    index = asana_index.load_index(
+        Path(os.environ["ASANA_INDEX_LOCAL_FILE"]),
+        Path(os.environ["ASANA_INDEX_MANIFEST_LOCAL_FILE"]),
+    )
+    vocabulary = private_ocr_context.build_vocabulary(index)
     requested = os.environ.get("JOBSHEET_FIELD_SAMPLE_IDS", "")
     sample_ids = tuple(item.strip() for item in requested.split(",") if item.strip()) \
         if requested else SAMPLE_IDS
@@ -152,7 +141,8 @@ def run() -> dict:
                         values = _paired(doc)
                     else:
                         values = {
-                            field: _single(doc, field, context=arm == "single_context").get(field)
+                            field: _single(doc, field, context=arm == "single_context",
+                                           vocabulary=vocabulary).get(field)
                             for field in FIELDS
                         }
                     arms[arm] = {
