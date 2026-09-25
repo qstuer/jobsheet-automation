@@ -137,6 +137,8 @@ _FIELD_DISPLAY_LABELS = {
     "service_date_raw": "ACTION DATE ONLY",
     "fault_symptom": "FAULT SYMPTOM - REFERENCE NUMBER ONLY",
     "action_taken": "ACTION TAKEN - REFERENCE NUMBER ONLY",
+    "engineer_signed_date": "ENGINEER SIGNATURE DATE ONLY",
+    "customer_signed_date": "CUSTOMER SIGNATURE DATE ONLY",
 }
 
 
@@ -997,6 +999,43 @@ def ocr_jobsheet_action_identifiers(
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
     raise NvidiaResponseError("ACTION TAKEN 識別碼格式錯誤") from last_error
+
+
+def ocr_jobsheet_signature_date(
+        pdf_doc: fitz.Document, page_idx: int, field: str, zoom: float = 5.0
+) -> Optional[str]:
+    """Copy one independently handwritten signature date, without Asana hints.
+
+    This is corroborating evidence only. The processor still requires at least
+    one ACTION DATE reading to agree before it may affect matching.
+    """
+    if field not in {"engineer_signed_date", "customer_signed_date"}:
+        raise ValueError("不支援的簽署日期欄位")
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, (field,), zoom=zoom, strong=zoom >= 6.0
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "Read only the handwritten date beside the signature in this one "
+        "labelled panel. Do not read a name, stamp, ACTION DATE, or another "
+        "panel. Do not infer a missing digit or use any task information. "
+        'Return JSON only: {"signed_date":null} if unreadable, otherwise '
+        '{"signed_date":"DD/MM/YYYY"} using exactly the visible digits.'
+    )
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(prompt, image_b64, max_tokens=120, expects_json=True)
+        try:
+            data = _parse_json_object(raw, required_keys={"signed_date"})
+            value = data["signed_date"]
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise NvidiaResponseError("簽署日期不是文字")
+            parsed = _parse_action_date(value)
+            return parsed.isoformat() if parsed else None
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
+            last_error = exc
+    raise NvidiaResponseError("簽署日期格式錯誤") from last_error
 
 
 def _context_field_prompt(field: str, vocabulary: dict) -> str:

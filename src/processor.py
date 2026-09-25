@@ -350,6 +350,45 @@ def _apply_focused_action_date(consensus: dict, focused_readings: list) -> bool:
     return False
 
 
+def _apply_signature_date_corroboration(
+        consensus: dict, action_readings: list, signed_dates: list
+) -> bool:
+    """Resolve one ambiguous ACTION DATE digit using both signature dates.
+
+    The signatures are not an alternate source of service date: at least one
+    independently transcribed ACTION DATE must agree. Other valid ACTION DATE
+    readings may differ by only one digit; a broader conflict remains pending.
+    No Asana date or answer is supplied to the model or this decision.
+    """
+    dates = [nvidia_client._parse_action_date(value) for value in signed_dates]
+    audit = consensus.setdefault("_ocr_audit", {})
+    if len(dates) != 2 or dates[0] is None or dates[0] != dates[1]:
+        audit["signature_date_check"] = "unresolved"
+        return False
+    target = dates[0]
+    action = [
+        (nvidia_client._parse_action_date(row.get("service_date_raw")),
+         row.get("service_date_raw"))
+        for row in action_readings if row.get("service_date_raw")
+    ]
+    valid = [(day, raw) for day, raw in action if day is not None]
+    target_digits = target.strftime("%Y%m%d")
+    if not any(day == target for day, _ in valid) or any(
+        sum(left != right for left, right in zip(
+            day.strftime("%Y%m%d"), target_digits
+        )) > 1 for day, _ in valid
+    ):
+        audit["signature_date_check"] = "no_action_date_agreement"
+        return False
+    raw = next(raw for day, raw in valid if day == target)
+    consensus["service_date_raw"] = raw
+    consensus["service_date_iso"] = target.isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus["date_corrob"] = True
+    audit["signature_date_check"] = "corroborated"
+    return True
+
+
 def _ocr_and_match(doc, job_type):
     """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
     nvidia_client.reset_ocr_metrics()
@@ -514,6 +553,26 @@ def _ocr_and_match(doc, job_type):
         else:
             date_recheck_blocked = True
             log.info("  ACTION DATE 單格兩輪未一致，不憑原先日期自動配對")
+
+    if (task is None and context_fields and any(
+            row.get("service_date_raw") for row in readings)):
+        # Opt-in backtest only. Two separate signatures can resolve a single
+        # handwritten digit, but cannot manufacture a service date absent from
+        # ACTION DATE. Neither crop receives Asana dates or candidate tasks.
+        signed_dates = []
+        for field in ("engineer_signed_date", "customer_signed_date"):
+            try:
+                signed_dates.append(nvidia_client.ocr_jobsheet_signature_date(
+                    doc, 0, field, zoom=5.0
+                ))
+            except nvidia_client.NvidiaResponseError:
+                signed_dates.append(None)
+        if _apply_signature_date_corroboration(consensus, readings, signed_dates):
+            date_recheck_blocked = False
+            log.info("  ACTION DATE 獲兩個簽署日期獨立確認，重新核對歷史工作")
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  簽署日期未能安全確認 ACTION DATE，不作日期修正")
 
     if (task is None and context_fields and asana_client._device_index is not None
             and all(consensus.get(field) for field in

@@ -62,6 +62,27 @@ class VisionCardTests(unittest.TestCase):
                 )
             self.assertIn((255, 0, 0), set(crop.getdata()))
 
+    def test_signature_date_crops_do_not_overlap(self):
+        with fitz.open() as doc:
+            page = doc.new_page(width=1000, height=1000)
+            for field, color in (("engineer_signed_date", (1, 0, 0)),
+                                 ("customer_signed_date", (0, 0, 1))):
+                left, top, right, bottom = config.OCR_FIELD_BOXES[field]
+                page.draw_rect(fitz.Rect(left*1000, top*1000, right*1000, bottom*1000),
+                               color=None, fill=color)
+            with patch.object(nvidia_client, "_preprocess_field_image",
+                              side_effect=lambda img, **kw: img):
+                engineer = nvidia_client._render_field_crop(
+                    doc, 0, "engineer_signed_date", 5
+                )
+                customer = nvidia_client._render_field_crop(
+                    doc, 0, "customer_signed_date", 5
+                )
+            self.assertIn((255, 0, 0), set(engineer.getdata()))
+            self.assertNotIn((0, 0, 255), set(engineer.getdata()))
+            self.assertIn((0, 0, 255), set(customer.getdata()))
+            self.assertNotIn((255, 0, 0), set(customer.getdata()))
+
     def test_circle_accepts_short_affirmative_reply_but_not_a_guess(self):
         for reply in ("not PM", "UNKNOWN PM", "probably CM", "PM or CM",
                       "The choices are CM, PM, FCO and INS", "PM is not circled", ""):

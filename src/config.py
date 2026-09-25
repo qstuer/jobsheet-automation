@@ -112,6 +112,10 @@ OCR_FIELD_BOXES = {
     "service_date_raw": (0.555, 0.312, 0.735, 0.365),
     "fault_symptom":   (0.055, 0.245, 0.955, 0.315),
     "action_taken":    (0.055, 0.307, 0.555, 0.500),
+    # Dates repeated beside the two signatures may corroborate an ambiguous
+    # ACTION DATE. They are never treated as a replacement date by themselves.
+    "engineer_signed_date": (0.215, 0.930, 0.500, 0.980),
+    "customer_signed_date": (0.700, 0.930, 0.960, 0.980),
 }
 # 單格複核只保留手寫值附近，避免印刷標籤與表格線佔去大部分像素。
 # 外層欄位卡仍會顯示可靠的欄位名稱，因此模型毋須靠原表格標籤猜欄位。

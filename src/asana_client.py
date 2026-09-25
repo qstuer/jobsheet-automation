@@ -1427,7 +1427,11 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                 "date_delta": date_delta, "job_type": candidate_type,
             }
         if date_delta <= 3:
-            score += 50
+            # In the isolated backtest, both independently handwritten
+            # signature dates and an ACTION DATE reading must agree before
+            # this extra visit-specific weight is available. A shared phone
+            # from an older PM must not cancel an exact formal visit date.
+            score += 90 if ocr_data.get("date_corrob") else 50
             support.add("date")
             reasons.append(
                 "date within 3 days (year corrected)"
