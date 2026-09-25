@@ -49,6 +49,19 @@ class VisionCardTests(unittest.TestCase):
         self.assertIn("printed, typed and handwritten VALUES", rules)
         self.assertIn("ignore printed field labels", rules)
 
+    def test_focused_date_crop_keeps_ink_above_the_value_cell(self):
+        # A handwritten month can extend above the value-cell top line. The
+        # former 0.323 focused bound removed this stroke before model reading.
+        with fitz.open() as doc:
+            page = doc.new_page(width=1000, height=1000)
+            page.draw_rect(fitz.Rect(590, 315, 600, 319),
+                           color=None, fill=(1, 0, 0))
+            with patch.object(nvidia_client, "_preprocess_field_image", side_effect=lambda img, **kw: img):
+                crop = nvidia_client._render_field_crop(
+                    doc, 0, "service_date_raw", 5, focused=True
+                )
+            self.assertIn((255, 0, 0), set(crop.getdata()))
+
     def test_circle_accepts_short_affirmative_reply_but_not_a_guess(self):
         for reply in ("not PM", "UNKNOWN PM", "probably CM", "PM or CM",
                       "The choices are CM, PM, FCO and INS", "PM is not circled", ""):

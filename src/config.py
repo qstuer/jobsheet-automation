@@ -123,7 +123,9 @@ OCR_FOCUSED_FIELD_BOXES = {
     "contact_person_raw": (0.670, 0.166, 0.955, 0.207),
     "department_room_raw": (0.180, 0.198, 0.575, 0.242),
     "phone_candidates":  (0.670, 0.198, 0.955, 0.242),
-    "service_date_raw":   (0.555, 0.323, 0.735, 0.365),
+    # Handwritten dates can rise into the printed DATE heading. Starting at
+    # 0.323 clipped their upper loops; B08's ambiguous month must be retested.
+    "service_date_raw":   (0.555, 0.312, 0.735, 0.365),
 }
 OCR_PRIMARY_CARD_FIELDS = (
     "order_no", "product_raw", "serial_candidates", "hospital_raw",
