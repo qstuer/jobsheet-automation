@@ -570,6 +570,11 @@ def _ocr_and_match(doc, job_type):
                 ))
             except nvidia_client.NvidiaResponseError:
                 signed_dates.append(None)
+        log.info("  日期診斷：ACTION有效讀數=%s、ACTION原文讀數=%s、工程師簽署可讀=%s、客戶簽署可讀=%s",
+                 sum(bool(row.get("service_date_raw")) for row in readings),
+                 sum(bool((row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw"))
+                     for row in readings),
+                 signed_dates[0] is not None, signed_dates[1] is not None)
         if _apply_signature_date_corroboration(consensus, readings, signed_dates):
             date_recheck_blocked = False
             log.info("  ACTION DATE 獲客戶簽署日期獨立確認，重新核對歷史工作")
@@ -597,6 +602,8 @@ def _ocr_and_match(doc, job_type):
                 consensus.setdefault("_ocr_audit", {})["date_parts_recheck"] = (
                     "agreed" if agreed else "unresolved"
                 )
+                log.info("  日期分段診斷：有效讀數=%s、兩輪與客戶日期一致=%s",
+                         sum(value is not None for value in part_dates), agreed)
                 if agreed:
                     parts_readings = [{"service_date_raw": value} for value in part_dates]
                     if _apply_signature_date_corroboration(

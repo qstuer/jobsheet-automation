@@ -1068,17 +1068,22 @@ def ocr_jobsheet_action_date_parts(
             data = _parse_json_object(raw, required_keys={"day", "month", "year"})
             parts = [data[key] for key in ("day", "month", "year")]
             if any(part is None for part in parts):
+                log.info("  ACTION DATE 分段讀取：欄位缺失")
                 return None
             if any(not isinstance(part, str) or not part.isdigit() for part in parts):
+                log.info("  ACTION DATE 分段讀取：非純數字")
                 return None
             parsed = _parse_action_date("/".join(parts))
             if parsed is None:
+                log.info("  ACTION DATE 分段讀取：日期無效")
                 return None
             age = (_today() - parsed).days
-            return parsed.isoformat() if (
+            accepted = (
                 -config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS
                 <= age <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS
-            ) else None
+            )
+            log.info("  ACTION DATE 分段讀取：%s", "有效" if accepted else "超出日期範圍")
+            return parsed.isoformat() if accepted else None
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
     raise NvidiaResponseError("ACTION DATE 分段複核格式錯誤") from last_error
