@@ -112,10 +112,12 @@ OCR_FIELD_BOXES = {
     "service_date_raw": (0.555, 0.312, 0.735, 0.365),
     "fault_symptom":   (0.055, 0.245, 0.955, 0.315),
     "action_taken":    (0.055, 0.307, 0.555, 0.500),
-    # Dates repeated beside the two signatures may corroborate an ambiguous
-    # ACTION DATE. They are never treated as a replacement date by themselves.
+    # Customer sign-off may corroborate an ambiguous ACTION DATE; the engineer
+    # may have signed earlier. Neither signature replaces ACTION DATE alone.
     "engineer_signed_date": (0.215, 0.930, 0.500, 0.980),
-    "customer_signed_date": (0.700, 0.930, 0.960, 0.980),
+    # Keep the handwritten date while excluding most of the hospital stamp;
+    # its high-contrast seal previously dominated this tiny OCR card.
+    "customer_signed_date": (0.760, 0.947, 0.960, 0.979),
 }
 # 單格複核只保留手寫值附近，避免印刷標籤與表格線佔去大部分像素。
 # 外層欄位卡仍會顯示可靠的欄位名稱，因此模型毋須靠原表格標籤猜欄位。

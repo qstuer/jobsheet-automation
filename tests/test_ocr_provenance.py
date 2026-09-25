@@ -255,6 +255,34 @@ class OCRProvenanceTests(unittest.TestCase):
         self.assertEqual(["date_recheck", "date_recheck"],
                          [row["context"]["stage"] for row in result["_ocr_audit"]["readings"][-2:]])
 
+    def test_isolated_matching_rechecks_date_even_when_broad_cards_have_none(self):
+        broad = self.normalize(product_raw="EPIQ Elite", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"],
+                               phone_candidates=["99990070"])
+        context_cards = [self.normalize(product_raw="EPIQ Elite") for _ in range(2)] + [
+            self.normalize(hospital_raw="QMH") for _ in range(2)
+        ]
+        focused_dates = [self.normalize(service_date_raw="20/8/26"),
+                         self.normalize(service_date_raw="20/08/2026")]
+
+        def find(ocr, job_type):
+            return ({"gid": "synthetic-task"}, 2) if ocr.get("service_date_iso") == "2026-08-20" else (None, 0)
+
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_serial_candidates", return_value=["US123F4567"]), \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=context_cards), \
+             patch.object(nvidia_client, "ocr_jobsheet_focused_field", side_effect=focused_dates) as focused, \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
+             patch.object(asana_client, "find_task", side_effect=find):
+            task, _, result = processor._ocr_and_match(None, "PM")
+
+        self.assertEqual("synthetic-task", task["gid"])
+        self.assertEqual("2026-08-20", result["service_date_iso"])
+        self.assertEqual(2, focused.call_count)
+
     def test_action_identifier_card_only_keeps_visible_mixed_tokens(self):
         response = json.dumps({"action_identifiers": [
             "PRB-A123", "TX9-4567", "12345678", "ordinary", "PRB?999",

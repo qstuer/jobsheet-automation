@@ -1038,6 +1038,52 @@ def ocr_jobsheet_signature_date(
     raise NvidiaResponseError("簽署日期格式錯誤") from last_error
 
 
+def ocr_jobsheet_action_date_parts(
+        pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
+) -> Optional[str]:
+    """Test-only second representation of the ACTION DATE handwriting.
+
+    Read the three visible digit groups independently. No customer date,
+    Asana date or candidate answer is supplied to the model. The processor
+    requires two agreeing reads and independent customer sign-off before
+    using this when ordinary transcription has failed.
+    """
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, ("service_date_raw",), zoom=zoom,
+        strong=zoom >= 6.0, focused=True,
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "Read only the handwritten first-row ACTION DATE value. Ignore the "
+        "printed DATE (DD/MM/YY) heading and all other panels. Copy the "
+        "day digits before the first separator, month digits between the "
+        "separators, and year digits after the second separator separately. "
+        "Do not infer missing digits. Return JSON only: "
+        '{"day":null,"month":null,"year":null} if unreadable, otherwise '
+        '{"day":"DD","month":"MM","year":"YYYY"}.'
+    )
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(prompt, image_b64, max_tokens=160, expects_json=True)
+        try:
+            data = _parse_json_object(raw, required_keys={"day", "month", "year"})
+            parts = [data[key] for key in ("day", "month", "year")]
+            if any(part is None for part in parts):
+                return None
+            if any(not isinstance(part, str) or not part.isdigit() for part in parts):
+                return None
+            parsed = _parse_action_date("/".join(parts))
+            if parsed is None:
+                return None
+            age = (_today() - parsed).days
+            return parsed.isoformat() if (
+                -config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS
+                <= age <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS
+            ) else None
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
+            last_error = exc
+    raise NvidiaResponseError("ACTION DATE 分段複核格式錯誤") from last_error
+
+
 def _context_field_prompt(field: str, vocabulary: dict) -> str:
     """單格提示只接收私人索引投影，不把客戶詞彙寫進程式碼。"""
     if field == "product_raw":

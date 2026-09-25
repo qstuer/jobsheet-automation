@@ -1427,9 +1427,9 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                 "date_delta": date_delta, "job_type": candidate_type,
             }
         if date_delta <= 3:
-            # In the isolated backtest, both independently handwritten
-            # signature dates and an ACTION DATE reading must agree before
-            # this extra visit-specific weight is available. A shared phone
+            # In the isolated backtest, a customer sign-off date and an
+            # independent ACTION DATE reading must agree before this extra
+            # visit-specific weight is available. A shared phone
             # from an older PM must not cancel an exact formal visit date.
             score += 90 if ocr_data.get("date_corrob") else 50
             support.add("date")
@@ -1581,14 +1581,29 @@ def find_task(ocr_data: dict, job_type: str = None,
         # require Asset: it is optional and may be blank on genuine visits.
         # A shared phone or hospital does not distinguish repeat PM tasks;
         # their *formal* dates must leave exactly one visit within three days.
+        device_separated = False
+        if used_index and ocr_data.get("date_corrob") and visual_serials:
+            ranked_devices = _rank_index_devices(ocr_data, job_type)
+            device_separated = bool(ranked_devices) and (
+                len(ranked_devices) == 1 or
+                ranked_devices[0]["serial_similarity"] -
+                ranked_devices[1]["serial_similarity"] >
+                config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
+            ) and _norm(ranked_devices[0]["row"].get("serial")) in {
+                _norm(value) for value in _task_serials(best["task"])
+            }
         if used_index and ocr_data.get("date_corrob") and visual_serials \
                 and best["serial_dist"] <= 1 and gap >= 30 \
                 and best.get("date_delta") is not None \
                 and best["date_delta"] <= 3 \
-                and {"date", "phone_exact", "hospital", "product", "job_type"}.issubset(
+                and {"date", "hospital", "product", "job_type"}.issubset(
                     best["support"]
-                ) and all(
-                    row.get("date_delta") is not None and row["date_delta"] > 3
+                ) and ("phone_exact" in best["support"] or device_separated) \
+                and all(
+                    # A historical task without a formal date does not
+                    # compete with this independently corroborated exact
+                    # visit date. A second task within three days still does.
+                    row.get("date_delta") is None or row["date_delta"] > 3
                     for row in scored[1:]
                 ):
             log.info("  ✅ 交叉核對日期與單字 Serial 誤差唯一鎖定當次工作")
