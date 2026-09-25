@@ -73,13 +73,13 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           echo "089345ec6c4bc16d5896217bd7fe48560455cdcc4b8241f32dca9c2f1550a766  /tmp/jobsheet-backtest/manifest-reviewed-20260923.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Recheck four dates with one-digit and partial sign-off safeguards
+      - name: Compare five private samples with NVIDIA vision
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          JOBSHEET_BACKTEST_SAMPLE_IDS: B01,B04,B07,B10
-          OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}
+          JOBSHEET_BACKTEST_SAMPLE_IDS: B01,B03,B04,B07,B10
+          OCR_PROVIDER: ${{ inputs.ocr_provider || 'nvidia' }}
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.
           JOBSHEET_CONTEXT_FIELD_OCR: '1'
