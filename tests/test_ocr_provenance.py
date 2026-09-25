@@ -319,6 +319,8 @@ class OCRProvenanceTests(unittest.TestCase):
              patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=context_cards), \
              patch.object(nvidia_client, "ocr_jobsheet_focused_field", side_effect=focused_dates), \
              patch.object(nvidia_client, "ocr_jobsheet_signature_date", return_value=None), \
+             patch.object(nvidia_client, "ocr_jobsheet_customer_month_year", return_value=None), \
+             patch.object(nvidia_client, "ocr_jobsheet_action_date_parts", return_value=None), \
              patch.object(nvidia_client, "ocr_jobsheet_action_identifiers", side_effect=action_reads) as read, \
              patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
              patch.object(asana_client, "find_task", side_effect=find), \
@@ -350,6 +352,8 @@ class OCRProvenanceTests(unittest.TestCase):
              patch.object(nvidia_client, "ocr_jobsheet_focused_field",
                           side_effect=[self.normalize(service_date_raw="20/9/2026") for _ in range(2)]), \
              patch.object(nvidia_client, "ocr_jobsheet_signature_date", return_value=None), \
+             patch.object(nvidia_client, "ocr_jobsheet_customer_month_year", return_value=None), \
+             patch.object(nvidia_client, "ocr_jobsheet_action_date_parts", return_value=None), \
              patch.object(nvidia_client, "ocr_jobsheet_action_identifiers",
                           side_effect=[["PRBA123", "TX94567"], ["PRBA123"]]), \
              patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \

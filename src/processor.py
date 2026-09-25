@@ -357,9 +357,9 @@ def _apply_signature_date_corroboration(
 
     Engineers may sign days before the customer. Requiring both signatures to
     agree discarded real visits. The customer date is only a cross-check: an
-    independently read ACTION DATE must match it, and no other valid ACTION
-    DATE reading may have a wider-than-one-digit conflict. No Asana answer is
-    given to OCR or used here.
+    independently read ACTION DATE must match it, or two differently rendered
+    focused reads may each differ by at most one digit. Any wider conflict
+    blocks correction. No Asana answer is given to OCR or used here.
     """
     dates = [nvidia_client._parse_action_date(value) for value in signed_dates]
     audit = consensus.setdefault("_ocr_audit", {})
@@ -367,28 +367,83 @@ def _apply_signature_date_corroboration(
         audit["signature_date_check"] = "unresolved"
         return False
     target = dates[1]
+    age = (nvidia_client._today() - target).days
+    if not (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+            <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS):
+        audit["signature_date_check"] = "outside_window"
+        return False
     action = [
-        (nvidia_client._parse_action_date(value), value)
+        (nvidia_client._parse_action_date(value), value,
+         (row.get("_read_context") or {}).get("stage"),
+         (row.get("_read_context") or {}).get("zoom"))
         for row in action_readings
         for value in [row.get("service_date_raw") or
                       (row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw")]
         if isinstance(value, str) and value.strip()
     ]
-    valid = [(day, raw) for day, raw in action if day is not None]
+    valid = [(day, raw, stage, zoom) for day, raw, stage, zoom in action if day is not None]
     target_digits = target.strftime("%Y%m%d")
-    if not any(day == target for day, _ in valid) or any(
-        sum(left != right for left, right in zip(
-            day.strftime("%Y%m%d"), target_digits
-        )) > 1 for day, _ in valid
+    distance = lambda day: sum(left != right for left, right in zip(
+        day.strftime("%Y%m%d"), target_digits
+    ))
+    focused_near = {
+        (stage, zoom) for day, _, stage, zoom in valid
+        if stage in {"date_recheck", "date_parts"} and distance(day) <= 1
+    }
+    focused_far = any(
+        distance(day) > 1 for day, _, stage, _ in valid
+        if stage in {"date_recheck", "date_parts"}
+    )
+    exact_present = any(day == target for day, _, _, _ in valid)
+    paired_near = len(focused_near) >= 2 and not focused_far
+    if not valid or not (
+        paired_near or (
+            exact_present and all(distance(day) <= 1 for day, _, _, _ in valid)
+        )
     ):
         audit["signature_date_check"] = "no_action_date_agreement"
         return False
-    raw = next(raw for day, raw in valid if day == target)
+    exact = next((raw for day, raw, _, _ in valid if day == target), None)
+    raw = exact or target.strftime("%d/%m/%Y")
     consensus["service_date_raw"] = raw
     consensus["service_date_iso"] = target.isoformat()
     consensus["date_source"] = "ACTION_DATE"
     consensus["date_corrob"] = True
-    audit["signature_date_check"] = "corroborated"
+    audit["signature_date_check"] = (
+        "corroborated" if exact else "one_digit_customer_correction"
+    )
+    return True
+
+
+def _apply_customer_month_year_corroboration(
+        consensus: dict, action_dates: list, customer_months: list
+) -> bool:
+    """Use two ACTION DATE reads only when customer month/year also agrees.
+
+    The customer stamp can hide the day, so this is weaker than a full signed
+    date. It does not earn the extra date-corroboration score, and the normal
+    Asana task uniqueness gates still decide whether matching is safe.
+    """
+    audit = consensus.setdefault("_ocr_audit", {})
+    days = [nvidia_client._parse_action_date(value) for value in action_dates]
+    agreed = (
+        len(days) == 2 and days[0] is not None and days[0] == days[1]
+        and len(customer_months) == 2
+        and customer_months[0] is not None
+        and customer_months[0] == customer_months[1]
+        and days[0].strftime("%Y-%m") == customer_months[0]
+    )
+    if agreed:
+        age = (nvidia_client._today() - days[0]).days
+        agreed = (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+                  <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS)
+    audit["customer_month_year_check"] = "agreed" if agreed else "unresolved"
+    if not agreed:
+        return False
+    consensus["service_date_raw"] = action_dates[0]
+    consensus["service_date_iso"] = days[0].isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus.pop("date_corrob", None)
     return True
 
 
@@ -597,20 +652,49 @@ def _ocr_and_match(doc, job_type):
                         ))
                     except nvidia_client.NvidiaResponseError:
                         part_dates.append(None)
-                agreed = (len(part_dates) == 2 and
-                          part_dates[0] == part_dates[1] == customer_date.isoformat())
+                agreed = (len(part_dates) == 2 and part_dates[0] is not None
+                          and part_dates[0] == part_dates[1])
                 consensus.setdefault("_ocr_audit", {})["date_parts_recheck"] = (
                     "agreed" if agreed else "unresolved"
                 )
-                log.info("  日期分段診斷：有效讀數=%s、兩輪與客戶日期一致=%s",
+                log.info("  日期分段診斷：有效讀數=%s、兩輪同值=%s",
                          sum(value is not None for value in part_dates), agreed)
                 if agreed:
-                    parts_readings = [{"service_date_raw": value} for value in part_dates]
+                    parts_readings = [
+                        {"service_date_raw": value,
+                         "_read_context": {"stage": "date_parts", "zoom": zoom}}
+                        for value, zoom in zip(part_dates, config.OCR_FOCUSED_RETRY_ZOOMS)
+                    ]
                     if _apply_signature_date_corroboration(
                             consensus, [*readings, *parts_readings], signed_dates):
                         date_recheck_blocked = False
                         log.info("  ACTION DATE 分段雙讀獲客戶簽署日期確認，重新核對歷史工作")
                         task, tier = asana_client.find_task(consensus, job_type=job_type)
+            else:
+                # A stamp may obscure the customer DAY while leaving month and
+                # year legible. Two independent ACTION DATE part readings must
+                # agree in full, and two customer readings must confirm their
+                # month/year. Never fill the day from Asana or scan date.
+                customer_months = []
+                part_dates = []
+                for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+                    try:
+                        customer_months.append(nvidia_client.ocr_jobsheet_customer_month_year(
+                            doc, 0, zoom=zoom
+                        ))
+                    except nvidia_client.NvidiaResponseError:
+                        customer_months.append(None)
+                    try:
+                        part_dates.append(nvidia_client.ocr_jobsheet_action_date_parts(
+                            doc, 0, zoom=zoom
+                        ))
+                    except nvidia_client.NvidiaResponseError:
+                        part_dates.append(None)
+                if _apply_customer_month_year_corroboration(
+                        consensus, part_dates, customer_months):
+                    date_recheck_blocked = False
+                    log.info("  ACTION DATE 雙讀與客戶簽署月份一致，重新核對歷史工作")
+                    task, tier = asana_client.find_task(consensus, job_type=job_type)
 
     if (task is None and context_fields and asana_client._device_index is not None
             and all(consensus.get(field) for field in

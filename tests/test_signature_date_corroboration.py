@@ -39,6 +39,42 @@ class SignatureDateCorroborationTests(unittest.TestCase):
         ))
         self.assertEqual("2026-08-18", result["service_date_iso"])
 
+    def test_one_digit_date_error_needs_two_focused_reads_and_customer_signoff(self):
+        action = [
+            {"service_date_raw": "18/9/2026",
+             "_read_context": {"stage": "date_parts", "zoom": 5.0}},
+            {"service_date_raw": "18/9/2026",
+             "_read_context": {"stage": "date_parts", "zoom": 6.0}},
+        ]
+        result = {"_ocr_audit": {}}
+        self.assertTrue(processor._apply_signature_date_corroboration(
+            result, action, ["2026-08-14", "2026-08-18"]
+        ))
+        self.assertEqual("one_digit_customer_correction",
+                         result["_ocr_audit"]["signature_date_check"])
+        self.assertEqual("2026-08-18", result["service_date_iso"])
+        for reduced in (action[:1], [
+            {"service_date_raw": "18/9/2026"},
+            {"service_date_raw": "18/9/2026"},
+        ]):
+            self.assertFalse(processor._apply_signature_date_corroboration(
+                {"_ocr_audit": {}}, reduced,
+                ["2026-08-14", "2026-08-18"]
+            ))
+        self.assertFalse(processor._apply_signature_date_corroboration(
+            {"_ocr_audit": {}}, action,
+            ["2026-08-14", "2026-10-29"]
+        ))
+        year_error = [
+            {"service_date_raw": "18/8/2006",
+             "_read_context": {"stage": "date_parts", "zoom": zoom}}
+            for zoom in (5.0, 6.0)
+        ]
+        self.assertTrue(processor._apply_signature_date_corroboration(
+            {"_ocr_audit": {}}, year_error,
+            [None, "2026-08-18"]
+        ))
+
     def test_signatures_cannot_create_a_date_absent_from_action_panel(self):
         for action in ([{"service_date_raw": "18/9/2026"}], []):
             result = {"_ocr_audit": {}}
@@ -96,6 +132,34 @@ class SignatureDateCorroborationTests(unittest.TestCase):
         self.assertFalse(processor._apply_signature_date_corroboration(
             wrong, [{"service_date_raw": "2026-10-29"}, *parts], signed
         ))
+
+    def test_customer_month_year_only_confirms_two_matching_action_reads(self):
+        result = {"_ocr_audit": {}}
+        self.assertTrue(processor._apply_customer_month_year_corroboration(
+            result, ["2026-08-18", "2026-08-18"],
+            ["2026-08", "2026-08"]
+        ))
+        self.assertEqual("2026-08-18", result["service_date_iso"])
+        self.assertNotIn("date_corrob", result)
+        for days, months in (
+            (["2026-08-18", "2026-08-19"], ["2026-08", "2026-08"]),
+            (["2026-08-18", "2026-08-18"], ["2026-09", "2026-09"]),
+            (["2026-08-18", "2026-08-18"], ["2026-08", None]),
+        ):
+            self.assertFalse(processor._apply_customer_month_year_corroboration(
+                {"_ocr_audit": {}}, days, months
+            ))
+
+    def test_customer_month_year_reader_has_no_asana_candidate(self):
+        with patch.object(nvidia_client, "crop_jobsheet_field_card",
+                          return_value="synthetic"), \
+             patch.object(nvidia_client, "_call_vision",
+                          return_value='{"month":"8","year":"2026"}') as call:
+            result = nvidia_client.ocr_jobsheet_customer_month_year(None, 0)
+        self.assertEqual("2026-08", result)
+        prompt = call.call_args.args[0]
+        self.assertNotIn("Asana", prompt)
+        self.assertNotIn("2026-08", prompt)
 
     def test_corrob_date_may_distinguish_visits_but_not_shared_date(self):
         older = {

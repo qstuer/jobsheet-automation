@@ -1083,10 +1083,47 @@ def ocr_jobsheet_action_date_parts(
                 <= age <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS
             )
             log.info("  ACTION DATE 分段讀取：%s", "有效" if accepted else "超出日期範圍")
-            return parsed.isoformat() if accepted else None
+            # Keep the syntactically valid transcription only in this private
+            # review path. The processor may accept a single wrong year digit
+            # solely when independent customer sign-off corroborates it.
+            return parsed.isoformat()
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
     raise NvidiaResponseError("ACTION DATE 分段複核格式錯誤") from last_error
+
+
+def ocr_jobsheet_customer_month_year(
+        pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
+) -> Optional[str]:
+    """Read only month/year of customer sign-off when a stamp hides the day."""
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, ("customer_signed_date",), zoom=zoom,
+        strong=zoom >= 6.0,
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "This panel contains the CUSTOMER SIGNATURE DATE, sometimes crossed by "
+        "a round stamp. Read only the handwritten MONTH between the two date "
+        "separators and the YEAR after the second separator. The day may be "
+        "hidden: do not guess it. Ignore the stamp and printed label. "
+        'Return JSON only: {"month":null,"year":null} when either group '
+        'is unreadable, otherwise {"month":"MM","year":"YYYY"}.'
+    )
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(prompt, image_b64, max_tokens=120, expects_json=True)
+        try:
+            data = _parse_json_object(raw, required_keys={"month", "year"})
+            month, year = data["month"], data["year"]
+            if not all(isinstance(value, str) and value.isdigit()
+                       for value in (month, year)):
+                return None
+            if not (1 <= int(month) <= 12 and len(year) in (2, 4)):
+                return None
+            full_year = int(year) + (2000 if len(year) == 2 else 0)
+            return f"{full_year:04d}-{int(month):02d}"
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
+            last_error = exc
+    raise NvidiaResponseError("客戶簽署月份格式錯誤") from last_error
 
 
 def _context_field_prompt(field: str, vocabulary: dict) -> str:
