@@ -515,6 +515,33 @@ def _ocr_and_match(doc, job_type):
             date_recheck_blocked = True
             log.info("  ACTION DATE 單格兩輪未一致，不憑原先日期自動配對")
 
+    if (task is None and context_fields and asana_client._device_index is not None
+            and all(consensus.get(field) for field in
+                    ("serial_candidates", "product_raw", "hospital_raw"))):
+        # Isolated backtest only. A repeated PM may have an ambiguous handwritten
+        # month; independently transcribed probe/part IDs can distinguish its
+        # live Asana task. Never show the model Asana descriptions or candidate
+        # identifiers. One pass or one matching code is not sufficient.
+        log.info("  歷史工作仍未確定，ACTION TAKEN 識別碼做兩輪獨立抄錄")
+        action_reads = []
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                action_reads.append(nvidia_client.ocr_jobsheet_action_identifiers(
+                    doc, 0, zoom=zoom
+                ))
+            except nvidia_client.NvidiaResponseError:
+                log.warning("  ACTION TAKEN 單格 %.1fx 暫時無法完成", zoom)
+        action_ids = [value for value in action_reads[0]
+                      if value in set(action_reads[1])] if len(action_reads) == 2 else []
+        consensus.setdefault("_ocr_audit", {})["action_identifier_recheck"] = {
+            "readings": deepcopy(action_reads), "agreed": list(action_ids),
+        }
+        if len(action_ids) >= 2:
+            consensus["action_identifiers"] = action_ids
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  ACTION TAKEN 沒有兩個獨立一致的識別碼，不作工作證據")
+
     if task is None and not date_recheck_blocked:
         # The fixed program has already applied product, hospital and serial
         # gates.  Only a close top-two tie reaches the vision model, with at

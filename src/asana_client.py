@@ -1271,6 +1271,22 @@ def _task_work_orders(task: dict) -> List[str]:
     return list(dict.fromkeys(values))
 
 
+def _action_id_key(value: str) -> str:
+    if "?" in value:
+        return ""
+    token = re.sub(r"[^A-Z0-9]", "", value.upper())
+    return token if (5 <= len(token) <= 18
+                     and any(ch.isalpha() for ch in token)
+                     and any(ch.isdigit() for ch in token)) else ""
+
+
+def _task_action_ids(task: dict) -> set[str]:
+    # Notes are read live from Asana; task titles and indexed aggregate fields
+    # are not used as evidence of what happened on this particular visit.
+    tokens = re.findall(r"[A-Z0-9][A-Z0-9./_-]*", (task.get("notes") or "").upper())
+    return {key for value in tokens if (key := _action_id_key(value))}
+
+
 def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                      hosp: Optional[str], product: Optional[str],
                      job_type: Optional[str] = None) -> dict:
@@ -1340,6 +1356,18 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         score += 60
         support.add("work_order")
         reasons.append("HAWO/WO")
+
+    # Only the isolated backtest supplies these two-pass ACTION TAKEN codes.
+    # Require two distinct exact tokens from this specific task's live notes;
+    # a shared machine identifier or a lone OCR mistake cannot decide a visit.
+    action_ids = {_action_id_key(value)
+                  for value in (ocr_data.get("action_identifiers") or [])}
+    action_ids.discard("")
+    action_ids -= {_action_id_key(value) for value in serials}
+    if len(action_ids & _task_action_ids(task)) >= 2:
+        score += 50
+        support.add("action_codes")
+        reasons.append("ACTION TAKEN identifiers")
 
     hospital_ok = bool(
         hosp and _norm(hospital_core(name)) == _norm(hosp)
@@ -1538,7 +1566,7 @@ def find_task(ocr_data: dict, job_type: str = None,
         independent = (
             (best["support"] - scored[1]["support"])
             if len(scored) > 1 else set()
-        ) & {"phone_exact", "asset_exact", "work_order"}
+        ) & {"phone_exact", "asset_exact", "work_order", "action_codes"}
         if not independent:
             log.info("  多次歷史工作只靠相差超過三日的日期分開，保留待核對")
             return None, 0

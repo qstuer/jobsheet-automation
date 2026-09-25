@@ -255,6 +255,101 @@ class OCRProvenanceTests(unittest.TestCase):
         self.assertEqual(["date_recheck", "date_recheck"],
                          [row["context"]["stage"] for row in result["_ocr_audit"]["readings"][-2:]])
 
+    def test_action_identifier_card_only_keeps_visible_mixed_tokens(self):
+        response = json.dumps({"action_identifiers": [
+            "PRB-A123", "TX9-4567", "12345678", "ordinary", "PRB?999",
+            "prba123", "AB1",
+        ]})
+        with patch.object(nvidia_client, "crop_jobsheet_field_card", return_value="synthetic") as crop, \
+             patch.object(nvidia_client, "_call_vision", return_value=response) as call:
+            result = nvidia_client.ocr_jobsheet_action_identifiers(None, 0, zoom=5.0)
+        self.assertEqual(["PRBA123", "TX94567"], result)
+        self.assertEqual(("action_taken",), crop.call_args.args[2])
+        self.assertIn("do not include ordinary words", call.call_args.args[0])
+
+    def test_isolated_action_identifiers_resolve_visit_without_leaking_values(self):
+        broad = self.normalize(product_raw="EPIQ Elite", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"],
+                               phone_candidates=["99990070"],
+                               contact_person_raw="TEST PERSON",
+                               service_date_raw="20/9/2026")
+        context_cards = [self.normalize(product_raw="EPIQ Elite") for _ in range(2)] + [
+            self.normalize(hospital_raw="QMH") for _ in range(2)
+        ]
+        focused_dates = [self.normalize(service_date_raw="20/9/2026") for _ in range(2)]
+        action_reads = [["PRBA123", "TX94567"], ["TX94567", "PRBA123"]]
+
+        def find(ocr, job_type):
+            return ({"gid": "synthetic-task"}, 2) if len(ocr.get("action_identifiers") or []) == 2 else (None, 0)
+
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(asana_client, "_device_index", {"schema_version": 3}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_serial_candidates", return_value=["US123F4567"]), \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=context_cards), \
+             patch.object(nvidia_client, "ocr_jobsheet_focused_field", side_effect=focused_dates), \
+             patch.object(nvidia_client, "ocr_jobsheet_action_identifiers", side_effect=action_reads) as read, \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
+             patch.object(asana_client, "find_task", side_effect=find), \
+             self.assertLogs("processor", level="INFO") as logs:
+            task, _, result = processor._ocr_and_match(None, "PM")
+
+        self.assertEqual("synthetic-task", task["gid"])
+        self.assertEqual(["PRBA123", "TX94567"], result["action_identifiers"])
+        self.assertEqual(2, read.call_count)
+        for private in ("PRBA123", "TX94567", "US123F4567", "99990070"):
+            self.assertNotIn(private, "\n".join(logs.output) + processor._dry_run_ocr_preview(result))
+
+    def test_action_identifier_disagreement_cannot_resolve_visit(self):
+        broad = self.normalize(product_raw="EPIQ Elite", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"],
+                               phone_candidates=["99990070"],
+                               contact_person_raw="TEST PERSON",
+                               service_date_raw="20/9/2026")
+        context_cards = [self.normalize(product_raw="EPIQ Elite") for _ in range(2)] + [
+            self.normalize(hospital_raw="QMH") for _ in range(2)
+        ]
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(asana_client, "_device_index", {"schema_version": 3}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_serial_candidates", return_value=["US123F4567"]), \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=context_cards), \
+             patch.object(nvidia_client, "ocr_jobsheet_focused_field",
+                          side_effect=[self.normalize(service_date_raw="20/9/2026") for _ in range(2)]), \
+             patch.object(nvidia_client, "ocr_jobsheet_action_identifiers",
+                          side_effect=[["PRBA123", "TX94567"], ["PRBA123"]]), \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
+             patch.object(asana_client, "find_task", return_value=(None, 0)), \
+             patch.object(asana_client, "get_close_index_candidates", return_value=[]):
+            task, _, result = processor._ocr_and_match(None, "PM")
+        self.assertIsNone(task)
+        self.assertNotIn("action_identifiers", result)
+        self.assertEqual(["PRBA123"], result["_ocr_audit"]["action_identifier_recheck"]["agreed"])
+
+    def test_action_identifier_fallback_is_off_without_isolated_flag(self):
+        reading = self.normalize(product_raw="EPIQ Elite", hospital_raw="QMH",
+                                 serial_candidates=["US123F4567"],
+                                 phone_candidates=["99990070"],
+                                 contact_person_raw="TEST PERSON",
+                                 service_date_raw="20/9/2026")
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "0"}), \
+             patch.object(asana_client, "_device_index", {"schema_version": 3}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=reading), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=reading), \
+             patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=reading), \
+             patch.object(nvidia_client, "ocr_jobsheet_serial_candidates", return_value=["US123F4567"]), \
+             patch.object(nvidia_client, "ocr_jobsheet_action_identifiers") as action_reader, \
+             patch.object(asana_client, "find_task", return_value=(None, 0)), \
+             patch.object(asana_client, "get_close_index_candidates", return_value=[]):
+            task, _, result = processor._ocr_and_match(None, "PM")
+        self.assertIsNone(task)
+        self.assertNotIn("action_identifiers", result)
+        action_reader.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -958,6 +958,47 @@ def ocr_jobsheet_focused_field(
     return _read_card(image_b64, prompt, {field})
 
 
+def normalize_action_identifiers(values) -> list[str]:
+    """Keep only visible mixed letter/digit identifiers, never free-text guesses."""
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise NvidiaResponseError("ACTION TAKEN 識別碼不是文字清單")
+    result = []
+    for value in values:
+        if "?" in value:
+            continue
+        token = re.sub(r"[^A-Z0-9]", "", value.upper())
+        if (5 <= len(token) <= 18 and any(c.isalpha() for c in token)
+                and any(c.isdigit() for c in token) and token not in result):
+            result.append(token)
+    return result[:8]
+
+
+def ocr_jobsheet_action_identifiers(
+        pdf_doc: fitz.Document, page_idx: int, zoom: float) -> list[str]:
+    """Test-only task discriminator: copy identifiers in ACTION TAKEN, no Asana hints."""
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, ("action_taken",), zoom=zoom, strong=zoom >= 6.0
+    )
+    prompt = _TRANSCRIPTION_RULES + (
+        "Read only the ACTION TAKEN panel. Copy the visible equipment, probe, "
+        "or part identifiers containing both letters and digits. Keep their "
+        "punctuation; do not include ordinary words, dates, phone numbers, or "
+        "identifiers from any other panel. An unclear character must be '?' "
+        "rather than a guessed character. No candidate task or expected answer "
+        "is available. Return JSON only: {\"action_identifiers\":[]}. "
+        "At most eight distinct identifiers."
+    )
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(prompt, image_b64, max_tokens=500, expects_json=True)
+        try:
+            data = _parse_json_object(raw, required_keys={"action_identifiers"})
+            return normalize_action_identifiers(data["action_identifiers"])
+        except (json.JSONDecodeError, NvidiaResponseError) as exc:
+            last_error = exc
+    raise NvidiaResponseError("ACTION TAKEN 識別碼格式錯誤") from last_error
+
+
 def _context_field_prompt(field: str, vocabulary: dict) -> str:
     """單格提示只接收私人索引投影，不把客戶詞彙寫進程式碼。"""
     if field == "product_raw":

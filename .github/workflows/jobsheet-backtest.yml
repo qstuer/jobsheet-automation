@@ -78,7 +78,7 @@ jobs:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          # Recheck the known wrong-month case after restoring the date crop's upper strokes.
+          # Recheck the known wrong-month case with isolated ACTION TAKEN identifiers.
           # Remove this selection only after the B08 result has been reviewed.
           JOBSHEET_BACKTEST_SAMPLE_IDS: B08
           OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}

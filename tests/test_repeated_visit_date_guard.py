@@ -70,6 +70,38 @@ class RepeatedVisitDateGuardTests(unittest.TestCase):
         dates = asana_client._task_dates({"notes": "Visit: 2026-08-20"})
         self.assertEqual([date(2026, 8, 20)], dates)
 
+    def test_two_visit_specific_identifiers_can_resolve_ambiguous_month(self):
+        self.tasks[0]["notes"] = "Checked probes PRB-A123 and TX9-4567."
+        self.tasks[1]["notes"] = "Next planned visit."
+        ocr = dict(_ocr("2026-09-20"),
+                   action_identifiers=["PRBA123", "TX94567"])
+        with patch.object(asana_client, "_device_index", None), \
+             patch.object(asana_client, "_gather_pool", return_value=self.tasks):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+        self.assertEqual("older", task["gid"])
+        self.assertEqual(2, tier)
+
+    def test_one_identifier_or_main_serial_is_not_enough(self):
+        self.tasks[0]["notes"] = "Checked probes PRB-A123 and TX9-4567."
+        for identifiers in (["PRBA123"], ["AB123B4567", "PRBA123"]):
+            ocr = dict(_ocr("2026-09-20"), action_identifiers=identifiers)
+            with patch.object(asana_client, "_device_index", None), \
+                 patch.object(asana_client, "_gather_pool", return_value=self.tasks):
+                task, tier = asana_client.find_task(ocr, job_type="PM")
+            self.assertIsNone(task)
+            self.assertEqual(0, tier)
+
+    def test_shared_identifiers_cannot_decide_between_visits(self):
+        for task in self.tasks:
+            task["notes"] = "Checked probes PRB-A123 and TX9-4567."
+        ocr = dict(_ocr("2026-09-20"),
+                   action_identifiers=["PRBA123", "TX94567"])
+        with patch.object(asana_client, "_device_index", None), \
+             patch.object(asana_client, "_gather_pool", return_value=self.tasks):
+            task, tier = asana_client.find_task(ocr, job_type="PM")
+        self.assertIsNone(task)
+        self.assertEqual(0, tier)
+
 
 if __name__ == "__main__":
     unittest.main()
