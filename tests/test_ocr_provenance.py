@@ -90,16 +90,16 @@ class OCRProvenanceTests(unittest.TestCase):
         self.assertIn("invalid_phone_length", audit["rejections"]["phone_candidates"])
 
     def test_snapshot_is_independent_of_input_and_normalized_mutations(self):
-        values = ["+852 6123 4567", "123"]
+        values = ["+852 9999 0067", "123"]
         reading = self.normalize(phone_candidates=values, department_room_raw="Asset# 123456 6F")
-        values.append("76543210")
+        values.append("99990070")
         reading["phone_candidates"].clear()
-        self.assertEqual(["+852 6123 4567", "123"], reading["_ocr_audit"]["raw"]["phone_candidates"])
-        self.assertEqual(["61234567"], reading["_ocr_audit"]["normalized"]["phone_candidates"])
+        self.assertEqual(["+852 9999 0067", "123"], reading["_ocr_audit"]["raw"]["phone_candidates"])
+        self.assertEqual(["99990067"], reading["_ocr_audit"]["normalized"]["phone_candidates"])
         self.assertEqual("6F", reading["_ocr_audit"]["normalized"]["location_raw"])
 
     def test_candidate_limit_keeps_all_original_values_for_diagnosis(self):
-        values = ["61234561", "61234562", "61234563", "61234564"]
+        values = ["99990061", "99990062", "99990063", "99990064"]
         reading = self.normalize(phone_candidates=values)
         self.assertEqual(values[:3], reading["phone_candidates"])
         self.assertEqual(values, reading["_ocr_audit"]["raw"]["phone_candidates"])
@@ -116,7 +116,7 @@ class OCRProvenanceTests(unittest.TestCase):
 
     def test_matching_trace_has_round_context_and_does_not_leak_to_logs(self):
         reading = self.normalize(product_raw="EPIQ", hospital_raw="QMH", serial_candidates=["US123F4567"],
-                                 contact_person_raw="PRIVATECONTACT", phone_candidates=["76543210", "123"])
+                                 contact_person_raw="PRIVATECONTACT", phone_candidates=["99990070", "123"])
         with patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=reading), \
              patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=reading), \
              patch.object(asana_client, "find_task", return_value=({"gid": "101"}, 2)), \
@@ -125,8 +125,66 @@ class OCRProvenanceTests(unittest.TestCase):
         audit = result["_ocr_audit"]
         self.assertEqual(["primary", "identity"], [r["context"]["stage"] for r in audit["readings"]])
         public_text = "\n".join(logs.output) + processor._dry_run_ocr_preview(result)
-        for private in ("PRIVATECONTACT", "76543210", "US123F4567", "QMH"):
+        for private in ("PRIVATECONTACT", "99990070", "US123F4567", "QMH"):
             self.assertNotIn(private, public_text)
+
+    def test_context_single_fields_override_broad_cards_only_after_two_votes(self):
+        broad = self.normalize(product_raw="CX50", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"])
+        focused = [self.normalize(product_raw="EPIQ Elite") for _ in range(2)] + [
+            self.normalize(hospital_raw="PYNEH") for _ in range(2)
+        ]
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}) as build, \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=focused) as reader, \
+             patch.object(asana_client, "find_task", return_value=({"gid": "task"}, 2)) as find:
+            task, _, result = processor._ocr_and_match(None, "PM")
+        self.assertEqual("task", task["gid"])
+        self.assertEqual("EPIQ Elite", result["product_raw"])
+        self.assertEqual("PYNEH", result["hospital_raw"])
+        self.assertEqual(["product_raw", "product_raw", "hospital_raw", "hospital_raw"],
+                         [call.args[2] for call in reader.call_args_list])
+        build.assert_called_once()
+        self.assertEqual("PYNEH", find.call_args.args[0]["hospital_raw"])
+        self.assertEqual(["primary", "identity"] + ["context_field"] * 4,
+                         [row["context"]["stage"] for row in result["_ocr_audit"]["readings"]])
+        self.assertEqual("QMH", result["_ocr_audit"]["readings"][0]["raw"]["hospital_raw"])
+
+    def test_context_disagreement_never_reaches_asana(self):
+        broad = self.normalize(product_raw="CX50", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"])
+        focused = [self.normalize(product_raw="EPIQ Elite"),
+                   self.normalize(product_raw="Affiniti 70"),
+                   self.normalize(hospital_raw="PYNEH"),
+                   self.normalize(hospital_raw="PYNEH")]
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=focused), \
+             patch.object(asana_client, "find_task") as find:
+            task, _, result = processor._ocr_and_match(None, "PM")
+        self.assertIsNone(task)
+        self.assertIsNone(result["product_raw"])
+        self.assertEqual("conflicting_readings",
+                         result["_ocr_audit"]["consensus_rejections"]["product_raw"])
+        find.assert_not_called()
+
+    def test_context_prompt_is_not_a_candidate_answer_list(self):
+        vocabulary = {"product_families": ["TESTFAMILY"],
+                      "product_models": ["TESTMODEL"],
+                      "hospital_codes": ["ZZ"],
+                      "same_hospital_codes": [["YY", "ZZ"]]}
+        for field in ("product_raw", "hospital_raw"):
+            prompt = nvidia_client._context_field_prompt(field, vocabulary)
+            self.assertIn("NOT a", prompt)
+            self.assertIn("Never make up", prompt)
+        self.assertIn("TESTMODEL", nvidia_client._context_field_prompt("product_raw", vocabulary))
+        self.assertIn("ZZ", nvidia_client._context_field_prompt("hospital_raw", vocabulary))
+        with self.assertRaises(ValueError):
+            nvidia_client._context_field_prompt("serial_candidates", vocabulary)
 
     def test_matching_date_uses_canonical_day_not_spaced_display_value(self):
         reading = self.normalize(service_date_raw="18 / 8 / 26")

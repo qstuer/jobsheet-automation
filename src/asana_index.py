@@ -330,7 +330,7 @@ def _contacts(text: str) -> list[str]:
                          flags=re.IGNORECASE)[0].strip(" .,:;-")
         if sum(char.isalpha() for char in value) >= 2:
             values.append(value)
-    # 很多 task description 只寫「25956917 Ms.Yan」，沒有 Contact
+    # Some task descriptions put a phone and contact name together, unlabeled.
     # 標籤；電話後同一行的純姓名仍可作低權重聯絡人證據。
     for match in _CONTACT_AFTER_PHONE_RE.finditer(text or ""):
         value = re.sub(r"\s+", " ", match.group("value")).strip(" .,:;-")
@@ -376,8 +376,8 @@ def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[d
     hospital = asana_client.hospital_core(hospital_name) or hospital_name or None
     hospital_aliases = asana_client.hospital_aliases(hospital_name)
     # Order Numbers deliberately never enter the index.  They are only used to
-    # remove title numbers from the generic-phone fallback; labelled phones such
-    # as ``Phone: 61234567`` remain valid evidence.
+    # remove title numbers from the generic-phone fallback; an explicitly
+    # labeled phone field remains valid evidence.
     combined_text = f"{name}\n{notes}"
     indexed_order_numbers = re.findall(
         r"(?i)\b(?:order(?:\s*(?:no\.?|number))?|sr\s*#?)\s*[:#\-]?\s*"
@@ -544,11 +544,9 @@ def _build_location_directory(rows: list[dict], learned_groups: list[dict]) -> l
             confirmed, learned_aliases, unconfirmed, enabled = [], [], [core], False
         elif known:
             key = _norm(known)
-            official = (
-                asana_client.HOSPITAL_OFFICIAL_NAMES.get(key)
-                or asana_client.HOSPITAL_OFFICIAL_NAMES.get(str(known).upper())
-                or str(known)
-            )
+            # A code-only task cannot supply an official full name. Preserve
+            # the code until an actual full spelling appears in private data.
+            official = core if len(re.findall(r"[A-Za-z]+", core)) >= 2 else str(known)
             confirmed = [
                 alias for alias, canonical in config.HOSPITAL_SHORT_ALIASES.items()
                 if _norm(canonical) == key
@@ -574,6 +572,9 @@ def _build_location_directory(rows: list[dict], learned_groups: list[dict]) -> l
             "device_count": 0, "match_enabled": enabled, "alias_sources": [],
             "_devices": set(),
         })
+        if known and len(re.findall(r"[A-Za-z]+", core)) >= 2 \
+                and row["canonical_hospital"] == str(known):
+            row["canonical_hospital"] = core
         row["confirmed_aliases"] = _unique([*row["confirmed_aliases"], *confirmed])
         row["learned_aliases"] = _unique([*row["learned_aliases"], *learned_aliases])
         row["unconfirmed_aliases"] = _unique([*row["unconfirmed_aliases"], *unconfirmed])

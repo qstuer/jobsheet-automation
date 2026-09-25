@@ -73,11 +73,14 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           echo "089345ec6c4bc16d5896217bd7fe48560455cdcc4b8241f32dca9c2f1550a766  /tmp/jobsheet-backtest/manifest-reviewed-20260923.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Run 20 private samples without cloud writes
+      - name: Recheck B08 only without cloud writes
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
+          # First prove the wrong-month safety gate on the known regression.
+          # Remove this selection only after the B08 result has been reviewed.
+          JOBSHEET_BACKTEST_SAMPLE_IDS: B08
           OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.

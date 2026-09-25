@@ -44,41 +44,9 @@ _task_cache: dict = {}
 _device_index: Optional[dict] = None
 _INDEX_SCORE_EPSILON = 1e-9
 
-# 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
-# 與配對證據；完整的私人機構名稱仍可保留使用。
-HOSPITAL_ALIASES = {
-    **config.HOSPITAL_SHORT_ALIASES,
-    "QUEENMARYHOSPITAL": "QMH",
-    "QUEENELIZABETHHOSPITAL": "QEH",
-    "KWONGWAHHOSPITAL": "KWH",
-    "KOWLOONHOSPITAL": "KH",
-    "PAMELAYOUDENETHERSOLEEASTERNHOSPITAL": "PYNEH",
-    "PRINCESSMARGARETHOSPITAL": "PMH",
-    "HONGKONGCHILDRENSHOSPITAL": "HKCH",
-    "PRINCEOFWALESHOSPITAL": "PWH",
-    "UNITEDCHRISTIANHOSPITAL": "UCH",
-    "TUENMUNHOSPITAL": "TMH",
-    "NORTHDISTRICTHOSPITAL": "NDH",
-    "GRANTHAMHOSPITAL": "GH",
-    # 保留空格供 Asana typeahead 作真正的子字串搜尋；比較時仍會經 _norm。
-    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
-}
-
-HOSPITAL_OFFICIAL_NAMES = {
-    "QMH": "Queen Mary Hospital",
-    "QEH": "Queen Elizabeth Hospital",
-    "KWH": "Kwong Wah Hospital",
-    "KH": "Kowloon Hospital",
-    "PYNEH": "Pamela Youde Nethersole Eastern Hospital",
-    "PMH": "Princess Margaret Hospital",
-    "HKCH": "Hong Kong Children's Hospital",
-    "PWH": "Prince of Wales Hospital",
-    "UCH": "United Christian Hospital",
-    "TMH": "Tuen Mun Hospital",
-    "NDH": "North District Hospital",
-    "GH": "Grantham Hospital",
-    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
-}
+# Only confirmed short codes are public configuration. Full customer/site names
+# come from the private Drive index at runtime, never from repository literals.
+HOSPITAL_ALIASES = dict(config.HOSPITAL_SHORT_ALIASES)
 
 
 class AsanaError(RuntimeError):
@@ -199,6 +167,46 @@ def hospital_acronym(value: Optional[str]) -> Optional[str]:
     return acronym if 2 <= len(acronym) <= 8 else None
 
 
+def _private_hospital_aliases() -> dict[str, str]:
+    """Return verified aliases from the in-memory private location directory.
+
+    An unconfirmed short code or a mere shared-device history must not become
+    an alias. Do not cache this mapping: tests and one-shot runs replace the
+    private index in the same Python process.
+    """
+    mapping = {}
+    ambiguous = set()
+    if not _device_index:
+        return mapping
+    for group in _device_index.get("location_directory") or []:
+        if not group.get("match_enabled"):
+            continue
+        names = [
+            group.get("canonical_hospital") or "",
+            *(group.get("confirmed_aliases") or []),
+            *(group.get("learned_aliases") or []),
+        ]
+        short_codes = {
+            config.HOSPITAL_SHORT_ALIASES[name.upper()]
+            for name in names
+            if name.upper() in config.HOSPITAL_SHORT_ALIASES
+        }
+        canonical = (sorted(short_codes)[0] if len(short_codes) == 1
+                     else group.get("canonical_hospital") or "")
+        if not canonical:
+            continue
+        for name in names:
+            if name:
+                key = _norm(name)
+                if key in mapping and mapping[key] != canonical:
+                    ambiguous.add(key)
+                else:
+                    mapping[key] = canonical
+    for key in ambiguous:
+        mapping.pop(key, None)
+    return mapping
+
+
 def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
     """Separate hospital identity from status tags and floor/room suffixes.
 
@@ -222,8 +230,8 @@ def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
         detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
         core = match.group("hospital").strip()
     else:
-        # ``QMH K3``, ``TKO MB-G-A`` and ``HKAH(Stubbs Road)`` are a short
-        # hospital code followed by in-hospital detail.  Requiring the code to
+        # An uppercase site code followed by room detail is a different field.
+        # Requiring the code to
         # be uppercase avoids splitting ordinary full names at their first word.
         match = re.match(
             r"^(?P<hospital>[A-Z]{2,8})(?:(?:\s+)|(?=\())(?P<detail>.+)$",
@@ -241,7 +249,7 @@ def hospital_aliases(value: Optional[str]) -> List[str]:
     if not core:
         return []
     canonical = hospital_core(core)
-    # Unknown short codes are the most common OCR hallucination (PN/KWM/PYTV).
+    # Unknown short codes are a common OCR hallucination.
     # They must not pass the 33% fuzzy hospital gate.
     if re.fullmatch(r"[A-Za-z]{2,6}", core) and not canonical:
         return []
@@ -261,6 +269,7 @@ def _index_hospital_aliases(value: Optional[str]) -> List[str]:
     observed = _norm(core)
     if not observed or _device_index is None:
         return aliases
+    matching_groups = []
     for group in _device_index.get("location_directory") or []:
         if not group.get("match_enabled"):
             continue
@@ -270,7 +279,9 @@ def _index_hospital_aliases(value: Optional[str]) -> List[str]:
             *(group.get("learned_aliases") or []),
         ]
         if observed in {_norm(item) for item in known if item}:
-            return list(dict.fromkeys([*aliases, *known]))
+            matching_groups.append(known)
+    if len(matching_groups) == 1:
+        return list(dict.fromkeys([*aliases, *matching_groups[0]]))
     return aliases
 
 
@@ -279,19 +290,24 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     if not customer:
         return None
     core = re.split(r"[,/\-]", customer.strip(), 1)[0].strip()
-    canonical = HOSPITAL_ALIASES.get(_norm(core))
+    normalized = _norm(core)
+    canonical = HOSPITAL_ALIASES.get(normalized)
     if canonical:
         return canonical
-    # KWM / PYTV 這類未知短碼不得成為候選搜尋或加分依據。
+    private_aliases = _private_hospital_aliases()
+    if normalized in private_aliases:
+        return private_aliases[normalized]
+    # 未確認的短碼不得成為候選搜尋或加分依據。
     if re.fullmatch(r"[A-Za-z]{2,6}", core):
         return None
 
-    # 完整醫院名可能有極少量抄寫誤差，例如 Tong Nah Hospital。只在它與
-    # 已確認清單中的某一個完整名稱相差最多兩字、而且最近答案唯一時校正。
-    # 這一步只在程式內做；候選名不會交給視覺模型，避免模型迎合答案。
-    normalized = _norm(core)
+    # A complete name can imply a known acronym without a hardcoded name.
+    # Fuzzy correction, however, requires the private confirmed directory.
+    acronym = hospital_acronym(core)
+    if acronym in config.HOSPITAL_SHORT_ALIASES.values():
+        return acronym
     full_names = {
-        raw: value for raw, value in HOSPITAL_ALIASES.items()
+        raw: value for raw, value in private_aliases.items()
         if len(raw) >= 10
     }
     distances = sorted(
@@ -314,7 +330,20 @@ def hospital_search_terms(canonical: Optional[str]) -> List[str]:
         raw for raw, value in config.HOSPITAL_SHORT_ALIASES.items()
         if value == canonical
     ]
-    return list(dict.fromkeys([canonical, *aliases]))
+    # Full spellings are only supplied by the private index. They are useful
+    # for Asana typeahead when the task title uses a full name instead of code.
+    private = [
+        name for group in (_device_index or {}).get("location_directory") or []
+        if group.get("match_enabled")
+        and _norm(canonical) in {
+            _norm(group.get("canonical_hospital") or ""),
+            *(_norm(value) for value in group.get("confirmed_aliases") or []),
+            *(_norm(value) for value in group.get("learned_aliases") or []),
+        }
+        for name in [group.get("canonical_hospital") or ""]
+        if name
+    ]
+    return list(dict.fromkeys([canonical, *aliases, *private]))
 
 
 def extract_serial(name: str) -> Optional[str]:
@@ -921,14 +950,16 @@ def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -
 
 
 def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
-                       selected_device_key: Optional[str] = None) -> tuple[List[dict], bool]:
+                       selected_device_key: Optional[str] = None) -> tuple[List[dict], bool, bool]:
     """Choose one device, then hydrate its historical tasks from live Asana.
 
-    The boolean distinguishes a genuine index miss (safe to use typeahead) from
-    ambiguous indexed candidates (must stay pending instead of broadening).
+    The first boolean distinguishes a genuine index miss from ambiguous indexed
+    candidates. The second records repeated same-type visits *before* date
+    filtering, so a wrong OCR date cannot hide an older visit from the final
+    safety check.
     """
     if _device_index is None:
-        return [], False
+        return [], False, False
     prepared = _prepare_index_query(ocr_data)
     raw_scores = [
         _score_index_device(row, prepared, job_type)
@@ -938,7 +969,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         raw_scores, prepared, job_type
     )
     if joint_ambiguous:
-        return [], True
+        return [], True, False
     had_prefilter = any(
         item["product_similarity"] >= config.INDEX_PRODUCT_MIN_SIMILARITY
         and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY
@@ -950,7 +981,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         raw_scores, bool(prepared.get("_index_serials"))
     )
     if not scored:
-        return [], had_prefilter
+        return [], had_prefilter, False
     for rank, item in enumerate(scored[:3], 1):
         log.info(
             "  設備候選 #%s：serial相似=%s%%、產品=%s%%、醫院=%s%%、證據=%s",
@@ -972,7 +1003,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         )
         if selected is None:
             log.warning("  視覺複核選擇不在安全候選內，停止配對")
-            return [], True
+            return [], True, False
         best = selected
     else:
         best = scored[0]
@@ -992,9 +1023,26 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
             "  設備索引前兩名只相差 %s 個百分點，需要一次候選複核",
             round(gap * 100),
         )
-        return [], True
+        return [], True, False
 
     refs = list(best["row"].get("task_refs") or [])
+    service_date = (
+        _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
+        if ocr_data.get("date_source") == "ACTION_DATE" else None
+    )
+
+    def plausible_repeat(ref: dict) -> bool:
+        if job_type and ref.get("job_type") not in (None, job_type):
+            return False
+        formal_dates = _formal_index_ref_dates(ref)
+        return not service_date or not formal_dates or min(
+            abs((day - service_date).days) for day in formal_dates
+        ) <= 93
+
+    repeated_same_type = len({
+        str(ref.get("gid")) for ref in refs
+        if ref.get("gid") and plausible_repeat(ref)
+    }) > 1
     refs.sort(key=lambda ref: _score_index_task_ref(ref, ocr_data, job_type), reverse=True)
     gids = []
     for ref in refs:
@@ -1006,7 +1054,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
     gids = gids[:config.ASANA_MAX_HYDRATED_CANDIDATES]
     hydrated = [_fetch_task(gid) for gid in gids]
     log.info("  已鎖定一部設備，並即時讀取 %s 個歷史 Asana task", len(hydrated))
-    return hydrated, True
+    return hydrated, True, repeated_same_type
 
 
 def _clean_candidates(values, fallback=None) -> List[str]:
@@ -1055,9 +1103,14 @@ def _task_dates(task: dict) -> List[date]:
     """只回傳可能代表實際服務日的日期。
 
     modified_at 會因改名、留言或欄位更新而變，不可用來證明服務日期；
-    created/completed 只在另一個 helper 作很弱的排序，不算交叉證據。
+    正式到期／完成日優先；描述中的舊保養日期只在兩者皆無時後備。
     """
-    values = [task.get("due_on"), task.get("start_on")]
+    formal = [task.get("due_on"), task.get("completed_at")]
+    parsed_formal = [_parse_date(value) for value in formal if value]
+    parsed_formal = list(dict.fromkeys(value for value in parsed_formal if value))
+    if parsed_formal:
+        return parsed_formal
+    values = [task.get("start_on")]
     notes = task.get("notes") or ""
     values.extend(re.findall(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|"
                              r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", notes))
@@ -1149,7 +1202,7 @@ def _task_contacts(task: dict) -> List[str]:
                          flags=re.IGNORECASE)[0].strip(" .,:;-")
         if sum(char.isalpha() for char in value) >= 2:
             contacts.append(value)
-    # PM 工作常直接寫成 ``25956917 Ms.Yan``，沒有 Contact 標籤。
+    # A task may contain an unlabeled phone followed by a contact name.
     # 電話只用來定位同一行；人名仍獨立保存和低權重比較。
     for value in re.findall(
         r"(?im)(?:\+?852[ -]?)?\d{4}[ -]?\d{4}\s+"
@@ -1417,8 +1470,9 @@ def find_task(ocr_data: dict, job_type: str = None,
     # row, retain the existing live typeahead search for newly-created tasks;
     # once rows are found, do not broaden the search and risk a false match.
     used_index = False
+    repeated_index_visit = False
     if _device_index is not None:
-        pool, index_had_candidates = _gather_index_pool(
+        pool, index_had_candidates, repeated_index_visit = _gather_index_pool(
             ocr_data, job_type, selected_device_key=selected_device_key
         )
         used_index = bool(pool)
@@ -1471,6 +1525,23 @@ def find_task(ocr_data: dict, job_type: str = None,
     best = scored[0]
     runner_score = scored[1]["score"] if len(scored) > 1 else -1
     gap = best["score"] - runner_score
+
+    # A date read from handwriting can be wrong even when two OCR passes agree.
+    # For repeated visits on the same device, a task 4–31 days away must not
+    # win solely because it falls into a better date-scoring bucket. Require a
+    # near-exact formal date or an independent task-specific identifier which
+    # distinguishes it from the runner-up. Order-number matches were already
+    # handled above and do not need this guard.
+    if (len(scored) > 1 or repeated_index_visit) \
+            and best.get("date_delta") is not None \
+            and best["date_delta"] > 3:
+        independent = (
+            (best["support"] - scored[1]["support"])
+            if len(scored) > 1 else set()
+        ) & {"phone_exact", "asset_exact", "work_order"}
+        if not independent:
+            log.info("  多次歷史工作只靠相差超過三日的日期分開，保留待核對")
+            return None, 0
 
     if not serials:
         # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。

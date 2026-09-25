@@ -389,7 +389,7 @@ class NvidiaResponseTests(unittest.TestCase):
 
         prompt = call.call_args.kwargs["prompt"]
         self.assertTrue(call.call_args.kwargs["expects_json"])
-        for old_example in ("US622B1115", "USO16D0865", "PYNEH", "EPIQ Elite"):
+        for old_example in ("USZ00B0006", "USO00D0010", "PYNEH", "EPIQ Elite"):
             self.assertNotIn(old_example, prompt)
 
     def test_focused_serial_reader_filters_non_serial_text(self):
@@ -435,7 +435,7 @@ class NvidiaResponseTests(unittest.TestCase):
             "serial_candidates": ["15915F0726", "S2N22F1275"],
             "product_raw": "Affiniti 70",
             "hospital_raw": "PN",
-            "department_room_raw": "Asset# 19130438",
+            "department_room_raw": "Asset# 88880001",
             "phone_candidates": [],
             "asset_candidates": [],
             "work_order_candidates": [],
@@ -452,24 +452,24 @@ class NvidiaResponseTests(unittest.TestCase):
             result["serial_visual_candidates"],
         )
         self.assertIsNone(result["hospital_raw"])
-        self.assertEqual(["19130438"], result["asset_candidates"])
+        self.assertEqual(["88880001"], result["asset_candidates"])
         self.assertIsNone(result["location_raw"])
         self.assertIn("serial_candidates", result["unreadable_fields"])
         self.assertIn("hospital_raw", result["unreadable_fields"])
 
     def test_asset_parser_preserves_room_text_after_asset_number(self):
         candidate = json.loads(self._payload(
-            department_room_raw="Asset# 19130438 6F",
+            department_room_raw="Asset# 88880001 6F",
         ))
 
         result = nvidia_client._normalize_ocr_data(candidate)
 
-        self.assertEqual(["19130438"], result["asset_candidates"])
+        self.assertEqual(["88880001"], result["asset_candidates"])
         self.assertEqual("6F", result["location_raw"])
 
     def test_observed_serial_families_pass_without_autocorrection(self):
         for value in (
-            "US915F0726", "USN16F0565", "SZN22F1275", "SG41700123",
+            "USY00F0004", "USX00F0001", "SZX00F0005", "SG00000011",
         ):
             with self.subTest(value=value):
                 self.assertTrue(nvidia_client._valid_serial_token(value))
@@ -514,7 +514,7 @@ class ProcessorConsensusTests(unittest.TestCase):
         reading = dict(
             self.ocr_a,
             contact_person_raw="Alice", department_room_raw="3F",
-            phone_candidates=["61234567"], asset_candidates=["19130438"],
+            phone_candidates=["99990011"], asset_candidates=["88880001"],
             service_date_raw="08/09/2026", date_source="ACTION_DATE",
         )
         candidates = [
@@ -553,36 +553,36 @@ class ProcessorConsensusTests(unittest.TestCase):
 
     def test_contact_person_has_its_own_consensus_field(self):
         consensus = processor._consensus_ocr([
-            {"contact_person_raw": "Ms. Chan", "phone_candidates": ["61234567"]},
-            {"contact_person_raw": "Ms Chan", "phone_candidates": ["61234567"]},
+            {"contact_person_raw": "Ms. Chan", "phone_candidates": ["99990011"]},
+            {"contact_person_raw": "Ms Chan", "phone_candidates": ["99990011"]},
         ])
 
         self.assertEqual("Ms. Chan", consensus["contact_person_raw"])
-        self.assertEqual(["61234567"], consensus["phone_candidates"])
+        self.assertEqual(["99990011"], consensus["phone_candidates"])
 
     def test_one_character_serial_disagreement_is_kept_as_two_candidates(self):
         readings = [
-            {"serial_candidates": ["US915F0726"]},
-            {"serial_candidates": ["US915F072G"]},
+            {"serial_candidates": ["USY00F0004"]},
+            {"serial_candidates": ["USY00F000G"]},
         ]
 
         consensus = processor._consensus_ocr(readings)
 
         self.assertEqual(
-            ["US915F0726", "US915F072G"],
+            ["USY00F0004", "USY00F000G"],
             consensus["serial_candidates"],
         )
 
     def test_majority_serial_stays_ambiguous_after_a_different_valid_read(self):
         readings = [
-            {"serial_candidates": ["US915F0726"]},
-            {"serial_candidates": ["US915F072G"]},
-            {"serial_candidates": ["US915F0726"]},
+            {"serial_candidates": ["USY00F0004"]},
+            {"serial_candidates": ["USY00F000G"]},
+            {"serial_candidates": ["USY00F0004"]},
         ]
 
         consensus = processor._consensus_ocr(readings)
 
-        self.assertEqual(["US915F0726"], consensus["serial_candidates"])
+        self.assertEqual(["USY00F0004"], consensus["serial_candidates"])
         self.assertTrue(consensus["serial_ambiguous"])
 
     def test_non_device_words_do_not_gain_fuzzy_serial_consensus(self):
@@ -630,8 +630,8 @@ class ProcessorConsensusTests(unittest.TestCase):
             "serial_candidates": ["WRONG12345"],
             "product_raw": "CX50",
             "hospital_raw": "QMH",
-            "phone_candidates": ["25956917"],
-            "asset_candidates": ["19130438"],
+            "phone_candidates": ["99990001"],
+            "asset_candidates": ["88880001"],
             "service_date_raw": "18/8/2026",
             "date_source": "ACTION_DATE",
         }
@@ -686,10 +686,10 @@ class ProcessorConsensusTests(unittest.TestCase):
         )
 
     def test_disputed_phone_gets_one_field_recheck(self):
-        primary = dict(self.ocr_a, phone_candidates=["25956158"])
-        support = {"phone_candidates": ["25956159"],
+        primary = dict(self.ocr_a, phone_candidates=["99990031"])
+        support = {"phone_candidates": ["99990032"],
                    "unreadable_fields": []}
-        focused = {"phone_candidates": ["25956158"],
+        focused = {"phone_candidates": ["99990031"],
                    "unreadable_fields": []}
         task = {"gid": "task-1", "name": "Task 1"}
         with patch.object(nvidia_client, "ocr_jobsheet_fields",
@@ -709,7 +709,7 @@ class ProcessorConsensusTests(unittest.TestCase):
 
         self.assertEqual("task-1", matched["gid"])
         self.assertEqual(2, tier)
-        self.assertEqual(["25956158"], consensus["phone_candidates"])
+        self.assertEqual(["99990031"], consensus["phone_candidates"])
         reread.assert_called_once_with(
             unittest.mock.ANY, 0, "phone_candidates",
             zoom=config.OCR_FOCUSED_RETRY_ZOOMS[0],
@@ -719,14 +719,14 @@ class ProcessorConsensusTests(unittest.TestCase):
 class AsanaMatchSafetyTests(unittest.TestCase):
     def test_order_number_is_not_reused_as_phone_or_asset_evidence(self):
         task_row = {
-            "gid": "task", "name": "PYN / Affiniti 70 / US915F0726 / 61877075",
-            "notes": "Telephone 25956917; Asset 19130438",
+            "gid": "task", "name": "PYN / Affiniti 70 / USY00F0004 / 60000011",
+            "notes": "Telephone 99990001; Asset 88880001",
         }
         scored = asana_client._candidate_score(
             task_row,
             {
-                "phone_candidates": ["61877075"],
-                "asset_candidates": ["25956917"],
+                "phone_candidates": ["60000011"],
+                "asset_candidates": ["99990001"],
             },
             serials=[], hosp=None, product=None,
         )
@@ -738,14 +738,14 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         ocr = {
             "order_no": None,
             "serial_candidates": [],
-            "serial_visual_candidates": ["S2N22F1275"],
+            "serial_visual_candidates": ["S2X00F0005"],
             "product": "Affiniti 70",
-            "phone_candidates": ["25899327"],
+            "phone_candidates": ["99990041"],
         }
         task_row = {
             "gid": "task",
-            "name": "Tung Wah Hospital/ Affiniti 70/ SZN22F1275",
-            "notes": "Telephone 25899327",
+            "name": "Sample Regional Hospital/ Affiniti 70/ SZX00F0005",
+            "notes": "Telephone 99990041",
         }
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
             task, tier = asana_client.find_task(ocr, job_type="PM")
@@ -759,12 +759,12 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "serial_candidates": [],
             "serial_visual_candidates": ["15915F0726"],
             "product": "Affiniti 70",
-            "phone_candidates": ["25956917"],
+            "phone_candidates": ["99990001"],
         }
         task_row = {
             "gid": "task",
-            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
-            "notes": "Telephone 25956917",
+            "name": "PYN/ Affiniti 70/ USY00F0004/ 60000011",
+            "notes": "Telephone 99990001",
         }
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
             task, tier = asana_client.find_task(ocr, job_type="PM")
@@ -773,34 +773,34 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         self.assertEqual(0, tier)
 
     def test_tung_wah_search_keeps_spaces_for_typeahead(self):
-        canonical = asana_client.hospital_core("Tung Wah Hospital")
+        canonical = asana_client.hospital_core("Sample Regional Hospital")
 
-        self.assertEqual("Tung Wah Hospital", canonical)
+        self.assertEqual("Sample Regional Hospital", canonical)
         self.assertEqual(
-            ["Tung Wah Hospital"],
+            ["Sample Regional Hospital"],
             asana_client.hospital_search_terms(canonical),
         )
 
     def test_recent_task_can_correct_obviously_misread_service_year(self):
         ocr = {
             "order_no": None,
-            "serial_candidates": ["USN16F0565"],
-            "serial_no": "USN16F0565",
-            "phone_candidates": ["25956158"],
+            "serial_candidates": ["USX00F0001"],
+            "serial_no": "USX00F0001",
+            "phone_candidates": ["99990031"],
             "service_date_raw": "18/8/2020",
             "date_source": "ACTION_DATE",
         }
         current = {
             "gid": "current",
-            "name": "PYNEH Affiniti 70 USN16F0565 61877077",
-            "notes": "25956158",
+            "name": "PYNEH Affiniti 70 USX00F0001 60000012",
+            "notes": "99990031",
             "due_on": "2026-08-20",
             "memberships": [{"project": {"name": "2026 PM"}}],
         }
         historical = {
             "gid": "historical",
-            "name": "PYNEH Affiniti 70 USN16F0565 60000001",
-            "notes": "25956158",
+            "name": "PYNEH Affiniti 70 USX00F0001 60000001",
+            "notes": "99990031",
             "due_on": "2025-08-20",
             "memberships": [{"project": {"name": "2025 PM"}}],
         }
@@ -824,19 +824,19 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         with patch.object(asana_client, "_typeahead", return_value=[]) as search:
             asana_client._gather_pool(
                 None, [], None, None,
-                phones=["2595 6917"], assets=["19130438"],
+                phones=["9999 0001"], assets=["88880001"],
             )
 
         self.assertEqual(
-            ["25956917", "19130438"],
+            ["99990001", "88880001"],
             [call.args[0] for call in search.call_args_list],
         )
 
     def test_exact_work_order_is_strong_support(self):
         ocr = {
             "order_no": None,
-            "serial_candidates": ["USZ99A1234"],
-            "serial_no": "USZ99A1234",
+            "serial_candidates": ["USZ00A0000"],
+            "serial_no": "USZ00A0000",
             "product": "MODEL Z",
             "customer": "TESTH",
             "phone_candidates": [],
@@ -848,7 +848,7 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         }
         task_row = {
             "gid": "task",
-            "name": "TESTH/ MODEL Z/ USZ99A1234/ HAWO 9876543",
+            "name": "TESTH/ MODEL Z/ USZ00A0000/ HAWO 9876543",
         }
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
             task, tier = asana_client.find_task(ocr, job_type="PM")
@@ -879,15 +879,15 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "serial_no": None,
             "product": "Affiniti 70",
             "customer": "PYN",
-            "phone_candidates": ["25956917"],
-            "asset_candidates": ["19130438"],
+            "phone_candidates": ["99990001"],
+            "asset_candidates": ["88880001"],
             "service_date_raw": "18/8/2026",
             "date_source": "ACTION_DATE",
         }
         task_row = {
             "gid": "task",
-            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
-            "notes": "Phone 25956917; Asset 19130438",
+            "name": "PYN/ Affiniti 70/ USY00F0004/ 60000011",
+            "notes": "Phone 99990001; Asset 88880001",
             "due_on": "2026-08-18",
             "memberships": [{"project": {"name": "2026 PM"}}],
         }
@@ -902,15 +902,15 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "order_no": None,
             "serial_candidates": [],
             "serial_no": None,
-            "phone_candidates": ["25956917"],
-            "asset_candidates": ["19130438"],
+            "phone_candidates": ["99990001"],
+            "asset_candidates": ["88880001"],
             "service_date_raw": None,
             "date_source": None,
         }
         task_row = {
             "gid": "task",
-            "name": "PYN/ Affiniti 70/ US915F0726/ 61877075",
-            "notes": "Phone 25956917; Asset 19130438",
+            "name": "PYN/ Affiniti 70/ USY00F0004/ 60000011",
+            "notes": "Phone 99990001; Asset 88880001",
             "memberships": [{"project": {"name": "2026 PM"}}],
         }
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
@@ -922,8 +922,8 @@ class AsanaMatchSafetyTests(unittest.TestCase):
     def test_completed_recent_task_beats_future_incomplete_task(self):
         ocr = {
             "order_no": None,
-            "serial_candidates": ["SZN22B1280"],
-            "serial_no": "SZN22B1280",
+            "serial_candidates": ["SZX00B0000"],
+            "serial_no": "SZX00B0000",
             "product": "EPIQ Elite",
             "customer": "KWH-6F",
             "phone_candidates": [],
@@ -933,9 +933,9 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "location_raw": "6F",
         }
         tasks = [
-            {"gid": "current", "name": "KWH, EPIQ Elite, SZN22B1280",
+            {"gid": "current", "name": "KWH, EPIQ Elite, SZX00B0000",
              "completed": True, "due_on": "2026-09-10"},
-            {"gid": "future", "name": "KWH, EPIQ Elite, SZN22B1280",
+            {"gid": "future", "name": "KWH, EPIQ Elite, SZX00B0000",
              "completed": False, "due_on": "2027-03-10"},
         ]
         with patch.object(asana_client, "_gather_pool", return_value=tasks):
@@ -947,8 +947,8 @@ class AsanaMatchSafetyTests(unittest.TestCase):
     def test_one_character_serial_error_needs_two_supporting_signals(self):
         base = {
             "order_no": None,
-            "serial_candidates": ["SZN22B128O"],
-            "serial_no": "SZN22B128O",
+            "serial_candidates": ["SZX00B000O"],
+            "serial_no": "SZX00B000O",
             "product": "EPIQ Elite",
             "customer": None,
             "phone_candidates": [],
@@ -957,7 +957,7 @@ class AsanaMatchSafetyTests(unittest.TestCase):
             "date_source": None,
             "location_raw": None,
         }
-        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZN22B1280"}
+        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZX00B0000"}
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
             task, _ = asana_client.find_task(base, job_type="PM")
         self.assertIsNone(task)
@@ -971,15 +971,15 @@ class AsanaMatchSafetyTests(unittest.TestCase):
 
     def test_pm_sheet_rejects_explicit_cm_project(self):
         ocr = {
-            "order_no": "61947879",
-            "serial_candidates": ["US519F0836"],
-            "serial_no": "US519F0836",
+            "order_no": "60000014",
+            "serial_candidates": ["USW00F0008"],
+            "serial_no": "USW00F0008",
             "product": "Affiniti 70",
             "customer": "HKCH",
         }
         cm_task = {
             "gid": "repair",
-            "name": "HKCH Affiniti 70 US519F0836 61947879",
+            "name": "HKCH Affiniti 70 USW00F0008 60000014",
             "memberships": [{"project": {"name": "Corrective Maintenance"}}],
         }
         with patch.object(asana_client, "_gather_pool", return_value=[cm_task]):
@@ -990,14 +990,14 @@ class AsanaMatchSafetyTests(unittest.TestCase):
     def test_known_pm_project_is_matching_evidence(self):
         ocr = {
             "order_no": None,
-            "serial_candidates": ["US519F0836"],
-            "serial_no": "US519F0836",
+            "serial_candidates": ["USW00F0008"],
+            "serial_no": "USW00F0008",
             "product": None,
             "customer": None,
         }
         pm_task = {
             "gid": "pm",
-            "name": "HKCH Affiniti 70 US519F0836",
+            "name": "HKCH Affiniti 70 USW00F0008",
             "memberships": [{"project": {"name": "2026 PM"}}],
         }
         with patch.object(asana_client, "_gather_pool", return_value=[pm_task]):
@@ -1008,7 +1008,7 @@ class AsanaMatchSafetyTests(unittest.TestCase):
     def test_unknown_short_hospital_code_is_not_used(self):
         self.assertIsNone(asana_client.hospital_core("KWM"))
         self.assertIsNone(asana_client.hospital_core("PYTV-6F"))
-        self.assertEqual("QMH", asana_client.hospital_core("Queen Mary Hospital"))
+        self.assertEqual("QMH", asana_client.hospital_core("Quick Medical Hospital"))
 
     def test_pyn_and_pyneh_are_the_same_hospital(self):
         self.assertEqual("PYNEH", asana_client.hospital_core("PYN"))
@@ -1021,25 +1021,37 @@ class AsanaMatchSafetyTests(unittest.TestCase):
         )
 
     def test_full_hospital_name_allows_unique_two_character_ocr_error(self):
-        self.assertEqual(
-            "Tung Wah Hospital",
-            asana_client.hospital_core("Tong Nah Hospital"),
-        )
-        self.assertEqual(
-            "Completely Unknown Clinic",
-            asana_client.hospital_core("Completely Unknown Clinic"),
-        )
+        asana_client.set_device_index({
+            "devices": [],
+            "location_directory": [{
+                "canonical_hospital": "Alpha Medical Hospital",
+                "confirmed_aliases": ["Alpha Medical Hospital"],
+                "learned_aliases": [],
+                "match_enabled": True,
+            }],
+        })
+        try:
+            self.assertEqual(
+                "Alpha Medical Hospital",
+                asana_client.hospital_core("Alphe Medical Hospital"),
+            )
+            self.assertEqual(
+                "Completely Unknown Clinic",
+                asana_client.hospital_core("Completely Unknown Clinic"),
+            )
+        finally:
+            asana_client.clear_device_index()
 
     def test_ambiguous_serial_needs_two_supporting_signals_even_if_one_is_exact(self):
         ocr = {
             "order_no": None,
-            "serial_candidates": ["SZN22B1280", "SZN22B128O"],
-            "serial_no": "SZN22B1280",
+            "serial_candidates": ["SZX00B0000", "SZX00B000O"],
+            "serial_no": "SZX00B0000",
             "serial_ambiguous": True,
             "product": "EPIQ Elite",
             "hospital_raw": None,
         }
-        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZN22B1280"}
+        task_row = {"gid": "task", "name": "KWH, EPIQ Elite, SZX00B0000"}
         with patch.object(asana_client, "_gather_pool", return_value=[task_row]):
             task, _ = asana_client.find_task(ocr, job_type="PM")
         self.assertIsNone(task)
@@ -1057,9 +1069,9 @@ class AsanaMatchSafetyTests(unittest.TestCase):
 
     def test_safe_title_removes_trailing_separators(self):
         title = asana_client.get_safe_title({
-            "name": "PYNEH, EPIQ Elite / US622B1115/ "
+            "name": "PYNEH, EPIQ Elite / USZ00B0006/ "
         })
-        self.assertEqual("PYNEH, EPIQ Elite - US622B1115", title)
+        self.assertEqual("PYNEH, EPIQ Elite - USZ00B0006", title)
 
 
 if __name__ == "__main__":
