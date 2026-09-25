@@ -78,7 +78,7 @@ jobs:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260923.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          # First prove the wrong-month safety gate on the known regression.
+          # Recheck the known wrong-month case after isolated ACTION DATE reads.
           # Remove this selection only after the B08 result has been reviewed.
           JOBSHEET_BACKTEST_SAMPLE_IDS: B08
           OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}

@@ -327,6 +327,29 @@ def _consensus_ocr(readings: list) -> dict:
     return result
 
 
+def _apply_focused_action_date(consensus: dict, focused_readings: list) -> bool:
+    """In the isolated backtest, only two agreeing date-panel reads may replace a broad-card date.
+
+    Broad cards can independently make the same month error. Their votes remain
+    in the private audit, but cannot outvote this pair. If either focused read
+    fails or they disagree, discard the date as matching evidence altogether.
+    """
+    dates = [nvidia_client._parse_action_date(row.get("service_date_raw"))
+             for row in focused_readings]
+    agreed = len(dates) == 2 and dates[0] is not None and dates[0] == dates[1]
+    audit = consensus.setdefault("_ocr_audit", {})
+    audit["date_recheck"] = "agreed" if agreed else "unresolved"
+    if agreed:
+        consensus["service_date_raw"] = focused_readings[0]["service_date_raw"]
+        consensus["service_date_iso"] = dates[0].isoformat()
+        consensus["date_source"] = "ACTION_DATE"
+        return True
+    consensus["service_date_raw"] = None
+    consensus["service_date_iso"] = None
+    consensus["date_source"] = None
+    return False
+
+
 def _ocr_and_match(doc, job_type):
     """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
     nvidia_client.reset_ocr_metrics()
@@ -468,7 +491,31 @@ def _ocr_and_match(doc, job_type):
                     break
         task, tier = asana_client.find_task(consensus, job_type=job_type)
 
-    if task is None:
+    date_recheck_blocked = False
+    if task is None and context_fields and consensus.get("service_date_iso"):
+        # Test branch only: when task selection remains unresolved, re-read the
+        # ACTION DATE panel twice even if the broad cards agreed. Never show
+        # the model candidate dates or use one focused reading to override.
+        log.info("  歷史工作未能確定，ACTION DATE 單格兩輪獨立複核")
+        date_focus = []
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "service_date_raw", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                log.warning("  ACTION DATE 單格 %.1fx 暫時無法完成", zoom)
+                continue
+            date_focus.append(contextual(reading, "date_recheck", zoom, "service_date_raw"))
+        readings.extend(date_focus)
+        consensus = _consensus_ocr(readings)
+        if _apply_focused_action_date(consensus, date_focus):
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            date_recheck_blocked = True
+            log.info("  ACTION DATE 單格兩輪未一致，不憑原先日期自動配對")
+
+    if task is None and not date_recheck_blocked:
         # The fixed program has already applied product, hospital and serial
         # gates.  Only a close top-two tie reaches the vision model, with at
         # most ten rows and no freedom to invent a table-external answer.

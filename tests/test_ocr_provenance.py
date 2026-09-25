@@ -195,6 +195,66 @@ class OCRProvenanceTests(unittest.TestCase):
         self.assertEqual(asana_client._score_index_task_ref(ref, plain, "PM"),
                          asana_client._score_index_task_ref(ref, consensus, "PM"))
 
+    def test_focused_date_pair_overrides_two_matching_broad_card_errors(self):
+        broad = self.normalize(service_date_raw="20/9/2026")
+        focused = [self.normalize(service_date_raw=value)
+                   for value in ("20/8/26", "20.08.2026")]
+        result = processor._consensus_ocr([broad, broad, *focused])
+        self.assertTrue(processor._apply_focused_action_date(result, focused))
+        self.assertEqual("2026-08-20", result["service_date_iso"])
+        self.assertEqual("20/8/26", result["service_date_raw"])
+        self.assertEqual("agreed", result["_ocr_audit"]["date_recheck"])
+        self.assertEqual("20/9/2026", result["_ocr_audit"]["readings"][0]["raw"]["service_date_raw"])
+
+    def test_focused_date_must_have_two_valid_matching_reads(self):
+        broad = self.normalize(service_date_raw="20/9/2026")
+        for focused in (
+            [self.normalize(service_date_raw="20/8/2026")],
+            [self.normalize(service_date_raw="20/8/2026"),
+             self.normalize(service_date_raw="21/8/2026")],
+            [self.normalize(service_date_raw="20/8/2026"),
+             self.normalize(service_date_raw="not legible")],
+        ):
+            result = processor._consensus_ocr([broad, broad, *focused])
+            self.assertFalse(processor._apply_focused_action_date(result, focused))
+            self.assertIsNone(result["service_date_iso"])
+            self.assertIsNone(result["service_date_raw"])
+            self.assertIsNone(result["date_source"])
+            self.assertEqual("unresolved", result["_ocr_audit"]["date_recheck"])
+
+    def test_isolated_matching_rechecks_consensus_date_before_accepting_task(self):
+        broad = self.normalize(product_raw="EPIQ Elite", hospital_raw="QMH",
+                               serial_candidates=["US123F4567"],
+                               phone_candidates=["99990070"],
+                               contact_person_raw="TEST PERSON",
+                               service_date_raw="20/9/2026")
+        context_cards = [self.normalize(product_raw="EPIQ Elite") for _ in range(2)] + [
+            self.normalize(hospital_raw="QMH") for _ in range(2)
+        ]
+        focused_dates = [self.normalize(service_date_raw="20/8/26"),
+                         self.normalize(service_date_raw="20/08/2026")]
+
+        def find(ocr, job_type):
+            return ({"gid": "synthetic-task"}, 2) if ocr.get("service_date_iso") == "2026-08-20" else (None, 0)
+
+        with patch.dict(processor.os.environ, {processor.CONTEXT_FIELD_OCR_ENV: "1"}), \
+             patch.object(nvidia_client, "ocr_jobsheet_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_identity_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_support_fields", return_value=broad), \
+             patch.object(nvidia_client, "ocr_jobsheet_serial_candidates", return_value=["US123F4567"]), \
+             patch.object(nvidia_client, "ocr_jobsheet_context_field", side_effect=context_cards), \
+             patch.object(nvidia_client, "ocr_jobsheet_focused_field", side_effect=focused_dates) as focused, \
+             patch.object(processor.private_ocr_context, "build_vocabulary", return_value={}), \
+             patch.object(asana_client, "find_task", side_effect=find):
+            task, _, result = processor._ocr_and_match(None, "PM")
+
+        self.assertEqual("synthetic-task", task["gid"])
+        self.assertEqual("2026-08-20", result["service_date_iso"])
+        self.assertEqual(["service_date_raw", "service_date_raw"],
+                         [call.args[2] for call in focused.call_args_list])
+        self.assertEqual(["date_recheck", "date_recheck"],
+                         [row["context"]["stage"] for row in result["_ocr_audit"]["readings"][-2:]])
+
 
 if __name__ == "__main__":
     unittest.main()
