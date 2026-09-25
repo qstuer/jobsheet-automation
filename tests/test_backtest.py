@@ -137,6 +137,26 @@ class BacktestTests(unittest.TestCase):
         sample["expected"]["serial"] = "US123B4568"
         self.assertEqual("FAIL", backtest._evaluate_result(self._task(), sample, 4)["status"])
 
+    def test_no_final_task_is_not_reported_as_wrong_device(self):
+        result = backtest._evaluate_result(None, self._sample(), 4, "PM", 1)
+        self.assertEqual("FAIL", result["status"])
+        self.assertEqual(1, result["device_candidate_rank"])
+        for field in ("device_check", "task_check", "filename_check"):
+            self.assertEqual("NOT_SELECTED", result[field])
+
+    def test_device_candidate_rank_is_anonymous_and_separate_from_task(self):
+        ranked = [
+            {"row": {"serial": "US987B6543"}},
+            {"row": {"serial": "US123B4567"}},
+        ]
+        with patch.object(backtest.asana_client, "_device_index", {"devices": []}), \
+             patch.object(backtest.asana_client, "_rank_index_devices", return_value=ranked):
+            result = backtest._device_candidate_rank(
+                {"product_raw": "EPIQ Elite"}, "US123B4567", "PM"
+            )
+        self.assertEqual(2, result)
+        self.assertNotIn("US123B4567", json.dumps({"device_candidate_rank": result}))
+
     def test_correct_match_reports_untested_stages_honestly(self):
         result = backtest._evaluate_result(self._task(), self._sample(), 4)
         self.assertEqual("PASS", result["status"])
@@ -182,7 +202,7 @@ class BacktestTests(unittest.TestCase):
         for detected in ("CM", "UNKNOWN", "FCO", "INS"):
             with patch.object(backtest.nvidia_client, "detect_cm_pm", return_value=detected) as read, \
                  patch.object(backtest.processor, "_ocr_and_match") as match:
-                task, actual, _ = backtest._read_sample(doc, "PM")
+                task, actual, _, _ = backtest._read_sample(doc, "PM")
             read.assert_called_once_with(doc, 0)
             match.assert_not_called()
             self.assertIsNone(task)
@@ -199,7 +219,7 @@ class BacktestTests(unittest.TestCase):
                      self._task(), 1, {"ocr_metrics": {
                          "calls": 3, "seconds": 2.5, "total_tokens": 20,
                          "estimated_cost_cny_upper": 0.02}})) as match:
-                _, actual, metrics = backtest._read_sample(doc, detected)
+                _, actual, metrics, _ = backtest._read_sample(doc, detected)
             read.assert_called_once_with(doc, 0)
             match.assert_called_once_with(doc, detected)
             self.assertEqual(detected, actual)
@@ -304,7 +324,7 @@ class BacktestTests(unittest.TestCase):
                  patch("src.backtest.nvidia_client.get_ocr_metrics", return_value={"calls": 1}), \
                  patch("src.backtest._read_sample", side_effect=[
                      backtest.nvidia_client.NvidiaResponseError("private response"),
-                     (None, "PM", {"calls": 1}),
+                     (None, "PM", {"calls": 1}, None),
                  ]):
                 rows = backtest.run()
             self.assertEqual(["SERVICE_ERROR", "UNVERIFIED"], [r["status"] for r in rows])

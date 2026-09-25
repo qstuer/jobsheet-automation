@@ -144,7 +144,8 @@ def _matches_expected(task: dict | None, expected: dict) -> bool:
 
 
 def _evaluate_result(task: dict | None, sample: dict, page_count: int,
-                     detected_type: str | None = None) -> dict:
+                     detected_type: str | None = None,
+                     device_candidate_rank: int | str = "NOT_TESTED") -> dict:
     """Return only anonymous checks, never task data or expected answers."""
     expected = sample["expected"]
     serial = expected.get("serial") or (
@@ -152,17 +153,21 @@ def _evaluate_result(task: dict | None, sample: dict, page_count: int,
     )
     def check(value: bool) -> str:
         return "PASS" if value else "FAIL"
-    device = "NOT_REVIEWED" if not serial else check(bool(task) and asana_client._norm(serial) in {
-        asana_client._norm(s) for s in asana_client._task_serials(task)
-    })
+    device = "NOT_REVIEWED" if not serial else (
+        "NOT_SELECTED" if task is None else check(asana_client._norm(serial) in {
+            asana_client._norm(s) for s in asana_client._task_serials(task)
+        })
+    )
     exact_task = "NOT_REVIEWED"
     filename = "NOT_REVIEWED"
     task_type = "NOT_TESTED" if task is None else check(
         asana_client._task_job_type(task) == sample["job_type"]
     )
     if expected["kind"] == "match":
-        exact_task = check(bool(task) and str(task.get("gid")) == expected.get("task_gid"))
-        filename = check(bool(task) and processor._planned_filename(task)[0] == expected.get("filename"))
+        exact_task = ("NOT_SELECTED" if task is None else
+                      check(str(task.get("gid")) == expected.get("task_gid")))
+        filename = ("NOT_SELECTED" if task is None else
+                    check(processor._planned_filename(task)[0] == expected.get("filename")))
     count_ok = page_count == (4 if sample["job_type"] == "PM" else 1)
     circle = "NOT_TESTED" if detected_type is None else check(detected_type == sample["job_type"])
     if not sample.get("_verified_answer"):
@@ -174,7 +179,8 @@ def _evaluate_result(task: dict | None, sample: dict, page_count: int,
     else:
         status = "PASS"
     return {
-        "status": status, "device_check": device, "task_check": exact_task,
+        "status": status, "device_candidate_rank": device_candidate_rank,
+        "device_check": device, "task_check": exact_task,
         "filename_check": filename, "task_type_check": task_type,
         "page_count": page_count,
         "page_check": "COUNT_ONLY" if count_ok else "INCOMPLETE_OR_UNEXPECTED",
@@ -188,7 +194,8 @@ def _evaluate_service_error(sample: dict, page_count: int) -> dict:
     """A provider outage is not an OCR mismatch or an incorrect Asana match."""
     count_ok = page_count == (4 if sample["job_type"] == "PM" else 1)
     return {
-        "status": "SERVICE_ERROR", "device_check": "NOT_TESTED",
+        "status": "SERVICE_ERROR", "device_candidate_rank": "NOT_TESTED",
+        "device_check": "NOT_TESTED",
         "task_check": "NOT_TESTED", "filename_check": "NOT_TESTED",
         "task_type_check": "NOT_TESTED", "page_count": page_count,
         "page_check": "COUNT_ONLY" if count_ok else "INCOMPLETE_OR_UNEXPECTED",
@@ -246,12 +253,13 @@ def _append_summary(rows: list[dict], path: Path) -> None:
         )
         stream.write("这不是全流程通过率：圈选独立列出；逐栏准确率、checklist 内容与切页尚未验收。页数正确也不代表完整。\n\n")
         stream.write(f"重复工作样本：{repeated_work}；工作身份未确认：{unknown_work}。不同 PDF 不等于不同工作。\n\n")
-        stream.write("| 样本 | 结果 | 设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
-        stream.write("|---|---|---|---|---|---|---|---|---:|---:|---:|---:|\n")
+        stream.write("| 样本 | 结果 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
+        stream.write("|---|---|---:|---|---|---|---|---|---|---:|---:|---:|---:|\n")
         for row in rows:
             cost = f"RMB {row['cost']:.4f}" if row["cost"] is not None else "-"
             stream.write(
                 f"| {row['sample_id']} | {row['status']} | "
+                f"{row.get('device_candidate_rank', 'NOT_TESTED')} | "
                 f"{row.get('device_check', 'NOT_REVIEWED')} | {row.get('task_check', 'NOT_REVIEWED')} | "
                 f"{row.get('filename_check', 'NOT_REVIEWED')} | {row.get('task_type_check', 'NOT_TESTED')} | "
                 f"{row.get('circle_check', 'NOT_TESTED')} | "
@@ -271,13 +279,26 @@ def _read_sample(doc, expected_type: str) -> tuple:
     detected = nvidia_client.detect_cm_pm(doc, 0)
     metrics = nvidia_client.get_ocr_metrics()
     if detected not in {"CM", "PM"} or detected != expected_type:
-        return None, detected, metrics
+        return None, detected, metrics, None
     task, _tier, ocr = processor._ocr_and_match(doc, detected)
     # The matching core resets its own metrics; include the earlier circle calls.
     for key, value in (ocr.get("ocr_metrics") or {}).items():
         if isinstance(value, (int, float)):
             metrics[key] = metrics.get(key, 0) + value
-    return task, detected, metrics
+    return task, detected, metrics, ocr
+
+
+def _device_candidate_rank(ocr: dict | None, expected_serial: str | None,
+                           job_type: str) -> int | str:
+    """Score device retrieval separately from final task selection; emit no identity."""
+    if not ocr or not expected_serial or asana_client._device_index is None:
+        return "NOT_TESTED"
+    ranked = asana_client._rank_index_devices(ocr, job_type)
+    wanted = asana_client._norm(expected_serial)
+    for rank, candidate in enumerate(ranked, 1):
+        if asana_client._norm(candidate["row"].get("serial")) == wanted:
+            return rank if rank <= 10 else "OUTSIDE_TOP_10"
+    return "NOT_IN_POOL"
 
 
 def _deny_cloud_operation(*args, **kwargs):
@@ -335,7 +356,7 @@ def run() -> list[dict]:
                 raise BacktestError(f"{sample_id} 是空白 PDF")
             page_count = doc.page_count
             try:
-                task, detected, metrics = _read_sample(doc, sample["job_type"])
+                task, detected, metrics, ocr = _read_sample(doc, sample["job_type"])
             except nvidia_client.NvidiaResponseError:
                 # Never log raw provider replies: a model could echo private
                 # jobsheet text. Keep an anonymous service-error checkpoint.
@@ -344,7 +365,12 @@ def run() -> list[dict]:
                 metrics = nvidia_client.get_ocr_metrics()
                 evaluation = _evaluate_service_error(sample, page_count)
             else:
-                evaluation = _evaluate_result(task, sample, page_count, detected)
+                evaluation = _evaluate_result(
+                    task, sample, page_count, detected,
+                    _device_candidate_rank(
+                        ocr, sample["expected"].get("serial"), sample["job_type"]
+                    ),
+                )
         status = evaluation["status"]
         log.info("[%s] %s（客户资料已隐藏）", sample_id, status)
         rows.append({
