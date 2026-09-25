@@ -1576,6 +1576,23 @@ def find_task(ocr_data: dict, job_type: str = None,
             return None, 0
 
     if not serials:
+        # Test-only date corroboration can safely rescue a one-character raw
+        # serial when the index has already identified the device. Do not
+        # require Asset: it is optional and may be blank on genuine visits.
+        # A shared phone or hospital does not distinguish repeat PM tasks;
+        # their *formal* dates must leave exactly one visit within three days.
+        if used_index and ocr_data.get("date_corrob") and visual_serials \
+                and best["serial_dist"] <= 1 and gap >= 30 \
+                and best.get("date_delta") is not None \
+                and best["date_delta"] <= 3 \
+                and {"date", "phone_exact", "hospital", "product", "job_type"}.issubset(
+                    best["support"]
+                ) and all(
+                    row.get("date_delta") is not None and row["date_delta"] > 3
+                    for row in scored[1:]
+                ):
+            log.info("  ✅ 交叉核對日期與單字 Serial 誤差唯一鎖定當次工作")
+            return best["task"], 2
         # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。
         # 此時只接受唯一候選，而且完整 task 必須同時精確包含電話、asset
         # 及最近 ACTION DATE。三項來自不同欄位，不能只靠醫院/型號猜。

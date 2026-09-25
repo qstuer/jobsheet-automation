@@ -531,10 +531,11 @@ def _ocr_and_match(doc, job_type):
         task, tier = asana_client.find_task(consensus, job_type=job_type)
 
     date_recheck_blocked = False
-    if task is None and context_fields and consensus.get("service_date_iso"):
+    if task is None and context_fields:
         # Test branch only: when task selection remains unresolved, re-read the
-        # ACTION DATE panel twice even if the broad cards agreed. Never show
-        # the model candidate dates or use one focused reading to override.
+        # ACTION DATE panel twice even if the broad cards agreed or could not
+        # parse any date. Never show candidate dates to the model or use just
+        # one focused reading to override another.
         log.info("  歷史工作未能確定，ACTION DATE 單格兩輪獨立複核")
         date_focus = []
         for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
@@ -554,8 +555,7 @@ def _ocr_and_match(doc, job_type):
             date_recheck_blocked = True
             log.info("  ACTION DATE 單格兩輪未一致，不憑原先日期自動配對")
 
-    if (task is None and context_fields and any(
-            row.get("service_date_raw") for row in readings)):
+    if task is None and context_fields:
         # Opt-in backtest only. Two separate signatures can resolve a single
         # handwritten digit, but cannot manufacture a service date absent from
         # ACTION DATE. Neither crop receives Asana dates or candidate tasks.
@@ -572,7 +572,8 @@ def _ocr_and_match(doc, job_type):
             log.info("  ACTION DATE 獲兩個簽署日期獨立確認，重新核對歷史工作")
             task, tier = asana_client.find_task(consensus, job_type=job_type)
         else:
-            log.info("  簽署日期未能安全確認 ACTION DATE，不作日期修正")
+            log.info("  簽署日期未能安全確認 ACTION DATE：%s，不作日期修正",
+                     consensus.get("_ocr_audit", {}).get("signature_date_check"))
 
     if (task is None and context_fields and asana_client._device_index is not None
             and all(consensus.get(field) for field in

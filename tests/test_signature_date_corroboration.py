@@ -79,6 +79,35 @@ class SignatureDateCorroborationTests(unittest.TestCase):
             task, _ = asana_client.find_task(ocr, job_type="PM")
         self.assertEqual("expected", task["gid"])
 
+    def test_raw_serial_one_character_error_and_unique_formal_date(self):
+        old = {
+            "gid": "old", "name": "Example Hospital / EPIQ 5G / AB123B4567",
+            "due_on": "2026-08-03", "notes": "Phone 11112222",
+            "memberships": [{"project": {"name": "PM"}}],
+        }
+        current = {**old, "gid": "current", "due_on": "2026-08-18"}
+        ocr = {
+            "serial_candidates": [], "serial_visual_candidates": ["AB123B4568"],
+            "product_raw": "EPIQ 5G", "hospital_raw": "Example Hospital",
+            "phone_candidates": ["11112222"],
+            "service_date_iso": "2026-08-18", "date_source": "ACTION_DATE",
+            "date_corrob": True,
+        }
+        with patch.object(asana_client, "_device_index", {"schema_version": 3}), \
+             patch.object(asana_client, "_gather_index_pool",
+                          return_value=([old, current], True, True)):
+            task, _ = asana_client.find_task(ocr, job_type="PM")
+        self.assertEqual("current", task["gid"])
+
+        # The same evidence without independent date corroboration is not a
+        # reason to relax the original serial/Asset safety gate.
+        del ocr["date_corrob"]
+        with patch.object(asana_client, "_device_index", {"schema_version": 3}), \
+             patch.object(asana_client, "_gather_index_pool",
+                          return_value=([old, current], True, True)):
+            task, _ = asana_client.find_task(ocr, job_type="PM")
+        self.assertIsNone(task)
+
 
 if __name__ == "__main__":
     unittest.main()
