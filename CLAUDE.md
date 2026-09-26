@@ -95,6 +95,8 @@ GitHub 工作：`.github/workflows/jobsheet-process.yml`
 
 手動 Stage B 可填 `jobsheet_file`，並選 `source_queue=split|pending`。`dry_run=true` 時必須指定單檔，只做 OCR/Asana 查詢，不移動 Google Drive、不寫 OneDrive、不更新報告。
 
+難讀 ACTION DATE 的少數 `_PENDING` 單據另有受控核對入口（目前只在隔離測試分支，**只讀**）：在手動 Stage B 精確填 `jobsheet_file`、選 `source_queue=pending`、`dry_run=true`，再填已人工看原件確認的 `review_action_date=YYYY-MM-DD`。如果同一設備在日期前後 14 天內有多次同類工作，還要填 `review_task`（Asana 工作 GID 或工作連結）；這不是自由改名欄。程式先核對 PDF 頁數、設備的產品／醫院／Serial，Serial 少一字仍須有完整電話或 Asset 證據；再查私人索引中的同類工作和正式日期，最後即時讀 Asana 重核 PM／CM、Serial、產品、醫院、正式日期及可能的訂單號衝突。缺任何關鍵證據、候選並列或 Asana 故障都停在原處，絕不因人工日期直接上傳。只讀通過也**不會**搬檔或寫 OneDrive；還需後續獨立驗收才考慮正式放行。
+
 若人員已逐頁核對原檔及正確名稱，可在同一個單檔模式填 `confirmed_filename`（不含 `.pdf`）。此救援模式只處理指定 PDF，跳過 OCR/Asana；Windows/OneDrive 禁用的 `/` 等字元會轉成 ` - `。沒有同時指定 `jobsheet_file` 時程式拒絕執行，不能用它批量改名。
 
 新掃描尚在入口時，使用獨立的 `Jobsheet Safe Dry Run` workflow，填完整原始 PDF 檔名。它在 runner 臨時目錄切頁、檢查完整性、OCR 及查 Asana，結束後不留下任何雲端改動，也不會觸發正式 Stage B。

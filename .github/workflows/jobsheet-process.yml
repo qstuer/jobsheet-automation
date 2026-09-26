@@ -36,6 +36,14 @@ on:
         description: '人工已核對的確定檔名（不含 .pdf）；只可配合指定單檔使用'
         required: false
         type: string
+      review_action_date:
+        description: '難讀單據受控核對：人工確認 ACTION DATE，YYYY-MM-DD；必須選 pending、單檔及 dry_run=true'
+        required: false
+        type: string
+      review_task:
+        description: '只有同一設備仍有多次可能工作時才填 Asana 工作 GID 或連結；不接受檔名'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -108,6 +116,8 @@ jobs:
           JOBSHEET_SOURCE_QUEUE: ${{ inputs.source_queue || 'split' }}
           JOBSHEET_DRY_RUN:      ${{ inputs.dry_run || 'false' }}
           JOBSHEET_CONFIRMED_FILENAME: ${{ inputs.confirmed_filename }}
+          JOBSHEET_REVIEW_ACTION_DATE: ${{ inputs.review_action_date }}
+          JOBSHEET_REVIEW_TASK: ${{ inputs.review_task }}
           ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
           ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
         run: python -m src.processor

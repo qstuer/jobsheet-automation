@@ -24,7 +24,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, asana_index, batch_state, config, nvidia_client, private_ocr_context, rclone_helper
+from . import asana_client, asana_index, batch_state, config, nvidia_client, pending_review, private_ocr_context, rclone_helper
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,6 +37,8 @@ CONFIRMED_FILENAME_ENV = "JOBSHEET_CONFIRMED_FILENAME"
 ASANA_INDEX_FILE_ENV = "ASANA_INDEX_LOCAL_FILE"
 ASANA_INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
 CONTEXT_FIELD_OCR_ENV = "JOBSHEET_CONTEXT_FIELD_OCR"
+REVIEW_ACTION_DATE_ENV = "JOBSHEET_REVIEW_ACTION_DATE"
+REVIEW_TASK_ENV = "JOBSHEET_REVIEW_TASK"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -769,6 +771,70 @@ def _ocr_and_match(doc, job_type):
     return None, 0, consensus
 
 
+def _ocr_for_pending_review(doc) -> dict:
+    """Read identity and support only; the human has supplied ACTION DATE.
+
+    Do not run the automatic matcher or repeat its date/signature/probe OCR
+    loop. The supplied date is never shown to the image model.
+    """
+    nvidia_client.reset_ocr_metrics()
+    primary = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_DEFAULT)
+    identity = nvidia_client.ocr_jobsheet_identity_fields(
+        doc, 0, zoom=config.OCR_IDENTITY_ZOOM
+    )
+    context_fields = os.environ.get(CONTEXT_FIELD_OCR_ENV) == "1"
+    if context_fields:
+        primary = {**primary, "product_raw": None, "hospital_raw": None}
+        identity = {**identity, "product_raw": None, "hospital_raw": None}
+    readings = [
+        {**primary, "_read_context": {"stage": "primary", "zoom": config.OCR_ZOOM_DEFAULT}},
+        {**identity, "_read_context": {"stage": "identity", "zoom": config.OCR_IDENTITY_ZOOM}},
+    ]
+    if context_fields:
+        vocabulary = private_ocr_context.build_vocabulary(asana_client._device_index)
+        for field in ("product_raw", "hospital_raw"):
+            for _ in range(2):
+                reading = nvidia_client.ocr_jobsheet_context_field(doc, 0, field, vocabulary)
+                readings.append({**reading, "_read_context": {
+                    "stage": "context_field", "zoom": 5.0, "field": field,
+                }})
+    consensus = _consensus_ocr(readings)
+    if context_fields and not all(consensus.get(field) for field in
+                                  ("product_raw", "hospital_raw")):
+        consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+        return consensus
+    # A complete phone helps verify a one-character Serial discrepancy. Read
+    # the support card once; it does not receive the human date or Asana task.
+    try:
+        support = nvidia_client.ocr_jobsheet_support_fields(
+            doc, 0, zoom=config.OCR_SUPPORT_ZOOM
+        )
+        readings.append({**support, "_read_context": {
+            "stage": "support", "zoom": config.OCR_SUPPORT_ZOOM,
+        }})
+        consensus = _consensus_ocr(readings)
+    except nvidia_client.NvidiaResponseError:
+        log.warning("  輔助欄暫時無法辨認，不以日期取代身分證據")
+    for field in ("product_raw", "hospital_raw", "serial_candidates"):
+        if consensus.get(field) or (context_fields and field != "serial_candidates"):
+            continue
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, field, zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_identity", "zoom": zoom, "field": field,
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get(field):
+                break
+    consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+    return consensus
+
+
 def _parse_job_type(filename: str):
     m = re.search(r"_(CM|PM)\.pdf$", filename)
     return m.group(1) if m else None
@@ -810,8 +876,14 @@ def _save_result(work_dir: Path, manifest: dict, filename: str,
 def _process_split_file(filename: str, work_dir: Path,
                         source_folder: str = None,
                         dry_run: bool = False,
-                        confirmed_filename: str = "") -> dict:
+                        confirmed_filename: str = "",
+                        review_action_date: str = "",
+                        review_task: str = "") -> dict:
     source_folder = source_folder or config.GDRIVE_SPLIT
+    if (review_action_date or review_task) and (
+            not review_action_date or not dry_run or confirmed_filename
+            or source_folder != config.GDRIVE_PENDING):
+        raise ValueError("受控核對只能在 _PENDING 單檔只讀模式使用")
     remote = f"{source_folder}/{filename}"
     local = work_dir / filename
     rclone_helper.download(remote, local)
@@ -839,7 +911,12 @@ def _process_split_file(filename: str, work_dir: Path,
     job_type = _parse_job_type(filename)
     try:
         with fitz.open(local) as doc:
-            task, tier, ocr = _ocr_and_match(doc, job_type)
+            if review_action_date and len(doc) != (4 if job_type == "PM" else 1 if job_type == "CM" else -1):
+                return {"status": "受控核對：頁數或工作類型不合格", "state": "pending"}
+            if review_action_date:
+                task, tier, ocr = None, 0, _ocr_for_pending_review(doc)
+            else:
+                task, tier, ocr = _ocr_and_match(doc, job_type)
     except nvidia_client.NvidiaResponseError as exc:
         if dry_run:
             local.unlink(missing_ok=True)
@@ -870,6 +947,22 @@ def _process_split_file(filename: str, work_dir: Path,
         return {
             "status": "等待自動重試", "state": "retryable", "attempts": attempts,
         }
+
+    if review_action_date:
+        # This branch is reachable only with dry_run=true (checked in main).
+        # It is deliberately before the ordinary upload branch. A human date
+        # or task choice may not bypass device, visit and live-Asana checks.
+        reviewed = pending_review.review_ocr(
+            ocr, job_type, review_action_date, review_task
+        )
+        local.unlink(missing_ok=True)
+        if reviewed["status"] != "READY_READ_ONLY":
+            message = pending_review.REASON_MESSAGES.get(reviewed["reason"], "證據不足")
+            return {"status": f"受控核對：{message}；仍待確認", "reason": reviewed["reason"],
+                    "candidate_count": reviewed.get("candidate_count")}
+        planned, _ = _planned_filename(reviewed["task"])
+        return {"status": "受控核對：只讀通過，尚未上傳", "planned": planned,
+                "ocr_metrics": ocr.get("ocr_metrics", {})}
 
     if task is not None:
         log.info(f"  Asana 第 {tier} 層命中")
@@ -962,42 +1055,62 @@ def main() -> int:
         source_folder = (
             config.GDRIVE_PENDING if source_queue == "pending" else config.GDRIVE_SPLIT
         )
-        splits = rclone_helper.list_pdfs(source_folder, exclude_subdirs=True)
-        log.info(f"{source_queue.upper()} 待處理 job 數：{len(splits)}")
         target = os.environ.get(TARGET_FILE_ENV, "").strip()
         dry_run = os.environ.get(DRY_RUN_ENV, "").strip().lower() in {"1", "true", "yes"}
         confirmed_filename = os.environ.get(CONFIRMED_FILENAME_ENV, "").strip()
+        review_action_date = os.environ.get(REVIEW_ACTION_DATE_ENV, "").strip()
+        review_task = os.environ.get(REVIEW_TASK_ENV, "").strip()
+        if review_action_date or review_task:
+            if not review_action_date or not target or not dry_run or confirmed_filename \
+                    or source_queue != "pending" or not index_path:
+                log.error("受控核對只接受 _PENDING 的指定單檔、日期及 dry_run=true；不可指定檔名")
+                return 1
+            try:
+                pending_review.parse_review_date(review_action_date)
+                pending_review.parse_task_gid(review_task)
+            except ValueError as exc:
+                log.error("受控核對輸入無效：%s", exc)
+                return 1
         if dry_run and not target:
             log.error("dry-run 必須精確指定一份 jobsheet_file，沒有處理任何檔案")
             return 1
         if confirmed_filename and not target:
             log.error("人工確認檔名必須精確指定一份 jobsheet_file")
             return 1
+        if target and (re.search(r"[\\/]", target) or Path(target).name != target
+                       or Path(target).suffix.lower() != ".pdf"):
+            log.error("指定的測試檔名不安全，只接受資料夾內的單一 PDF 檔名")
+            return 1
+        splits = rclone_helper.list_pdfs(source_folder, exclude_subdirs=True)
+        log.info(f"{source_queue.upper()} 待處理 job 數：{len(splits)}")
         if target:
             # 手動測試時必須精確指定 _SPLIT 根目錄內的一個 PDF；不接受
             # 路徑或模糊名稱，避免誤處理同一批其他工作單。
-            if Path(target).name != target or Path(target).suffix.lower() != ".pdf":
-                log.error("指定的測試檔名不安全，只接受 _SPLIT 內的單一 PDF 檔名")
-                return 1
             if target not in splits:
-                log.error("指定的測試工作單目前不在 _SPLIT，沒有處理任何檔案")
+                log.error("指定的測試工作單目前不在指定資料夾，沒有處理任何檔案")
                 return 1
             splits = [target]
-            log.info(f"單檔安全模式：本次只處理 {target}")
+            log.info("單檔安全模式：本次只處理一份" if review_action_date
+                     else f"單檔安全模式：本次只處理 {target}")
         main_report = []
         had_processing_error = False
         for filename in splits:
-            log.info(f"=== 處理 {filename} ===")
+            log.info("=== 受控核對單一工作單 ===" if review_action_date
+                     else f"=== 處理 {filename} ===")
             try:
                 main_report.append({
                     "file": filename,
                     **_process_split_file(
                         filename, work_dir, source_folder=source_folder, dry_run=dry_run,
                         confirmed_filename=confirmed_filename,
+                        review_action_date=review_action_date, review_task=review_task,
                     ),
                 })
             except Exception as e:
-                log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
+                if review_action_date:
+                    log.exception("  受控核對失敗；Google Drive 來源保持原狀")
+                else:
+                    log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
                 main_report.append({"file": filename, "status": "處理錯誤", "error": str(e)})
                 had_processing_error = True
 
@@ -1029,7 +1142,7 @@ def main() -> int:
                     f"{metrics['estimated_cost_cny_upper']:.4f}"
                 )
             details.append(metric_text)
-        log.info(f"  {row.get('file')}：{'；'.join(details)}")
+        log.info(f"  {'單份受控核對' if review_action_date else row.get('file')}：{'；'.join(details)}")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:
         lines = [
@@ -1040,7 +1153,7 @@ def main() -> int:
         for row in main_report:
             public_planned = _public_planned_filename(row, dry_run)
             cells = (
-                row.get("file") or "",
+                "單份受控核對" if review_action_date else row.get("file") or "",
                 row.get("status") or "",
                 public_planned or "-",
                 row.get("ocr_preview") or "-",
