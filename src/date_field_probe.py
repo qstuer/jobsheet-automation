@@ -194,45 +194,53 @@ def probe_sample(sample: dict, fixture_dir: Path) -> dict:
 
 
 def probe_sample_cross_provider(sample: dict, fixture_dir: Path) -> dict:
-    """Compare ACTION DATE only, with independent DeepSeek and NVIDIA calls.
+    """Compare ACTION DATE using the three already configured vision models.
 
     This is a read-only experiment, not an automatic correction. In particular,
-    the NVIDIA fallback model is disabled so a failed primary cannot silently
-    change which two models are being compared. Neither model sees the private
-    answer or any Asana candidate date.
+    NVIDIA's fallback is called explicitly as a third reader. Automatic model
+    fallback is disabled so an outage cannot silently change any reader's
+    identity. No reader sees the private answer or an Asana candidate date.
     """
     expected = _reviewed_day(sample)
     statuses = {}
     components = {}
     agreed_dates = {}
     usage = {}
+    llama_model = config.NVIDIA_FALLBACK_MODEL
+    if not llama_model or llama_model == config.NVIDIA_MODEL:
+        raise ValueError("日期探針需要獨立設定的 NVIDIA 後備模型")
     with fitz.open(fixture_dir / sample["filename"]) as doc:
         if doc.page_count < 1:
             raise ValueError("日期探針不能讀取空白 PDF")
-        for provider in ("deepseek", "nvidia"):
+        for reader, provider, model in (
+            ("deepseek", "deepseek", config.NVIDIA_MODEL),
+            ("nvidia_nemotron", "nvidia", config.NVIDIA_MODEL),
+            ("nvidia_llama", "nvidia", llama_model),
+        ):
             nvidia_client.reset_ocr_metrics()
             nvidia_client.reset_model_availability()
             values = []
             with patch.object(config, "OCR_PROVIDER", provider), \
+                    patch.object(config, "NVIDIA_MODEL", model), \
                     patch.object(config, "NVIDIA_FALLBACK_MODEL", ""):
                 for zoom in ZOOMS:
                     try:
                         values.append(_read_date(doc, "service_date_raw", zoom))
                     except nvidia_client.NvidiaResponseError:
                         values.append(None)
-                usage[provider] = nvidia_client.get_ocr_metrics()
-            statuses[provider] = [_read_status(value, expected) for value in values]
-            components[provider] = [_component_flags(value, expected) for value in values]
-            agreed_dates[provider] = (
+                usage[reader] = nvidia_client.get_ocr_metrics()
+            statuses[reader] = [_read_status(value, expected) for value in values]
+            components[reader] = [_component_flags(value, expected) for value in values]
+            agreed_dates[reader] = (
                 values[0] if len(values) == 2 and values[0] is not None
                 and values[0] == values[1] else None
             )
     cross_agreed = (agreed_dates["deepseek"] is not None
-                    and agreed_dates["deepseek"] == agreed_dates["nvidia"])
+                    and agreed_dates["deepseek"] == agreed_dates["nvidia_nemotron"])
     return {
         "sample_id": sample["sample_id"],
-        "provider_statuses": statuses,
-        "provider_components": components,
+        "reader_statuses": statuses,
+        "reader_components": components,
         "cross_provider_agreement": (
             _read_status(agreed_dates["deepseek"], expected)
             if cross_agreed else "UNRESOLVED"
@@ -265,7 +273,7 @@ def run() -> int:
         rows.append(row)
         log.info("[%s] 日期欄位只讀檢查完成：%s", sample_id,
                  row.get("joint_fields") or row.get("fields")
-                 or row.get("provider_statuses"))
+                 or row.get("reader_statuses"))
     temporary = report.with_suffix(".tmp")
     temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report)

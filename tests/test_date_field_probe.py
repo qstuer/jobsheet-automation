@@ -106,6 +106,7 @@ class DateFieldProbeTests(TestCase):
 
         def read_date(_doc, _field, _zoom):
             seen.append((date_field_probe.config.OCR_PROVIDER,
+                         date_field_probe.config.NVIDIA_MODEL,
                          date_field_probe.config.NVIDIA_FALLBACK_MODEL))
             return truth if date_field_probe.config.OCR_PROVIDER == "deepseek" else wrong
 
@@ -120,13 +121,17 @@ class DateFieldProbeTests(TestCase):
                 self.sample, Path("unused")
             )
         self.assertEqual(result["cross_provider_agreement"], "UNRESOLVED")
-        self.assertEqual(result["provider_statuses"]["deepseek"],
+        self.assertEqual(result["reader_statuses"]["deepseek"],
                          ["CORRECT", "CORRECT"])
-        self.assertEqual(result["provider_statuses"]["nvidia"],
+        self.assertEqual(result["reader_statuses"]["nvidia_nemotron"],
                          ["OTHER_VALID_DATE", "OTHER_VALID_DATE"])
-        self.assertEqual([provider for provider, _ in seen],
-                         ["deepseek", "deepseek", "nvidia", "nvidia"])
-        self.assertTrue(all(fallback == "" for _, fallback in seen))
+        self.assertEqual(result["reader_statuses"]["nvidia_llama"],
+                         ["OTHER_VALID_DATE", "OTHER_VALID_DATE"])
+        self.assertEqual([provider for provider, _, _ in seen],
+                         ["deepseek", "deepseek", "nvidia", "nvidia",
+                          "nvidia", "nvidia"])
+        self.assertTrue(all(fallback == "" for _, _, fallback in seen))
+        self.assertNotEqual(seen[2][1], seen[4][1])
         self.assertNotIn("2031", str(result))
 
     def test_cross_provider_agreement_is_still_scored_against_private_truth(self):
