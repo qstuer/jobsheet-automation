@@ -59,11 +59,21 @@ class PendingReviewTests(unittest.TestCase):
             return pending_review.review_ocr(ocr or fake_ocr(), "PM", day, chosen,
                                              confirmed_serial=serial)
 
+    @staticmethod
+    def _two_asset_reads(ocr):
+        value = ocr["asset_candidates"][0]
+        ocr["_ocr_audit"] = {"readings": [
+            {"normalized": {"asset_candidates": [value]}},
+            {"normalized": {"asset_candidates": [value]}},
+        ]}
+        return ocr
+
     def test_confirmed_serial_requires_visual_and_exact_same_visit_asset(self):
         self.visits = [fake_task("12345678", asset="88880001")]
         self._install()
-        two_typos = fake_ocr(serial_candidates=["US123B4599"],
-                             asset_candidates=["88880001"], phone_candidates=[])
+        two_typos = self._two_asset_reads(fake_ocr(
+            serial_candidates=["US123B4599"], asset_candidates=["88880001"],
+            phone_candidates=[]))
         self.assertEqual("confirmed_serial_requires_task", self._review(
             two_typos, serial="US123B4567")["reason"])
         result = self._review(two_typos, chosen="12345678", serial="US123B4567")
@@ -80,12 +90,20 @@ class PendingReviewTests(unittest.TestCase):
             fake_ocr(serial_candidates=["US123B4599"],
                      asset_candidates=["88880002"]),
             chosen="12345678", serial="US123B4567")["reason"])
+        conflicted = self._two_asset_reads(fake_ocr(
+            serial_candidates=["US123B4599"], asset_candidates=["88880001"]))
+        conflicted["_ocr_audit"]["readings"] += [
+            {"normalized": {"asset_candidates": ["88880002"]}},
+            {"normalized": {"asset_candidates": ["88880002"]}},
+        ]
+        self.assertEqual("manual_serial_asset_not_confirmed", self._review(
+            conflicted, chosen="12345678", serial="US123B4567")["reason"])
 
     def test_confirmed_serial_cannot_bypass_date_type_or_live_asset(self):
         self.visits = [fake_task("12345678", asset="88880001")]
         self._install()
-        ocr = fake_ocr(serial_candidates=["US123B4599"],
-                       asset_candidates=["88880001"])
+        ocr = self._two_asset_reads(fake_ocr(
+            serial_candidates=["US123B4599"], asset_candidates=["88880001"]))
         self.assertEqual("no_visit_within_14_days", self._review(
             ocr, day="2026-09-20", chosen="12345678",
             serial="US123B4567")["reason"])

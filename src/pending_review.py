@@ -141,6 +141,30 @@ def _pending(reason: str, **extra) -> dict:
     return {"status": "PENDING", "reason": reason, **extra}
 
 
+def _confirmed_asset_on_sheet(ocr: dict, asana_assets: list[str]) -> bool:
+    """Require one exact Asset in two independent reads, without a rival vote.
+
+    The consensus field alone can hide a competing two-read value. A human
+    serial correction must not treat that ambiguous Asset as confirmation.
+    """
+    assets = {re.sub(r"\D", "", str(value or ""))
+              for value in ocr.get("asset_candidates") or []}
+    assets = {value for value in assets if len(value) >= 4}
+    if len(assets) != 1 or asana_client._asset_match_level(
+            list(assets), asana_assets) != 2:
+        return False
+    confirmed = next(iter(assets))
+    counts = {}
+    for reading in (ocr.get("_ocr_audit") or {}).get("readings") or []:
+        values = (reading.get("normalized") or {}).get("asset_candidates") or []
+        for value in {re.sub(r"\D", "", str(item or "")) for item in values}:
+            if len(value) >= 4:
+                counts[value] = counts.get(value, 0) + 1
+    return counts.get(confirmed, 0) >= 2 and not any(
+        value != confirmed and count >= 2 for value, count in counts.items()
+    )
+
+
 def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
                                   selected_gid: str, serial: str) -> dict:
     """Narrow one private review; never replace the original OCR evidence.
@@ -185,7 +209,7 @@ def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
     # Unlike the normal one-character typo path, this two/three-character
     # exception requires an exact Asset on this *visit*, not a historical
     # phone or Asset from another job on the same equipment.
-    if asana_client._asset_match_level(ocr.get("asset_candidates"), ref.get("assets")) != 2:
+    if not _confirmed_asset_on_sheet(ocr, ref.get("assets") or []):
         return _pending("manual_serial_asset_not_confirmed")
 
     # Only after every independent gate, run the existing read-only reviewer
@@ -202,8 +226,8 @@ def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
     if (not live_record or asana_client._norm(live_record.get("serial")) != serial
             or len(live_record.get("task_refs") or []) != 1):
         return _pending("live_serial_conflict")
-    if asana_client._asset_match_level(
-            ocr.get("asset_candidates"), live_record["task_refs"][0].get("assets")) != 2:
+    if not _confirmed_asset_on_sheet(
+            ocr, live_record["task_refs"][0].get("assets") or []):
         return _pending("live_support_conflict")
     result["manual_serial_confirmed"] = True
     return result
