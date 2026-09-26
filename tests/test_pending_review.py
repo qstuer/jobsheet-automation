@@ -242,6 +242,30 @@ class PendingReviewTests(unittest.TestCase):
         self.assertEqual("phone_candidates", focus.call_args.args[2])
         self.assertNotIn("2026-08-18", str(focus.call_args))
 
+    def test_review_rechecks_visible_asset_panel_twice_without_looking_up_answer(self):
+        broad = fake_ocr(department_room_raw="Asset# 98765432",
+                         asset_candidates=[])
+        other = fake_ocr(department_room_raw=None, asset_candidates=[])
+        focused = {"department_room_raw": "Asset# 98765432",
+                   "asset_candidates": ["98765432"]}
+        with patch.object(processor.nvidia_client, "reset_ocr_metrics"), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_fields",
+                             return_value=broad), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=other), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=other), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_focused_field",
+                             return_value=focused) as focus, \
+                patch.object(processor.nvidia_client, "get_ocr_metrics",
+                             return_value={"calls": 5, "seconds": 0.0,
+                                           "total_tokens": 0}):
+            result = processor._ocr_for_pending_review(object())
+        self.assertEqual(["98765432"], result["asset_candidates"])
+        self.assertEqual(2, focus.call_count)
+        self.assertTrue(all(call.args[2] == "department_room_raw"
+                            for call in focus.call_args_list))
+
 
 if __name__ == "__main__":
     unittest.main()

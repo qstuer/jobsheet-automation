@@ -66,8 +66,8 @@ def _identity_diagnostics(ocr: dict, expected: dict, job_type: str) -> dict:
         reading = entry.get("normalized") or {}
         context = entry.get("context") or {}
         stage = context.get("stage")
-        if stage not in {"primary", "identity", "support", "focused_phone", "focused_identity",
-                         "context_field"}:
+        if stage not in {"primary", "identity", "support", "focused_phone",
+                         "focused_asset_panel", "focused_identity", "context_field"}:
             stage = "other"
         score = (asana_client._score_index_device(
             expected_item["row"], asana_client._prepare_index_query(reading), job_type

@@ -834,6 +834,27 @@ def _ocr_for_pending_review(doc) -> dict:
             consensus = _consensus_ocr(readings)
             if consensus.get("phone_candidates"):
                 break
+    # A handwritten "Asset#" often sits in Dept./Room rather than a separate
+    # asset box. Re-read that visible panel only when a broad pass saw content
+    # there but no Asset reached two-pass consensus. A blank department does
+    # not justify extra calls, and one focused result still is not evidence.
+    if not consensus.get("asset_candidates") and any(
+            reading.get("department_room_raw") or reading.get("asset_candidates")
+            for reading in readings):
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "department_room_raw", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_asset_panel", "zoom": zoom,
+                "field": "department_room_raw",
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get("asset_candidates"):
+                break
     for field in ("product_raw", "hospital_raw", "serial_candidates"):
         if consensus.get(field) or (context_fields and field != "serial_candidates"):
             continue
