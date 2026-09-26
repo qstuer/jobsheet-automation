@@ -152,6 +152,36 @@ class DateFieldProbeTests(TestCase):
         self.assertEqual(result["cross_provider_agreement"], "OTHER_VALID_DATE")
         self.assertNotIn("2031", str(result))
 
+    def test_month_only_probe_is_anonymous_and_has_no_candidate_hint(self):
+        doc = MagicMock()
+        doc.__enter__.return_value = doc
+        doc.page_count = 4
+        with (patch.object(date_field_probe.fitz, "open", return_value=doc),
+              patch.object(date_field_probe.nvidia_client, "crop_jobsheet_field_card",
+                           return_value="synthetic"),
+              patch.object(date_field_probe.nvidia_client, "_call_vision",
+                           return_value='{"action_month":"04","engineer_month":"5",'
+                                        '"customer_month":null}') as call,
+              patch.object(date_field_probe.nvidia_client, "reset_ocr_metrics"),
+              patch.object(date_field_probe.nvidia_client, "reset_model_availability"),
+              patch.object(date_field_probe.nvidia_client, "get_ocr_metrics", return_value={
+                  "calls": 2, "seconds": 1.0, "total_tokens": 100,
+              })):
+            result = date_field_probe.probe_sample_months(
+                self.sample, Path("unused")
+            )
+        self.assertEqual(result["month_fields"]["service_date_raw"],
+                         ["CORRECT", "CORRECT"])
+        self.assertEqual(result["month_fields"]["engineer_signed_date"],
+                         ["OTHER_VALID_MONTH", "OTHER_VALID_MONTH"])
+        self.assertEqual(result["month_fields"]["customer_signed_date"],
+                         ["UNREADABLE", "UNREADABLE"])
+        prompt = call.call_args.args[0]
+        self.assertNotIn("Asana", prompt)
+        self.assertNotIn("2031", prompt)
+        self.assertNotIn("04/", prompt)
+        self.assertNotIn("2031", str(result))
+
 
 if __name__ == "__main__":
     main()

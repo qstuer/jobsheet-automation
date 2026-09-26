@@ -126,6 +126,66 @@ def _majority_date(reading: dict[str, date | None]) -> date | None:
     return day if count >= 2 else None
 
 
+def _read_joint_months(doc: fitz.Document, zoom: float) -> dict[str, int | None]:
+    """Read only the middle digit group; never show a candidate month."""
+    card = nvidia_client.crop_jobsheet_field_card(
+        doc, 0, FIELDS, zoom=zoom, strong=zoom >= 6.0,
+    )
+    prompt = (
+        "There are three separately labelled handwritten dates: ACTION DATE, "
+        "ENGINEER SIGNATURE DATE, and CUSTOMER SIGNATURE DATE. For each box, "
+        "read ONLY the handwritten MONTH digits between its first and second "
+        "date separators. Compare the writer's digit shapes where useful, but "
+        "do not assume that all three months are equal. Ignore day, year, "
+        "printed format headings and stamps. If either separator or the month "
+        "is not visible, return null; do not infer a missing digit. Return "
+        'JSON only: {"action_month":null,"engineer_month":null,'
+        '"customer_month":null}. Replace null with the visible one- or '
+        "two-digit month string only."
+    )
+    raw = nvidia_client._call_vision(prompt, card, max_tokens=160, expects_json=True)
+    keys = ("action_month", "engineer_month", "customer_month")
+    parsed = nvidia_client._parse_json_object(raw, required_keys=set(keys))
+    result = {}
+    for field, key in zip(FIELDS, keys):
+        value = parsed[key]
+        if value is None:
+            result[field] = None
+        elif isinstance(value, str) and value.isdigit() and len(value) <= 2 \
+                and 1 <= int(value) <= 12:
+            result[field] = int(value)
+        else:
+            raise nvidia_client.NvidiaResponseError("月份單格回覆格式錯誤")
+    return result
+
+
+def probe_sample_months(sample: dict, fixture_dir: Path) -> dict:
+    """Anonymous month-only diagnostic, with no path to task selection."""
+    expected_month = _reviewed_day(sample).month
+    nvidia_client.reset_ocr_metrics()
+    nvidia_client.reset_model_availability()
+    statuses = {field: [] for field in FIELDS}
+    with fitz.open(fixture_dir / sample["filename"]) as doc:
+        if doc.page_count < 1:
+            raise ValueError("日期探針不能讀取空白 PDF")
+        for zoom in ZOOMS:
+            try:
+                reading = _read_joint_months(doc, zoom)
+            except nvidia_client.NvidiaResponseError:
+                reading = {field: None for field in FIELDS}
+            for field in FIELDS:
+                value = reading[field]
+                statuses[field].append(
+                    "UNREADABLE" if value is None else
+                    "CORRECT" if value == expected_month else "OTHER_VALID_MONTH"
+                )
+    return {
+        "sample_id": sample["sample_id"],
+        "month_fields": statuses,
+        "usage": nvidia_client.get_ocr_metrics(),
+    }
+
+
 def probe_sample_joint(sample: dict, fixture_dir: Path) -> dict:
     """Anonymous joint-card experiment; no result can select an Asana task."""
     expected = _reviewed_day(sample)
@@ -260,7 +320,7 @@ def run() -> int:
         raise ValueError("日期探針缺少指定樣本")
     _validate_selected_files(list(selected.values()), fixture_dir)
     mode = os.environ.get("JOBSHEET_DATE_PROBE_MODE", "single")
-    if mode not in {"single", "joint", "cross_provider"}:
+    if mode not in {"single", "joint", "cross_provider", "month"}:
         raise ValueError("日期探針模式不正確")
     rows = []
     for sample_id in SAMPLES:
@@ -268,12 +328,13 @@ def run() -> int:
             "single": probe_sample,
             "joint": probe_sample_joint,
             "cross_provider": probe_sample_cross_provider,
+            "month": probe_sample_months,
         }[mode]
         row = probe(selected[sample_id], fixture_dir)
         rows.append(row)
         log.info("[%s] 日期欄位只讀檢查完成：%s", sample_id,
                  row.get("joint_fields") or row.get("fields")
-                 or row.get("reader_statuses"))
+                 or row.get("reader_statuses") or row.get("month_fields"))
     temporary = report.with_suffix(".tmp")
     temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report)
