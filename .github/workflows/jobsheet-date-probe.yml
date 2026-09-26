@@ -43,7 +43,7 @@ jobs:
       - name: Download fingerprinted private fixtures
         run: |
           mkdir -p /tmp/jobsheet-date-probe
-          for n in $(seq -w 1 20); do
+          for n in 01 04 07 10; do
             rclone copyto \
               "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/B${n}.pdf" \
               "/tmp/jobsheet-date-probe/B${n}.pdf"

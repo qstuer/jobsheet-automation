@@ -1,6 +1,8 @@
 """Synthetic checks for the anonymous date-only fixture probe."""
+import hashlib
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase, main
 from unittest.mock import MagicMock, patch
 
@@ -79,7 +81,20 @@ class DateFieldProbeTests(TestCase):
               })):
             result = date_field_probe.probe_sample_joint(self.sample, Path("unused"))
         self.assertEqual(result["two_render_majority"], "UNRESOLVED")
+        self.assertEqual(result["joint_components"]["service_date_raw"][0],
+                         {"day": True, "month": True, "year": True})
         self.assertNotIn("2031", str(result))
+
+    def test_only_selected_files_need_fingerprints(self):
+        with TemporaryDirectory() as folder:
+            directory = Path(folder)
+            path = directory / "B01.pdf"
+            path.write_bytes(b"synthetic fixture")
+            sample = dict(self.sample, source_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            date_field_probe._validate_selected_files([sample], directory)
+            path.write_bytes(b"changed fixture")
+            with self.assertRaises(ValueError):
+                date_field_probe._validate_selected_files([sample], directory)
 
 
 if __name__ == "__main__":

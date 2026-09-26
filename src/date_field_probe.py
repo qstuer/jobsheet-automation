@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -16,7 +17,7 @@ from pathlib import Path
 import fitz
 
 from . import nvidia_client
-from .backtest import _load_manifest, _validate_files
+from .backtest import _load_manifest
 
 log = logging.getLogger("date_field_probe")
 
@@ -61,6 +62,27 @@ def _read_status(read: date | None, expected: date) -> str:
     if read is None:
         return "UNREADABLE"
     return "CORRECT" if read == expected else "OTHER_VALID_DATE"
+
+
+def _component_flags(read: date | None, expected: date) -> dict[str, bool] | None:
+    if read is None:
+        return None
+    return {
+        "day": read.day == expected.day,
+        "month": read.month == expected.month,
+        "year": read.year == expected.year,
+    }
+
+
+def _validate_selected_files(samples: list[dict], fixture_dir: Path) -> None:
+    """Check only the four selected private PDFs, without logging their bytes."""
+    for sample in samples:
+        path = fixture_dir / sample["filename"]
+        expected_hash = sample.get("source_sha256")
+        if not path.is_file() or not expected_hash:
+            raise ValueError("日期探針缺少經指紋核實的原件")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+            raise ValueError("日期探針原件指紋不符")
 
 
 def _read_joint_dates(doc: fitz.Document, zoom: float) -> dict[str, date | None]:
@@ -109,6 +131,7 @@ def probe_sample_joint(sample: dict, fixture_dir: Path) -> dict:
     nvidia_client.reset_ocr_metrics()
     nvidia_client.reset_model_availability()
     fields = {field: [] for field in FIELDS}
+    components = {field: [] for field in FIELDS}
     majority_days = []
     with fitz.open(fixture_dir / sample["filename"]) as doc:
         if doc.page_count < 1:
@@ -120,6 +143,7 @@ def probe_sample_joint(sample: dict, fixture_dir: Path) -> dict:
                 reading = {field: None for field in FIELDS}
             for field in FIELDS:
                 fields[field].append(_read_status(reading[field], expected))
+                components[field].append(_component_flags(reading[field], expected))
             majority_days.append(_majority_date(reading))
     agreed = (len(majority_days) == 2 and majority_days[0] is not None
               and majority_days[0] == majority_days[1])
@@ -130,6 +154,7 @@ def probe_sample_joint(sample: dict, fixture_dir: Path) -> dict:
     return {
         "sample_id": sample["sample_id"],
         "joint_fields": fields,
+        "joint_components": components,
         "two_render_majority": majority_result,
         "calls": metrics["calls"],
         "seconds": round(metrics["seconds"], 2),
@@ -172,11 +197,11 @@ def run() -> int:
     manifest = Path(os.environ["JOBSHEET_BACKTEST_MANIFEST"])
     report = Path(os.environ["JOBSHEET_DATE_PROBE_REPORT"])
     samples = _load_manifest(manifest)
-    _validate_files(samples, fixture_dir)
     selected = {sample["sample_id"]: sample for sample in samples
                 if sample["sample_id"] in SAMPLES}
     if set(selected) != set(SAMPLES):
         raise ValueError("日期探針缺少指定樣本")
+    _validate_selected_files(list(selected.values()), fixture_dir)
     mode = os.environ.get("JOBSHEET_DATE_PROBE_MODE", "single")
     if mode not in {"single", "joint"}:
         raise ValueError("日期探針模式不正確")
