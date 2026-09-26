@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -26,6 +27,11 @@ FIELDS = (
     "customer_signed_date",
 )
 ZOOMS = (5.0, 6.0)
+_JOINT_KEYS = {
+    "action_date": "service_date_raw",
+    "engineer_date": "engineer_signed_date",
+    "customer_date": "customer_signed_date",
+}
 
 
 def _reviewed_day(sample: dict) -> date:
@@ -55,6 +61,81 @@ def _read_status(read: date | None, expected: date) -> str:
     if read is None:
         return "UNREADABLE"
     return "CORRECT" if read == expected else "OTHER_VALID_DATE"
+
+
+def _read_joint_dates(doc: fitz.Document, zoom: float) -> dict[str, date | None]:
+    """Let OCR compare handwriting while transcribing all three boxes separately.
+
+    No Asana dates or reviewed answers are included in the prompt.  Similar
+    handwriting is a visual aid, not a reason to force three equal answers.
+    """
+    card = nvidia_client.crop_jobsheet_field_card(
+        doc, 0, FIELDS, zoom=zoom, strong=zoom >= 6.0,
+    )
+    prompt = (
+        "This image has three separately labelled handwritten date boxes: "
+        "ACTION DATE, ENGINEER SIGNATURE DATE, CUSTOMER SIGNATURE DATE. "
+        "Transcribe each box independently in DD/MM/YYYY order. The dates "
+        "may be different. You may compare the writer's digit shapes across "
+        "boxes, but do not copy a value merely to make them agree. Use null "
+        "for an unreadable box; do not invent missing digits. Ignore stamps, "
+        "printed date-format headings, names and other boxes. Return JSON "
+        'only: {"action_date":null,"engineer_date":null,"customer_date":null}. '
+        "Replace null with the visible date string for each readable box."
+    )
+    raw = nvidia_client._call_vision(prompt, card, max_tokens=220, expects_json=True)
+    parsed = nvidia_client._parse_json_object(raw, required_keys=set(_JOINT_KEYS))
+    if any(value is not None and not isinstance(value, str)
+           for key, value in parsed.items() if key in _JOINT_KEYS):
+        raise nvidia_client.NvidiaResponseError("日期並排複核格式錯誤")
+    return {
+        field: nvidia_client._parse_action_date(parsed[key])
+        for key, field in _JOINT_KEYS.items()
+    }
+
+
+def _majority_date(reading: dict[str, date | None]) -> date | None:
+    valid = [value for value in reading.values() if value is not None]
+    counts = Counter(valid)
+    if not counts:
+        return None
+    day, count = counts.most_common(1)[0]
+    return day if count >= 2 else None
+
+
+def probe_sample_joint(sample: dict, fixture_dir: Path) -> dict:
+    """Anonymous joint-card experiment; no result can select an Asana task."""
+    expected = _reviewed_day(sample)
+    nvidia_client.reset_ocr_metrics()
+    nvidia_client.reset_model_availability()
+    fields = {field: [] for field in FIELDS}
+    majority_days = []
+    with fitz.open(fixture_dir / sample["filename"]) as doc:
+        if doc.page_count < 1:
+            raise ValueError("日期探針不能讀取空白 PDF")
+        for zoom in ZOOMS:
+            try:
+                reading = _read_joint_dates(doc, zoom)
+            except nvidia_client.NvidiaResponseError:
+                reading = {field: None for field in FIELDS}
+            for field in FIELDS:
+                fields[field].append(_read_status(reading[field], expected))
+            majority_days.append(_majority_date(reading))
+    agreed = (len(majority_days) == 2 and majority_days[0] is not None
+              and majority_days[0] == majority_days[1])
+    majority_result = (
+        _read_status(majority_days[0], expected) if agreed else "UNRESOLVED"
+    )
+    metrics = nvidia_client.get_ocr_metrics()
+    return {
+        "sample_id": sample["sample_id"],
+        "joint_fields": fields,
+        "two_render_majority": majority_result,
+        "calls": metrics["calls"],
+        "seconds": round(metrics["seconds"], 2),
+        "tokens": metrics["total_tokens"],
+        "cost_upper_cny": metrics.get("estimated_cost_cny_upper"),
+    }
 
 
 def probe_sample(sample: dict, fixture_dir: Path) -> dict:
@@ -96,11 +177,16 @@ def run() -> int:
                 if sample["sample_id"] in SAMPLES}
     if set(selected) != set(SAMPLES):
         raise ValueError("日期探針缺少指定樣本")
+    mode = os.environ.get("JOBSHEET_DATE_PROBE_MODE", "single")
+    if mode not in {"single", "joint"}:
+        raise ValueError("日期探針模式不正確")
     rows = []
     for sample_id in SAMPLES:
-        row = probe_sample(selected[sample_id], fixture_dir)
+        probe = probe_sample_joint if mode == "joint" else probe_sample
+        row = probe(selected[sample_id], fixture_dir)
         rows.append(row)
-        log.info("[%s] 日期欄位只讀檢查完成：%s", sample_id, row["fields"])
+        log.info("[%s] 日期欄位只讀檢查完成：%s", sample_id,
+                 row.get("joint_fields") or row.get("fields"))
     temporary = report.with_suffix(".tmp")
     temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report)

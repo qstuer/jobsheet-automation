@@ -53,11 +53,12 @@ jobs:
             /tmp/jobsheet-date-probe/manifest-reviewed-20260925.json
           echo '81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-date-probe/manifest-reviewed-20260925.json' | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Compare three date fields without candidate answers
+      - name: Compare all three date boxes together without candidate answers
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-date-probe
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-date-probe/manifest-reviewed-20260925.json
           JOBSHEET_DATE_PROBE_REPORT: /tmp/jobsheet-date-probe-anonymous.json
+          JOBSHEET_DATE_PROBE_MODE: joint
           OCR_PROVIDER: deepseek
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
