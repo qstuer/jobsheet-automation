@@ -1,0 +1,86 @@
+name: Jobsheet Serial Knowledge Probe - Two Private Samples
+
+# Isolated test-branch experiment. It reads two private copies and writes only
+# an anonymous artifact; neither the production queue nor OneDrive is touched.
+on:
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-serial-knowledge-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-serial-knowledge-probe
+  cancel-in-progress: false
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download two private copies and index
+        run: |
+          mkdir -p /tmp/jobsheet-backtest
+          for id in B07 B10; do
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${id}.pdf" \
+              "/tmp/jobsheet-backtest/${id}.pdf"
+          done
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260925.json" \
+            /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924/asana-device-index.json" \
+            /tmp/asana-device-index.json
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924/asana-device-index-manifest.json" \
+            /tmp/asana-device-index-manifest.json
+      - run: pip install -r requirements.txt
+      - name: Compare the same image with and without held-out pattern knowledge
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          JOBSHEET_SERIAL_REPORT: /tmp/serial-probe-anonymous.json
+          OCR_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
+        run: python -m src.serial_knowledge_probe
+      - name: Preserve anonymous results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-knowledge-anonymous-results
+          path: /tmp/serial-probe-anonymous.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Clean up rclone credentials
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
