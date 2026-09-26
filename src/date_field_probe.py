@@ -13,10 +13,11 @@ import hashlib
 from collections import Counter
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import fitz
 
-from . import nvidia_client
+from . import config, nvidia_client
 from .backtest import _load_manifest
 
 log = logging.getLogger("date_field_probe")
@@ -192,6 +193,54 @@ def probe_sample(sample: dict, fixture_dir: Path) -> dict:
     }
 
 
+def probe_sample_cross_provider(sample: dict, fixture_dir: Path) -> dict:
+    """Compare ACTION DATE only, with independent DeepSeek and NVIDIA calls.
+
+    This is a read-only experiment, not an automatic correction. In particular,
+    the NVIDIA fallback model is disabled so a failed primary cannot silently
+    change which two models are being compared. Neither model sees the private
+    answer or any Asana candidate date.
+    """
+    expected = _reviewed_day(sample)
+    statuses = {}
+    components = {}
+    agreed_dates = {}
+    usage = {}
+    with fitz.open(fixture_dir / sample["filename"]) as doc:
+        if doc.page_count < 1:
+            raise ValueError("日期探針不能讀取空白 PDF")
+        for provider in ("deepseek", "nvidia"):
+            nvidia_client.reset_ocr_metrics()
+            nvidia_client.reset_model_availability()
+            values = []
+            with patch.object(config, "OCR_PROVIDER", provider), \
+                    patch.object(config, "NVIDIA_FALLBACK_MODEL", ""):
+                for zoom in ZOOMS:
+                    try:
+                        values.append(_read_date(doc, "service_date_raw", zoom))
+                    except nvidia_client.NvidiaResponseError:
+                        values.append(None)
+                usage[provider] = nvidia_client.get_ocr_metrics()
+            statuses[provider] = [_read_status(value, expected) for value in values]
+            components[provider] = [_component_flags(value, expected) for value in values]
+            agreed_dates[provider] = (
+                values[0] if len(values) == 2 and values[0] is not None
+                and values[0] == values[1] else None
+            )
+    cross_agreed = (agreed_dates["deepseek"] is not None
+                    and agreed_dates["deepseek"] == agreed_dates["nvidia"])
+    return {
+        "sample_id": sample["sample_id"],
+        "provider_statuses": statuses,
+        "provider_components": components,
+        "cross_provider_agreement": (
+            _read_status(agreed_dates["deepseek"], expected)
+            if cross_agreed else "UNRESOLVED"
+        ),
+        "usage": usage,
+    }
+
+
 def run() -> int:
     fixture_dir = Path(os.environ["JOBSHEET_BACKTEST_DIR"])
     manifest = Path(os.environ["JOBSHEET_BACKTEST_MANIFEST"])
@@ -203,15 +252,20 @@ def run() -> int:
         raise ValueError("日期探針缺少指定樣本")
     _validate_selected_files(list(selected.values()), fixture_dir)
     mode = os.environ.get("JOBSHEET_DATE_PROBE_MODE", "single")
-    if mode not in {"single", "joint"}:
+    if mode not in {"single", "joint", "cross_provider"}:
         raise ValueError("日期探針模式不正確")
     rows = []
     for sample_id in SAMPLES:
-        probe = probe_sample_joint if mode == "joint" else probe_sample
+        probe = {
+            "single": probe_sample,
+            "joint": probe_sample_joint,
+            "cross_provider": probe_sample_cross_provider,
+        }[mode]
         row = probe(selected[sample_id], fixture_dir)
         rows.append(row)
         log.info("[%s] 日期欄位只讀檢查完成：%s", sample_id,
-                 row.get("joint_fields") or row.get("fields"))
+                 row.get("joint_fields") or row.get("fields")
+                 or row.get("provider_statuses"))
     temporary = report.with_suffix(".tmp")
     temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(report)

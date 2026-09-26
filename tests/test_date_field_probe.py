@@ -96,6 +96,57 @@ class DateFieldProbeTests(TestCase):
             with self.assertRaises(ValueError):
                 date_field_probe._validate_selected_files([sample], directory)
 
+    def test_cross_provider_requires_both_models_to_agree_without_fallback(self):
+        truth = date(2031, 4, 12)
+        wrong = date(2031, 5, 12)
+        doc = MagicMock()
+        doc.__enter__.return_value = doc
+        doc.page_count = 4
+        seen = []
+
+        def read_date(_doc, _field, _zoom):
+            seen.append((date_field_probe.config.OCR_PROVIDER,
+                         date_field_probe.config.NVIDIA_FALLBACK_MODEL))
+            return truth if date_field_probe.config.OCR_PROVIDER == "deepseek" else wrong
+
+        with (patch.object(date_field_probe.fitz, "open", return_value=doc),
+              patch.object(date_field_probe, "_read_date", side_effect=read_date),
+              patch.object(date_field_probe.nvidia_client, "reset_ocr_metrics"),
+              patch.object(date_field_probe.nvidia_client, "reset_model_availability"),
+              patch.object(date_field_probe.nvidia_client, "get_ocr_metrics", return_value={
+                  "calls": 2, "seconds": 1.0, "total_tokens": 100,
+              })):
+            result = date_field_probe.probe_sample_cross_provider(
+                self.sample, Path("unused")
+            )
+        self.assertEqual(result["cross_provider_agreement"], "UNRESOLVED")
+        self.assertEqual(result["provider_statuses"]["deepseek"],
+                         ["CORRECT", "CORRECT"])
+        self.assertEqual(result["provider_statuses"]["nvidia"],
+                         ["OTHER_VALID_DATE", "OTHER_VALID_DATE"])
+        self.assertEqual([provider for provider, _ in seen],
+                         ["deepseek", "deepseek", "nvidia", "nvidia"])
+        self.assertTrue(all(fallback == "" for _, fallback in seen))
+        self.assertNotIn("2031", str(result))
+
+    def test_cross_provider_agreement_is_still_scored_against_private_truth(self):
+        wrong = date(2031, 5, 12)
+        doc = MagicMock()
+        doc.__enter__.return_value = doc
+        doc.page_count = 4
+        with (patch.object(date_field_probe.fitz, "open", return_value=doc),
+              patch.object(date_field_probe, "_read_date", return_value=wrong),
+              patch.object(date_field_probe.nvidia_client, "reset_ocr_metrics"),
+              patch.object(date_field_probe.nvidia_client, "reset_model_availability"),
+              patch.object(date_field_probe.nvidia_client, "get_ocr_metrics", return_value={
+                  "calls": 2, "seconds": 1.0, "total_tokens": 100,
+              })):
+            result = date_field_probe.probe_sample_cross_provider(
+                self.sample, Path("unused")
+            )
+        self.assertEqual(result["cross_provider_agreement"], "OTHER_VALID_DATE")
+        self.assertNotIn("2031", str(result))
+
 
 if __name__ == "__main__":
     main()
