@@ -1,8 +1,10 @@
 """Four private PDFs: assisted, read-only acceptance of the pending-review path.
 
 The private manifest provides the human-confirmed date. Its expected Asana GID
-is withheld until the date-only pass explicitly reports multiple visits. No
-ground-truth hospital, product, serial or phone is given to the image model.
+is withheld until the date-only pass explicitly reports multiple visits. B07
+alone may use the independently reviewed serial after a device conflict; the
+reviewer still requires an exact same-visit Asset. No expected field is given
+to the image model, and B10 never receives a serial override.
 """
 
 import hashlib
@@ -21,11 +23,13 @@ SAMPLE_IDS = ("B01", "B04", "B07", "B10")
 
 
 def _anonymous_row(sample_id: str, *, status: str, reason: str = "",
-                   assisted: bool = False, metrics: dict | None = None) -> dict:
+                   assisted: bool = False, serial_assisted: bool = False,
+                   metrics: dict | None = None) -> dict:
     metrics = metrics or {}
     return {
         "sample_id": sample_id, "status": status, "reason": reason,
         "task_choice_supplied": assisted,
+        "serial_choice_supplied": serial_assisted,
         "calls": int(metrics.get("calls") or 0),
         "seconds": round(float(metrics.get("seconds") or 0), 2),
         "tokens": int(metrics.get("total_tokens") or 0),
@@ -164,6 +168,7 @@ def run() -> list[dict]:
                 confirmed_day = sample["observed_fields"]["service_date_raw"]
                 first = pending_review.review_ocr(ocr, detected, confirmed_day)
                 assisted = False
+                serial_assisted = False
                 result = first
                 if first["reason"] in {"visit_ambiguous", "device_ambiguous"}:
                     # Only for a disputed visit/device is the confirmed
@@ -173,18 +178,30 @@ def run() -> list[dict]:
                     result = pending_review.review_ocr(
                         ocr, detected, confirmed_day, sample["expected"]["task_gid"]
                     )
+                elif sample_id == "B07" and first["reason"] == "device_identity_conflict":
+                    # This serial was checked against the original private PDF
+                    # by a person. It is never passed to OCR or used for B10.
+                    serial_assisted = True
+                    assisted = True
+                    result = pending_review.review_ocr(
+                        ocr, detected, confirmed_day, sample["expected"]["task_gid"],
+                        confirmed_serial=sample["expected"]["serial"],
+                    )
                 if result["status"] == "READY_READ_ONLY":
                     task = result["task"]
                     correct = backtest._matches_expected(task, sample["expected"])
                     row = _anonymous_row(
-                        sample_id, status="PASS_ASSISTED" if correct and assisted else
+                        sample_id, status="PASS_SERIAL_ASSISTED" if correct and serial_assisted else
+                        "PASS_ASSISTED" if correct and assisted else
                         "PASS_DATE_ONLY" if correct else "WRONG_MATCH",
                         reason="all_checks_passed" if correct else "answer_conflict",
-                        assisted=assisted, metrics=metrics,
+                        assisted=assisted, serial_assisted=serial_assisted,
+                        metrics=metrics,
                     )
                 else:
                     row = _anonymous_row(sample_id, status="PENDING",
                                          reason=result["reason"], assisted=assisted,
+                                         serial_assisted=serial_assisted,
                                          metrics=metrics)
                 row["identity_diagnostic"] = diagnostic
             except nvidia_client.NvidiaResponseError:
@@ -202,11 +219,12 @@ def run() -> list[dict]:
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as stream:
             stream.write("## 四份受控核對（只讀，人工日期不是模型成績）\n\n")
-            stream.write("| 樣本 | 結果 | 是否另選工作 | 原因 | 圖片呼叫 |\n")
-            stream.write("|---|---|---|---|---:|\n")
+            stream.write("| 樣本 | 結果 | 是否另選工作 | 是否人工核對機身編號 | 原因 | 圖片呼叫 |\n")
+            stream.write("|---|---|---|---|---|---:|\n")
             for row in rows:
                 stream.write(f"| {row['sample_id']} | {row['status']} | "
                              f"{'是' if row['task_choice_supplied'] else '否'} | "
+                             f"{'是' if row['serial_choice_supplied'] else '否'} | "
                              f"{row['reason']} | {row['calls']} |\n")
             stream.write("\n沒有 OneDrive 寫入或 Google Drive 來源搬移；公開報告不含日期、電話、機身編號、醫院、任務或檔名。\n")
     return rows

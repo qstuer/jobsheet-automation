@@ -1,9 +1,10 @@
-"""Read-only, single-jobsheet review of a disputed ACTION DATE / Asana visit.
+"""Read-only, single-jobsheet review of disputed OCR / Asana evidence.
 
 The reviewer is deliberately separate from automatic matching and from the
 ``confirmed_filename`` upload shortcut. A human can correct only the disputed
-date and, if needed, identify one existing Asana task. They cannot supply a
-device, hospital, product, serial or output name through this path.
+date and, if needed, identify one existing Asana task. A separately confirmed
+serial is accepted only with an exact same-visit Asset and a selected task;
+it never enters the automatic or upload path.
 """
 
 import re
@@ -29,6 +30,10 @@ REASON_MESSAGES = {
     "live_support_conflict": "Asana 當次電話或 Asset 證據不吻合",
     "live_identity_conflict": "Asana 最新產品或醫院不吻合",
     "order_number_conflict": "單據訂單號與 Asana 不吻合",
+    "confirmed_serial_requires_task": "人工確認機身編號時必須指定 Asana 工作",
+    "manual_serial_not_visually_supported": "原始讀數與人工確認機身編號差異過大",
+    "manual_serial_not_unique": "人工確認機身編號在索引中不唯一",
+    "manual_serial_asset_not_confirmed": "當次 Asset 沒有獨立讀出並與 Asana 完全吻合",
 }
 
 
@@ -56,6 +61,16 @@ def parse_task_gid(value: str) -> str:
             and parts[1].isdigit() and re.fullmatch(r"\d{8,20}", parts[2])):
         return parts[2]
     raise ValueError("Asana 工作只接受 GID 或 app.asana.com 工作連結")
+
+
+def parse_review_serial(value: str) -> str:
+    """Accept a complete human-read serial, never a partial/pattern guess."""
+    serial = (value or "").strip().upper()
+    if not (re.fullmatch(r"[A-Z]{2,3}[A-Z0-9]{6,9}", serial)
+            and 8 <= len(serial) <= 12
+            and sum(char.isdigit() for char in serial) >= 4):
+        raise ValueError("確認機身編號必須完整，不能有空格、符號或問號")
+    return serial
 
 
 def _same_hospital(wanted: list[str], stored: list[str]) -> bool:
@@ -126,8 +141,76 @@ def _pending(reason: str, **extra) -> dict:
     return {"status": "PENDING", "reason": reason, **extra}
 
 
+def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
+                                  selected_gid: str, serial: str) -> dict:
+    """Narrow one private review; never replace the original OCR evidence.
+
+    A person can resolve the handwriting, but cannot supply the hospital,
+    product, Asset, visit date or Asana identity. The latter are independently
+    checked against both the private index and a fresh Asana fetch.
+    """
+    if not selected_gid:
+        return _pending("confirmed_serial_requires_task")
+    prepared = asana_client._prepare_index_query(ocr)
+    visual_serials = prepared.get("_index_serials") or []
+    if not visual_serials or min(
+            asana_client._lev(asana_client._norm(value), serial)
+            for value in visual_serials) > 3:
+        return _pending("manual_serial_not_visually_supported")
+    rows = [row for row in asana_client._device_index["devices"]
+            if asana_client._norm(row.get("serial")) == serial
+            and not row.get("weak_identity")]
+    if len(rows) != 1:
+        return _pending("manual_serial_not_unique")
+    row = rows[0]
+    score = asana_client._score_index_device(row, prepared, job_type)
+    if score["product_similarity"] != 1.0 or score["hospital_similarity"] != 1.0:
+        return _pending("device_identity_conflict")
+    wanted_product = prepared.get("_index_wanted_product")
+    wanted_hospitals = prepared.get("_index_wanted_hospitals") or []
+    refs = [ref for ref in row.get("task_refs") or []
+            if str(ref.get("gid")) == selected_gid and ref.get("job_type") == job_type]
+    if len(refs) != 1:
+        return _pending("selected_visit_not_eligible")
+    ref = refs[0]
+    if not (_same_product(wanted_product, asana_client.product_group(
+            ref.get("product_family") or ref.get("product")))
+            and _same_hospital(wanted_hospitals, ref.get("hospital_aliases") or
+                               asana_client.hospital_aliases(
+                                   ref.get("hospital") or ref.get("location")))):
+        return _pending("selected_visit_not_eligible")
+    delta = _formal_delta(day, ref)
+    if delta is None or delta > REVIEW_WINDOW_DAYS:
+        return _pending("no_visit_within_14_days")
+    # Unlike the normal one-character typo path, this two/three-character
+    # exception requires an exact Asset on this *visit*, not a historical
+    # phone or Asset from another job on the same equipment.
+    if asana_client._asset_match_level(ocr.get("asset_candidates"), ref.get("assets")) != 2:
+        return _pending("manual_serial_asset_not_confirmed")
+
+    # Only after every independent gate, run the existing read-only reviewer
+    # with the confirmed serial. Keep all other original OCR fields unchanged.
+    adjusted = dict(ocr)
+    adjusted.pop("_index_query_prepared", None)
+    adjusted["serial_candidates"] = [serial]
+    adjusted["serial_visual_candidates"] = []
+    adjusted["serial_no"] = serial
+    result = review_ocr(adjusted, job_type, day.isoformat(), selected_gid)
+    if result["status"] != "READY_READ_ONLY":
+        return result
+    live_record = asana_index.task_to_record(result["task"], job_type)
+    if (not live_record or asana_client._norm(live_record.get("serial")) != serial
+            or len(live_record.get("task_refs") or []) != 1):
+        return _pending("live_serial_conflict")
+    if asana_client._asset_match_level(
+            ocr.get("asset_candidates"), live_record["task_refs"][0].get("assets")) != 2:
+        return _pending("live_support_conflict")
+    result["manual_serial_confirmed"] = True
+    return result
+
+
 def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
-               selected_task: str = "") -> dict:
+               selected_task: str = "", confirmed_serial: str = "") -> dict:
     """Check identity, visit and current Asana facts without any cloud write.
 
     A confirmation is *not* a filename override. The caller may use a READY
@@ -139,6 +222,10 @@ def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
         return _pending("job_type_unknown")
     if asana_client._device_index is None:
         raise asana_client.AsanaError("受控核對需要已驗證的私人設備索引")
+    if confirmed_serial:
+        return _review_with_confirmed_serial(
+            ocr, job_type, day, selected_gid, parse_review_serial(confirmed_serial)
+        )
 
     prepared = asana_client._prepare_index_query(ocr)
     serials = prepared.get("_index_serials") or []

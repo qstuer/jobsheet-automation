@@ -12,11 +12,12 @@ from src import asana_client, asana_index, config, pending_review, processor
 
 def fake_task(gid, *, due="2026-08-20", hospital="Demo General Hospital",
               product="EPIQ Elite", serial="US123B4567", kind="PM",
-              phone="99990011"):
+              phone="99990011", asset=""):
     project = "2026 Aug" if kind == "PM" else "Corrective Maintenance"
     return {
         "gid": gid, "name": f"{hospital} / {product} / {serial}",
-        "notes": f"Phone: {phone}", "due_on": due,
+        "notes": f"Phone: {phone}\nAsset# {asset}" if asset else f"Phone: {phone}",
+        "due_on": due,
         "completed_at": "", "start_on": "", "completed": False,
         "created_at": "2026-08-01T00:00:00Z",
         "modified_at": "2026-08-21T00:00:00Z",
@@ -52,10 +53,58 @@ class PendingReviewTests(unittest.TestCase):
         )
         asana_client.set_device_index(index)
 
-    def _review(self, ocr=None, day="2026-08-18", chosen=""):
+    def _review(self, ocr=None, day="2026-08-18", chosen="", serial=""):
         with patch.object(asana_client, "_fetch_task", side_effect=lambda gid: next(
                 item for item in self.visits if item["gid"] == gid)):
-            return pending_review.review_ocr(ocr or fake_ocr(), "PM", day, chosen)
+            return pending_review.review_ocr(ocr or fake_ocr(), "PM", day, chosen,
+                                             confirmed_serial=serial)
+
+    def test_confirmed_serial_requires_visual_and_exact_same_visit_asset(self):
+        self.visits = [fake_task("12345678", asset="88880001")]
+        self._install()
+        two_typos = fake_ocr(serial_candidates=["US123B4599"],
+                             asset_candidates=["88880001"], phone_candidates=[])
+        self.assertEqual("confirmed_serial_requires_task", self._review(
+            two_typos, serial="US123B4567")["reason"])
+        result = self._review(two_typos, chosen="12345678", serial="US123B4567")
+        self.assertEqual("READY_READ_ONLY", result["status"])
+        self.assertTrue(result["manual_serial_confirmed"])
+        self.assertEqual("manual_serial_not_visually_supported", self._review(
+            fake_ocr(serial_candidates=["SZ999B9999"],
+                     asset_candidates=["88880001"]),
+            chosen="12345678", serial="US123B4567")["reason"])
+        self.assertEqual("manual_serial_asset_not_confirmed", self._review(
+            fake_ocr(serial_candidates=["US123B4599"], asset_candidates=[]),
+            chosen="12345678", serial="US123B4567")["reason"])
+        self.assertEqual("manual_serial_asset_not_confirmed", self._review(
+            fake_ocr(serial_candidates=["US123B4599"],
+                     asset_candidates=["88880002"]),
+            chosen="12345678", serial="US123B4567")["reason"])
+
+    def test_confirmed_serial_cannot_bypass_date_type_or_live_asset(self):
+        self.visits = [fake_task("12345678", asset="88880001")]
+        self._install()
+        ocr = fake_ocr(serial_candidates=["US123B4599"],
+                       asset_candidates=["88880001"])
+        self.assertEqual("no_visit_within_14_days", self._review(
+            ocr, day="2026-09-20", chosen="12345678",
+            serial="US123B4567")["reason"])
+        self.assertEqual("selected_visit_not_eligible", self._review(
+            ocr, chosen="87654321", serial="US123B4567")["reason"])
+        self.assertEqual("device_identity_conflict", self._review(
+            fake_ocr(serial_candidates=["US123B4599"], asset_candidates=["88880001"],
+                     hospital_raw="Wrong Hospital"), chosen="12345678",
+            serial="US123B4567")["reason"])
+        with patch.object(asana_client, "_fetch_task", return_value=fake_task(
+                "12345678", asset="88880002")):
+            self.assertEqual("live_support_conflict", pending_review.review_ocr(
+                ocr, "PM", "2026-08-18", "12345678",
+                confirmed_serial="US123B4567")["reason"])
+
+    def test_confirmed_serial_rejects_partial_input(self):
+        for value in ("US123B45?7", "US123B45-7", "US123", "15915F0726"):
+            with self.assertRaises(ValueError):
+                pending_review.parse_review_serial(value)
 
     def test_human_date_does_not_replace_other_checks(self):
         result = self._review()

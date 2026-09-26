@@ -24,7 +24,8 @@ class PendingReviewBacktestTests(unittest.TestCase):
                 "observed_fields": {
                     "service_date_raw": "2026-08-18", "date_source": "ACTION_DATE",
                 },
-                "expected": {"kind": "match", "task_gid": "12345678"},
+                "expected": {"kind": "match", "task_gid": "12345678",
+                             "serial": "US123B4567"},
             })
         return samples
 
@@ -42,12 +43,15 @@ class PendingReviewBacktestTests(unittest.TestCase):
             }
             reviewed = []
 
-            def review(ocr, kind, day, selected_task=""):
-                reviewed.append((ocr["sample"], kind, day, selected_task))
+            def review(ocr, kind, day, selected_task="", confirmed_serial=""):
+                reviewed.append((ocr["sample"], kind, day, selected_task,
+                                 bool(confirmed_serial)))
                 if ocr["sample"] in {"B01", "B04"} and not selected_task:
                     return {"status": "PENDING", "reason":
                             "visit_ambiguous" if ocr["sample"] == "B01"
                             else "device_ambiguous"}
+                if ocr["sample"] in {"B07", "B10"} and not confirmed_serial:
+                    return {"status": "PENDING", "reason": "device_identity_conflict"}
                 return {"status": "READY_READ_ONLY", "reason": "all_checks_passed",
                         "task": {"gid": "12345678"}}
 
@@ -78,16 +82,18 @@ class PendingReviewBacktestTests(unittest.TestCase):
                     patch.object(backtest, "_matches_expected", return_value=True):
                 open_pdf.return_value.__enter__.return_value.page_count = 4
                 rows = pending_review_backtest.run()
-            self.assertEqual(["PASS_ASSISTED", "PASS_ASSISTED", "PASS_DATE_ONLY",
-                              "PASS_DATE_ONLY"], [row["status"] for row in rows])
-            self.assertEqual(("B01", "PM", "2026-08-18", ""), reviewed[0])
-            self.assertEqual(("B01", "PM", "2026-08-18", "12345678"), reviewed[1])
-            self.assertEqual(("B04", "PM", "2026-08-18", ""), reviewed[2])
-            self.assertEqual(("B04", "PM", "2026-08-18", "12345678"), reviewed[3])
-            self.assertTrue(all(item[3] == "" for item in reviewed[4:]))
+            self.assertEqual(["PASS_ASSISTED", "PASS_ASSISTED", "PASS_SERIAL_ASSISTED",
+                              "PENDING"], [row["status"] for row in rows])
+            self.assertEqual(("B01", "PM", "2026-08-18", "", False), reviewed[0])
+            self.assertEqual(("B01", "PM", "2026-08-18", "12345678", False), reviewed[1])
+            self.assertEqual(("B04", "PM", "2026-08-18", "", False), reviewed[2])
+            self.assertEqual(("B04", "PM", "2026-08-18", "12345678", False), reviewed[3])
+            self.assertEqual(("B07", "PM", "2026-08-18", "12345678", True), reviewed[5])
+            self.assertEqual(("B10", "PM", "2026-08-18", "", False), reviewed[6])
             public_rows = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(set(public_rows[0]), {
                 "sample_id", "status", "reason", "task_choice_supplied",
+                "serial_choice_supplied",
                 "calls", "seconds", "tokens", "cost_cny_upper",
                 "identity_diagnostic",
             })
