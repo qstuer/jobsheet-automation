@@ -838,10 +838,12 @@ def _ocr_for_pending_review(doc) -> dict:
     # asset box. Re-read that visible panel only when a broad pass saw content
     # there but no Asset reached two-pass consensus. A blank department does
     # not justify extra calls, and one focused result still is not evidence.
+    # One final differently scaled read is allowed only if the first two
+    # disagree; all three see the source alone, never the Asana Asset.
     if not consensus.get("asset_candidates") and any(
             reading.get("department_room_raw") or reading.get("asset_candidates")
             for reading in readings):
-        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+        for zoom in (*config.OCR_FOCUSED_RETRY_ZOOMS, 5.5):
             try:
                 reading = nvidia_client.ocr_jobsheet_focused_field(
                     doc, 0, "department_room_raw", zoom=zoom

@@ -91,6 +91,16 @@ class PendingReviewTests(unittest.TestCase):
             serial="US123B4567")["reason"])
         self.assertEqual("selected_visit_not_eligible", self._review(
             ocr, chosen="87654321", serial="US123B4567")["reason"])
+        self.visits.append(fake_task("87654321", due="2026-08-21",
+                                     asset="88880002"))
+        self._install()
+        self.assertEqual("manual_serial_asset_not_confirmed", self._review(
+            ocr, chosen="87654321", serial="US123B4567")["reason"])
+        self.visits[-1] = fake_task("87654321", due="2026-08-21",
+                                    asset="88880001", kind="CM")
+        self._install()
+        self.assertEqual("selected_visit_not_eligible", self._review(
+            ocr, chosen="87654321", serial="US123B4567")["reason"])
         self.assertEqual("device_identity_conflict", self._review(
             fake_ocr(serial_candidates=["US123B4599"], asset_candidates=["88880001"],
                      hospital_raw="Wrong Hospital"), chosen="12345678",
@@ -314,6 +324,32 @@ class PendingReviewTests(unittest.TestCase):
         self.assertEqual(2, focus.call_count)
         self.assertTrue(all(call.args[2] == "department_room_raw"
                             for call in focus.call_args_list))
+
+    def test_review_allows_one_last_asset_read_after_disagreement(self):
+        broad = fake_ocr(department_room_raw="Asset# 98765432",
+                         asset_candidates=[])
+        other = fake_ocr(department_room_raw=None, asset_candidates=[])
+        readings = [
+            {"asset_candidates": ["98765431"]},
+            {"asset_candidates": ["98765432"]},
+            {"asset_candidates": ["98765432"]},
+        ]
+        with patch.object(processor.nvidia_client, "reset_ocr_metrics"), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_fields",
+                             return_value=broad), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=other), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=other), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_focused_field",
+                             side_effect=readings) as focus, \
+                patch.object(processor.nvidia_client, "get_ocr_metrics",
+                             return_value={"calls": 6, "seconds": 0.0,
+                                           "total_tokens": 0}):
+            result = processor._ocr_for_pending_review(object())
+        self.assertEqual(["98765432"], result["asset_candidates"])
+        self.assertEqual([5.0, 6.0, 5.5],
+                         [call.kwargs["zoom"] for call in focus.call_args_list])
 
 
 if __name__ == "__main__":
