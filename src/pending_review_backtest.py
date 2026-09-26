@@ -165,9 +165,10 @@ def run() -> list[dict]:
                 first = pending_review.review_ocr(ocr, detected, confirmed_day)
                 assisted = False
                 result = first
-                if first["reason"] == "visit_ambiguous":
-                    # Only here is the confirmed *work* revealed to the
-                    # reviewer; it still rechecks every identity and date.
+                if first["reason"] in {"visit_ambiguous", "device_ambiguous"}:
+                    # Only for a disputed visit/device is the confirmed
+                    # *work* revealed; the reviewer still requires one-typo
+                    # identity, same-visit support, and live Asana checks.
                     assisted = True
                     result = pending_review.review_ocr(
                         ocr, detected, confirmed_day, sample["expected"]["task_gid"]

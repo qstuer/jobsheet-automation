@@ -88,9 +88,9 @@ def _visit_has_independent_evidence(ocr: dict, ref: dict) -> bool:
     ) == 2
 
 
-def _unique_supported_close_device(ranked: list[dict], ocr: dict,
-                                   job_type: str, day: date) -> dict | None:
-    """Only a same-visit phone/Asset plus formal date may resolve a typo tie.
+def _supported_close_devices(ranked: list[dict], ocr: dict,
+                             job_type: str, day: date) -> list[tuple[dict, set[str]]]:
+    """Find nearby rows corroborated by one coherent historical visit.
 
     The selected Asana task supplied by a human is intentionally not used to
     choose the device. Search every plausible nearby device so that two rows
@@ -104,7 +104,8 @@ def _unique_supported_close_device(ranked: list[dict], ocr: dict,
         if (item["serial_dist"] > 3 or item["product_similarity"] != 1.0
                 or item["hospital_similarity"] != 1.0):
             continue
-        if any(
+        matching_gids = {
+            str(ref.get("gid")) for ref in item["row"].get("task_refs") or [] if (
             ref.get("job_type") == job_type
             and _same_product(wanted_product, asana_client.product_group(
                 ref.get("product_family") or ref.get("product")))
@@ -114,10 +115,11 @@ def _unique_supported_close_device(ranked: list[dict], ocr: dict,
             and _visit_has_independent_evidence(ocr, ref)
             and (delta := _formal_delta(day, ref)) is not None
             and delta <= REVIEW_WINDOW_DAYS
-            for ref in item["row"].get("task_refs") or []
-        ):
-            supported.append(item)
-    return supported[0] if len(supported) == 1 else None
+            )
+        }
+        if matching_gids:
+            supported.append((item, matching_gids))
+    return supported
 
 
 def _pending(reason: str, **extra) -> dict:
@@ -160,12 +162,22 @@ def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
             and best["product_similarity"] == 1.0
             and best["hospital_similarity"] == 1.0
         )
-        unique_visit_evidence = (
-            best["serial_dist"] == 1
-            and _unique_supported_close_device(ranked, ocr, job_type, day) is best
-        )
-        if not (unique_exact_identity or unique_visit_evidence):
-            return _pending("device_ambiguous")
+        if not unique_exact_identity:
+            supported = _supported_close_devices(ranked, ocr, job_type, day)
+            if len(supported) == 1 and supported[0][0] is best \
+                    and best["serial_dist"] == 1:
+                pass
+            elif selected_gid:
+                # Human selection may disambiguate *which Asana visit*, but
+                # only among independently corroborated one-typo devices.
+                # It cannot provide a missing serial/phone or invent a row.
+                chosen = [item for item, gids in supported
+                          if selected_gid in gids and item["serial_dist"] == 1]
+                if len(chosen) != 1:
+                    return _pending("device_ambiguous")
+                best = chosen[0]
+            else:
+                return _pending("device_ambiguous")
     if (best["product_similarity"] < 1.0 or best["hospital_similarity"] < 1.0
             or best["serial_dist"] > 1):
         # A date or selected task cannot rescue a poorly identified device.

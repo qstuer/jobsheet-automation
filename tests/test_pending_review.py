@@ -113,6 +113,11 @@ class PendingReviewTests(unittest.TestCase):
                                     phone="99990011")
         self._install()
         self.assertEqual("device_ambiguous", self._review(disputed)["reason"])
+        self.assertEqual("READY_READ_ONLY", self._review(
+            disputed, chosen="87654321")["status"])
+        self.assertEqual("device_ambiguous", self._review(fake_ocr(
+            serial_candidates=["US123B4569"], phone_candidates=[]),
+            chosen="87654321")["reason"])
 
     def test_other_visit_phone_cannot_rescue_serial_typo(self):
         self.visits.append(fake_task("87654321", due="2026-08-27", phone="99990022"))
