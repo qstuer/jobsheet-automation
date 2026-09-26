@@ -815,6 +815,25 @@ def _ocr_for_pending_review(doc) -> dict:
         consensus = _consensus_ocr(readings)
     except nvidia_client.NvidiaResponseError:
         log.warning("  輔助欄暫時無法辨認，不以日期取代身分證據")
+    # A phone seen on only one broad card is useful to recheck, but not yet
+    # independent evidence. Two focused tries at most; only repeated reads
+    # can enter consensus. The human date and Asana data are not shown here.
+    if not consensus.get("phone_candidates") and any(
+            reading.get("phone_candidates") for reading in readings):
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "phone_candidates", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_phone", "zoom": zoom,
+                "field": "phone_candidates",
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get("phone_candidates"):
+                break
     for field in ("product_raw", "hospital_raw", "serial_candidates"):
         if consensus.get(field) or (context_fields and field != "serial_candidates"):
             continue

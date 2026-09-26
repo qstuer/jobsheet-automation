@@ -103,6 +103,17 @@ class PendingReviewTests(unittest.TestCase):
         self.assertEqual("device_ambiguous", self._review(fake_ocr(
             serial_candidates=["US123B4567", "US123B4568"]))["reason"])
 
+    def test_close_typo_requires_unique_same_visit_support(self):
+        self.visits.append(fake_task("87654321", serial="US123B4568",
+                                     phone="99990022"))
+        self._install()
+        disputed = fake_ocr(serial_candidates=["US123B4569"])
+        self.assertEqual("READY_READ_ONLY", self._review(disputed)["status"])
+        self.visits[-1] = fake_task("87654321", serial="US123B4568",
+                                    phone="99990011")
+        self._install()
+        self.assertEqual("device_ambiguous", self._review(disputed)["reason"])
+
     def test_other_visit_phone_cannot_rescue_serial_typo(self):
         self.visits.append(fake_task("87654321", due="2026-08-27", phone="99990022"))
         self._install()
@@ -207,6 +218,24 @@ class PendingReviewTests(unittest.TestCase):
         self.assertEqual("EPIQ Elite", result["product_raw"])
         focus.assert_not_called()
         find.assert_not_called()
+
+    def test_review_rechecks_one_seen_phone_without_answer_context(self):
+        missing_phone = fake_ocr(phone_candidates=[])
+        with patch.object(processor.nvidia_client, "reset_ocr_metrics"), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_fields",
+                             return_value=fake_ocr()), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_identity_fields",
+                             return_value=missing_phone), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_support_fields",
+                             return_value=missing_phone), \
+                patch.object(processor.nvidia_client, "ocr_jobsheet_focused_field",
+                             return_value={"phone_candidates": ["99990011"]}) as focus, \
+                patch.object(processor.nvidia_client, "get_ocr_metrics",
+                             return_value={"calls": 4, "seconds": 0.0, "total_tokens": 0}):
+            result = processor._ocr_for_pending_review(object())
+        self.assertEqual(["99990011"], result["phone_candidates"])
+        self.assertEqual("phone_candidates", focus.call_args.args[2])
+        self.assertNotIn("2026-08-18", str(focus.call_args))
 
 
 if __name__ == "__main__":

@@ -88,6 +88,38 @@ def _visit_has_independent_evidence(ocr: dict, ref: dict) -> bool:
     ) == 2
 
 
+def _unique_supported_close_device(ranked: list[dict], ocr: dict,
+                                   job_type: str, day: date) -> dict | None:
+    """Only a same-visit phone/Asset plus formal date may resolve a typo tie.
+
+    The selected Asana task supplied by a human is intentionally not used to
+    choose the device. Search every plausible nearby device so that two rows
+    with the same corroboration remain ambiguous.
+    """
+    prepared = asana_client._prepare_index_query(ocr)
+    wanted_product = prepared.get("_index_wanted_product")
+    wanted_hospitals = prepared.get("_index_wanted_hospitals") or []
+    supported = []
+    for item in ranked:
+        if (item["serial_dist"] > 3 or item["product_similarity"] != 1.0
+                or item["hospital_similarity"] != 1.0):
+            continue
+        if any(
+            ref.get("job_type") == job_type
+            and _same_product(wanted_product, asana_client.product_group(
+                ref.get("product_family") or ref.get("product")))
+            and _same_hospital(wanted_hospitals, ref.get("hospital_aliases") or
+                               asana_client.hospital_aliases(
+                                   ref.get("hospital") or ref.get("location")))
+            and _visit_has_independent_evidence(ocr, ref)
+            and (delta := _formal_delta(day, ref)) is not None
+            and delta <= REVIEW_WINDOW_DAYS
+            for ref in item["row"].get("task_refs") or []
+        ):
+            supported.append(item)
+    return supported[0] if len(supported) == 1 else None
+
+
 def _pending(reason: str, **extra) -> dict:
     return {"status": "PENDING", "reason": reason, **extra}
 
@@ -128,7 +160,11 @@ def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
             and best["product_similarity"] == 1.0
             and best["hospital_similarity"] == 1.0
         )
-        if not unique_exact_identity:
+        unique_visit_evidence = (
+            best["serial_dist"] == 1
+            and _unique_supported_close_device(ranked, ocr, job_type, day) is best
+        )
+        if not (unique_exact_identity or unique_visit_evidence):
             return _pending("device_ambiguous")
     if (best["product_similarity"] < 1.0 or best["hospital_similarity"] < 1.0
             or best["serial_dist"] > 1):

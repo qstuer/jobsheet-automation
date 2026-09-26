@@ -66,7 +66,7 @@ def _identity_diagnostics(ocr: dict, expected: dict, job_type: str) -> dict:
         reading = entry.get("normalized") or {}
         context = entry.get("context") or {}
         stage = context.get("stage")
-        if stage not in {"primary", "identity", "support", "focused_identity",
+        if stage not in {"primary", "identity", "support", "focused_phone", "focused_identity",
                          "context_field"}:
             stage = "other"
         score = (asana_client._score_index_device(
