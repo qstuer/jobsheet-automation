@@ -40,6 +40,42 @@ def _add_metrics(first: dict, second: dict) -> dict:
     return result
 
 
+def _identity_diagnostics(ocr: dict, expected: dict, job_type: str) -> dict:
+    """Anonymous grading only; expected values never enter OCR or reviewer."""
+    prepared = asana_client._prepare_index_query(ocr)
+    ranked = asana_client._rank_index_devices(ocr, job_type)
+    expected_serial = asana_client._norm(expected.get("serial"))
+    expected_item = next((
+        asana_client._score_index_device(row, prepared, job_type)
+        for row in asana_client._device_index["devices"]
+        if asana_client._norm(row.get("serial")) == expected_serial
+    ), None)
+    expected_rank = next((
+        number for number, item in enumerate(ranked, 1)
+        if asana_client._norm(item["row"].get("serial")) == expected_serial
+    ), None)
+    ref = next((ref for ref in (expected_item or {}).get("row", {}).get("task_refs", [])
+                if str(ref.get("gid")) == expected.get("task_gid")), None)
+    return {
+        "expected_device_rank": expected_rank,
+        "eligible_device_count": len(ranked),
+        "top_two_serial_gap_pp": round(
+            (ranked[0]["serial_similarity"] - ranked[1]["serial_similarity"]) * 100
+        ) if len(ranked) > 1 else None,
+        "expected_product_pct": round(expected_item["product_similarity"] * 100)
+        if expected_item else None,
+        "expected_hospital_pct": round(expected_item["hospital_similarity"] * 100)
+        if expected_item else None,
+        "expected_serial_distance": expected_item["serial_dist"] if expected_item else None,
+        "expected_visit_phone_or_asset": bool(ref and
+            pending_review._visit_has_independent_evidence(ocr, ref)),
+        "ocr_has_product": bool(ocr.get("product_raw") or ocr.get("product")),
+        "ocr_has_hospital": bool(ocr.get("hospital_raw") or ocr.get("customer")),
+        "ocr_has_serial": bool(ocr.get("serial_candidates") or ocr.get("serial_no")),
+        "ocr_has_phone": bool(ocr.get("phone_candidates")),
+    }
+
+
 def run() -> list[dict]:
     fixture_dir = Path(os.environ.get("JOBSHEET_BACKTEST_DIR", "/tmp/jobsheet-backtest"))
     manifest_path = Path(os.environ.get(
@@ -93,6 +129,7 @@ def run() -> list[dict]:
                     continue
                 ocr = processor._ocr_for_pending_review(doc)
                 metrics = _add_metrics(circle_metrics, ocr.get("ocr_metrics") or {})
+                diagnostic = _identity_diagnostics(ocr, sample["expected"], detected)
                 confirmed_day = sample["observed_fields"]["service_date_raw"]
                 first = pending_review.review_ocr(ocr, detected, confirmed_day)
                 assisted = False
@@ -117,6 +154,7 @@ def run() -> list[dict]:
                     row = _anonymous_row(sample_id, status="PENDING",
                                          reason=result["reason"], assisted=assisted,
                                          metrics=metrics)
+                row["identity_diagnostic"] = diagnostic
             except nvidia_client.NvidiaResponseError:
                 # Provider text can contain customer data; never print it.
                 row = _anonymous_row(
@@ -124,7 +162,7 @@ def run() -> list[dict]:
                     metrics=nvidia_client.get_ocr_metrics(),
                 )
         rows.append(row)
-        log.info("[%s] %s / %s", sample_id, row["status"], row["reason"])
+        log.info("[%s] %s / %s (僅匿名分數)", sample_id, row["status"], row["reason"])
 
     report_path = Path(os.environ.get("JOBSHEET_REVIEW_REPORT", "/tmp/pending-review-anonymous.json"))
     report_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")

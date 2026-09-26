@@ -80,7 +80,9 @@ class PendingReviewBacktestTests(unittest.TestCase):
             self.assertEqual(set(public_rows[0]), {
                 "sample_id", "status", "reason", "task_choice_supplied",
                 "calls", "seconds", "tokens", "cost_cny_upper",
+                "identity_diagnostic",
             })
+            self.assertNotIn("serial", public_rows[0]["identity_diagnostic"])
 
     def test_source_change_stops_before_any_model_call(self):
         with TemporaryDirectory() as temp:
