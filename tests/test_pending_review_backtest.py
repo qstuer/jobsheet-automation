@@ -63,7 +63,12 @@ class PendingReviewBacktestTests(unittest.TestCase):
                                  "reset_model_availability"), \
                     patch.object(pending_review_backtest.processor,
                                  "_ocr_for_pending_review", side_effect=[
-                                     {"sample": sample_id, "ocr_metrics": {"calls": 2}}
+                                     {"sample": sample_id, "ocr_metrics": {"calls": 2},
+                                      "_ocr_audit": {"readings": [{
+                                          "context": {"stage": "primary"},
+                                          "normalized": {"phone_candidates": ["55559999"]},
+                                          "raw": {"hospital_raw": "SENSITIVE_HOSPITAL"},
+                                      }]}}
                                      for sample_id in pending_review_backtest.SAMPLE_IDS
                                  ]), \
                     patch.object(pending_review_backtest.pending_review,
@@ -83,6 +88,10 @@ class PendingReviewBacktestTests(unittest.TestCase):
                 "identity_diagnostic",
             })
             self.assertNotIn("serial", public_rows[0]["identity_diagnostic"])
+            self.assertEqual("primary", public_rows[0]["identity_diagnostic"]
+                             ["read_passes"][0]["stage"])
+            self.assertNotIn("SENSITIVE_HOSPITAL", report.read_text(encoding="utf-8"))
+            self.assertNotIn("55559999", report.read_text(encoding="utf-8"))
 
     def test_source_change_stops_before_any_model_call(self):
         with TemporaryDirectory() as temp:

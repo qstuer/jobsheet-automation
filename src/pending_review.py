@@ -119,7 +119,17 @@ def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
     best = ranked[0]
     if len(ranked) > 1 and (best["serial_similarity"] - ranked[1]["serial_similarity"]
                             <= asana_client.config.INDEX_SERIAL_CLOSE_GAP):
-        return _pending("device_ambiguous")
+        # A unique exact Serial plus exact product/hospital is stronger than a
+        # merely similar second Serial. Never let the human-confirmed date or
+        # task resolve a device tie, including two different exact OCR values.
+        unique_exact_identity = (
+            best["serial_dist"] == 0
+            and ranked[1]["serial_dist"] > 0
+            and best["product_similarity"] == 1.0
+            and best["hospital_similarity"] == 1.0
+        )
+        if not unique_exact_identity:
+            return _pending("device_ambiguous")
     if (best["product_similarity"] < 1.0 or best["hospital_similarity"] < 1.0
             or best["serial_dist"] > 1):
         # A date or selected task cannot rescue a poorly identified device.

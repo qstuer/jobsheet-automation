@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import fitz
@@ -56,6 +57,34 @@ def _identity_diagnostics(ocr: dict, expected: dict, job_type: str) -> dict:
     ), None)
     ref = next((ref for ref in (expected_item or {}).get("row", {}).get("task_refs", [])
                 if str(ref.get("gid")) == expected.get("task_gid")), None)
+    ref_phones = {re.sub(r"\D", "", value) for value in (ref or {}).get("phones") or []}
+    read_passes = []
+    for entry in (ocr.get("_ocr_audit") or {}).get("readings", [])[:12]:
+        # The audit contains customer text, but the artifact contains only
+        # fixed stage labels and numeric/boolean comparison results. It is
+        # grading evidence, never an input to OCR or the actual reviewer.
+        reading = entry.get("normalized") or {}
+        context = entry.get("context") or {}
+        stage = context.get("stage")
+        if stage not in {"primary", "identity", "support", "focused_identity",
+                         "context_field"}:
+            stage = "other"
+        score = (asana_client._score_index_device(
+            expected_item["row"], asana_client._prepare_index_query(reading), job_type
+        ) if expected_item else None)
+        phones = {re.sub(r"\D", "", value)
+                  for value in reading.get("phone_candidates") or []}
+        read_passes.append({
+            "stage": stage,
+            "serial_distance": score["serial_dist"] if score else None,
+            "serial_candidate_count": len(reading.get("serial_candidates") or []),
+            "serial_visual_count": len(reading.get("serial_visual_candidates") or []),
+            "product_pct": round(score["product_similarity"] * 100) if score else None,
+            "hospital_pct": round(score["hospital_similarity"] * 100) if score else None,
+            "phone_exact_visit": bool(ref_phones & phones),
+            "asset_exact_visit": bool(ref and asana_client._asset_match_level(
+                reading.get("asset_candidates"), ref.get("assets")) == 2),
+        })
     return {
         "expected_device_rank": expected_rank,
         "eligible_device_count": len(ranked),
@@ -72,7 +101,9 @@ def _identity_diagnostics(ocr: dict, expected: dict, job_type: str) -> dict:
         "ocr_has_product": bool(ocr.get("product_raw") or ocr.get("product")),
         "ocr_has_hospital": bool(ocr.get("hospital_raw") or ocr.get("customer")),
         "ocr_has_serial": bool(ocr.get("serial_candidates") or ocr.get("serial_no")),
+        "ocr_has_serial_visual": bool(ocr.get("serial_visual_candidates")),
         "ocr_has_phone": bool(ocr.get("phone_candidates")),
+        "read_passes": read_passes,
     }
 
 

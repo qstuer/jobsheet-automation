@@ -95,6 +95,14 @@ class PendingReviewTests(unittest.TestCase):
             serial_candidates=["US123B4568"], phone_candidates=[]))
         self.assertEqual("serial_needs_independent_evidence", result["reason"])
 
+    def test_unique_exact_serial_beats_close_typo_but_two_exact_values_do_not(self):
+        self.visits.append(fake_task("87654321", serial="US123B4568",
+                                     phone="99990022"))
+        self._install()
+        self.assertEqual("READY_READ_ONLY", self._review(fake_ocr())["status"])
+        self.assertEqual("device_ambiguous", self._review(fake_ocr(
+            serial_candidates=["US123B4567", "US123B4568"]))["reason"])
+
     def test_other_visit_phone_cannot_rescue_serial_typo(self):
         self.visits.append(fake_task("87654321", due="2026-08-27", phone="99990022"))
         self._install()
