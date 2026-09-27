@@ -382,3 +382,10 @@ ACTION DATE 與 CM／PM 的明確衝突不能被「最近日期」蓋過。
 - [首次四張只讀回測](https://github.com/qstuer/jobsheet-automation/actions/runs/36263742608)：B01／B04 維持人工協助通過；B07 雖在醫院、產品及已確認 Serial 上吻合，Asset 只有一輪讀到正確值，仍顯示待核對；B10 仍因缺當次獨立證據待核對。結果不算自動 OCR 通過。
 - 加入「前兩輪仍無任何共識才最多再讀一次」的 Asset 放大上限後，[第二次四張只讀回測](https://github.com/qstuer/jobsheet-automation/actions/runs/36264161578)沒有改善：B07 的讀值在兩輪後已有錯誤共識，因此第三輪沒有啟動；當次 Asset 仍未可靠吻合，B10 亦待核對。不能為湊通過率把單輪 Asset 或錯誤讀值當成當次證據；日後人工 Serial 關卡亦拒絕兩組互相矛盾的 Asset 共識。
 - 所有測試只下載私人副本，**OneDrive 寫入 0、正式 Google Drive 來源搬移 0、main 未改**。下一步若要讓 B07 通過，須先取得獨立可核實的當次 Asset 證據；不能再單靠相同模型反覆猜。
+
+### 2026-09-27：B07 人工核對 Asset 的只讀驗收
+
+- 使用者只授權獨立分支、單份原件的人工 Asset 核對。重新放大檢查 B07 首頁 Dept./Room 欄、核對已簽指紋的私人樣本答案及該次 Asana 工作；三者的 Asset 一致。這項人工值留在私人測試資料，不放入程式碼、模型提示或公開 Actions 日誌。
+- 受控入口要求：原始 OCR 至少有一輪獨立讀到相同 Asset、人工 Serial 仍在原始讀數的三字距離內、醫院與產品完全同組、PM／CM 相同、指定工作正式日期在 14 天內、索引該次 Asset 精確吻合，並再次即時讀取 Asana 重查 Serial、Asset、工作類型、日期、醫院、產品及訂單號。任何一項不符便留待核對；不會因同設備其他月份的 Asset 相同而選工作。
+- [四張私人副本只讀回測](https://github.com/qstuer/jobsheet-automation/actions/runs/36293518284)：B01、B04 維持人工協助通過；**B07 在人工確認 Serial＋Asset 後通過**，所選 Asana 工作 GID、機身編號及按現行規則計算的最終檔名均與已核實答案完全一致；B10 仍因缺當次獨立證據待核對。B07 的結果不可算成 OCR 自動成功。
+- 本機完整測試 335 個通過，獨立分支的 Code Check 通過。正式 main、Stage B、OneDrive 及 Google Drive 工作單來源皆未改；雲端測試僅下載私人副本，**上傳及來源搬移均為 0**。正式啟用人工核對入口或處理 B10 須另行決定，不以此回測自行放寬自動規則。
