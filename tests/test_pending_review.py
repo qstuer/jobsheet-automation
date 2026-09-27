@@ -53,11 +53,12 @@ class PendingReviewTests(unittest.TestCase):
         )
         asana_client.set_device_index(index)
 
-    def _review(self, ocr=None, day="2026-08-18", chosen="", serial=""):
+    def _review(self, ocr=None, day="2026-08-18", chosen="", serial="", asset=""):
         with patch.object(asana_client, "_fetch_task", side_effect=lambda gid: next(
                 item for item in self.visits if item["gid"] == gid)):
             return pending_review.review_ocr(ocr or fake_ocr(), "PM", day, chosen,
-                                             confirmed_serial=serial)
+                                             confirmed_serial=serial,
+                                             confirmed_asset=asset)
 
     @staticmethod
     def _two_asset_reads(ocr):
@@ -133,6 +134,40 @@ class PendingReviewTests(unittest.TestCase):
         for value in ("US123B45?7", "US123B45-7", "US123", "15915F0726"):
             with self.assertRaises(ValueError):
                 pending_review.parse_review_serial(value)
+
+    def test_human_asset_resolves_one_visible_read_only_for_selected_visit(self):
+        self.visits = [fake_task("12345678", asset="88880001")]
+        self._install()
+        disputed = fake_ocr(serial_candidates=["US123B4599"],
+                            asset_candidates=["88880002"])
+        disputed["_ocr_audit"] = {"readings": [
+            {"normalized": {"asset_candidates": ["88880001"]}},
+            {"normalized": {"asset_candidates": ["88880002"]}},
+            {"normalized": {"asset_candidates": ["88880002"]}},
+        ]}
+        result = self._review(disputed, chosen="12345678", serial="US123B4567",
+                              asset="88880001")
+        self.assertEqual("READY_READ_ONLY", result["status"])
+        self.assertTrue(result["manual_serial_confirmed"])
+        self.assertTrue(result["manual_asset_confirmed"])
+        self.assertEqual("confirmed_asset_requires_serial", self._review(
+            disputed, chosen="12345678", asset="88880001")["reason"])
+        self.assertEqual("manual_asset_not_seen", self._review(
+            disputed, chosen="12345678", serial="US123B4567",
+            asset="88880003")["reason"])
+        self.assertEqual("manual_asset_asana_conflict", self._review(
+            disputed, chosen="12345678", serial="US123B4567",
+            asset="88880002")["reason"])
+        self.assertEqual("no_visit_within_14_days", self._review(
+            disputed, day="2026-09-20", chosen="12345678",
+            serial="US123B4567", asset="88880001")["reason"])
+        with patch.object(asana_client, "_fetch_task", return_value=fake_task(
+                "12345678", asset="88880002")):
+            self.assertEqual("live_support_conflict", pending_review.review_ocr(
+                disputed, "PM", "2026-08-18", "12345678",
+                confirmed_serial="US123B4567", confirmed_asset="88880001")["reason"])
+        with self.assertRaises(ValueError):
+            pending_review.parse_review_asset("Asset# 88880001")
 
     def test_human_date_does_not_replace_other_checks(self):
         result = self._review()

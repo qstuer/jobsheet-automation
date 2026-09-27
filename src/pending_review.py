@@ -34,6 +34,9 @@ REASON_MESSAGES = {
     "manual_serial_not_visually_supported": "原始讀數與人工確認機身編號差異過大",
     "manual_serial_not_unique": "人工確認機身編號在索引中不唯一",
     "manual_serial_asset_not_confirmed": "當次 Asset 沒有獨立讀出並與 Asana 完全吻合",
+    "confirmed_asset_requires_serial": "人工確認 Asset 時必須同時核對機身編號",
+    "manual_asset_not_seen": "人工確認 Asset 未在原始讀數中出現",
+    "manual_asset_asana_conflict": "人工確認 Asset 與該次 Asana 工作不吻合",
 }
 
 
@@ -71,6 +74,14 @@ def parse_review_serial(value: str) -> str:
             and sum(char.isdigit() for char in serial) >= 4):
         raise ValueError("確認機身編號必須完整，不能有空格、符號或問號")
     return serial
+
+
+def parse_review_asset(value: str) -> str:
+    """Asset is an exact digit identifier; do not silently repair OCR text."""
+    asset = (value or "").strip()
+    if not re.fullmatch(r"\d{4,12}", asset):
+        raise ValueError("確認 Asset 必須是完整的 4–12 位數字")
+    return asset
 
 
 def _same_hospital(wanted: list[str], stored: list[str]) -> bool:
@@ -165,8 +176,18 @@ def _confirmed_asset_on_sheet(ocr: dict, asana_assets: list[str]) -> bool:
     )
 
 
+def _manual_asset_seen_in_ocr(ocr: dict, asset: str) -> bool:
+    """A human may resolve conflicting reads, but not invent unseen digits."""
+    for reading in (ocr.get("_ocr_audit") or {}).get("readings") or []:
+        values = (reading.get("normalized") or {}).get("asset_candidates") or []
+        if asset in {re.sub(r"\D", "", str(value or "")) for value in values}:
+            return True
+    return False
+
+
 def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
-                                  selected_gid: str, serial: str) -> dict:
+                                  selected_gid: str, serial: str,
+                                  confirmed_asset: str = "") -> dict:
     """Narrow one private review; never replace the original OCR evidence.
 
     A person can resolve the handwriting, but cannot supply the hospital,
@@ -209,7 +230,13 @@ def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
     # Unlike the normal one-character typo path, this two/three-character
     # exception requires an exact Asset on this *visit*, not a historical
     # phone or Asset from another job on the same equipment.
-    if not _confirmed_asset_on_sheet(ocr, ref.get("assets") or []):
+    if confirmed_asset:
+        if not _manual_asset_seen_in_ocr(ocr, confirmed_asset):
+            return _pending("manual_asset_not_seen")
+        if asana_client._asset_match_level(
+                [confirmed_asset], ref.get("assets")) != 2:
+            return _pending("manual_asset_asana_conflict")
+    elif not _confirmed_asset_on_sheet(ocr, ref.get("assets") or []):
         return _pending("manual_serial_asset_not_confirmed")
 
     # Only after every independent gate, run the existing read-only reviewer
@@ -226,15 +253,20 @@ def _review_with_confirmed_serial(ocr: dict, job_type: str, day: date,
     if (not live_record or asana_client._norm(live_record.get("serial")) != serial
             or len(live_record.get("task_refs") or []) != 1):
         return _pending("live_serial_conflict")
-    if not _confirmed_asset_on_sheet(
-            ocr, live_record["task_refs"][0].get("assets") or []):
+    live_assets = live_record["task_refs"][0].get("assets") or []
+    if confirmed_asset and asana_client._asset_match_level(
+            [confirmed_asset], live_assets) != 2:
+        return _pending("live_support_conflict")
+    if not confirmed_asset and not _confirmed_asset_on_sheet(ocr, live_assets):
         return _pending("live_support_conflict")
     result["manual_serial_confirmed"] = True
+    result["manual_asset_confirmed"] = bool(confirmed_asset)
     return result
 
 
 def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
-               selected_task: str = "", confirmed_serial: str = "") -> dict:
+               selected_task: str = "", confirmed_serial: str = "",
+               confirmed_asset: str = "") -> dict:
     """Check identity, visit and current Asana facts without any cloud write.
 
     A confirmation is *not* a filename override. The caller may use a READY
@@ -246,9 +278,12 @@ def review_ocr(ocr: dict, job_type: str, confirmed_date: str,
         return _pending("job_type_unknown")
     if asana_client._device_index is None:
         raise asana_client.AsanaError("受控核對需要已驗證的私人設備索引")
+    if confirmed_asset and not confirmed_serial:
+        return _pending("confirmed_asset_requires_serial")
     if confirmed_serial:
         return _review_with_confirmed_serial(
-            ocr, job_type, day, selected_gid, parse_review_serial(confirmed_serial)
+            ocr, job_type, day, selected_gid, parse_review_serial(confirmed_serial),
+            parse_review_asset(confirmed_asset) if confirmed_asset else "",
         )
 
     prepared = asana_client._prepare_index_query(ocr)

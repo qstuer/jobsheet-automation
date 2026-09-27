@@ -62,7 +62,7 @@ jobs:
             "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/index-rebuilt-20260924/asana-device-index-manifest.json" \
             /tmp/asana-device-index-manifest.json
       - run: pip install -r requirements.txt
-      # Re-run B07-only serial review with at most three independent Asset reads; no cloud writes.
+      # B07-only human-confirmed serial and Asset, checked against the live visit; no cloud writes.
       - name: Test human-date review without cloud writes
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
