@@ -1,0 +1,82 @@
+name: Jobsheet Recent-Month Date Probe
+
+# Isolated read-only OCR experiment. No Asana or OneDrive credentials, no
+# production trigger, no Google Drive writes. A push of this workflow alone
+# starts one fixed private-sample comparison on the test branch.
+on:
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-recent-month-date-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-recent-month-date-probe
+  cancel-in-progress: false
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore private Drive credentials
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download seven reviewed private copies
+        run: |
+          mkdir -p /tmp/jobsheet-backtest
+          for sample in B04 B06 B07 B10 B03 B16 B17; do
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${sample}.pdf" \
+              "/tmp/jobsheet-backtest/${sample}.pdf"
+          done
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260925.json" \
+            /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
+      - run: pip install -r requirements.txt
+      - name: Compare neutral and recent-month visual prompts
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          JOBSHEET_RECENCY_AS_OF: '2026-09-27'
+          JOBSHEET_RECENT_MONTH_REPORT: /tmp/recent-month-anonymous.json
+          OCR_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: python -m src.recent_month_date_probe
+      - name: Preserve anonymous result only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recent-month-date-anonymous
+          path: /tmp/recent-month-anonymous.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Clean up private files and credentials
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -rf /tmp/jobsheet-backtest
