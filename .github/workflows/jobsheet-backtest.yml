@@ -73,7 +73,7 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
           echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Recheck all 20 samples with guarded PM checklist-date fallback
+      - name: Recheck all 20 samples with guarded PM cross-page rescue
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
@@ -82,6 +82,10 @@ jobs:
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.
           JOBSHEET_CONTEXT_FIELD_OCR: '1'
+          # Test-only: if a complete PM still has no task, re-read the fixed
+          # checklist identity header and last-page sign-off. Never affects
+          # Stage B or OneDrive; the backtest process denies cloud writes.
+          JOBSHEET_PM_CROSSPAGE_RESCUE: '1'
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}

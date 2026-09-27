@@ -253,8 +253,8 @@ def _append_summary(rows: list[dict], path: Path) -> None:
         )
         stream.write("这不是全流程通过率：圈选独立列出；逐栏准确率、checklist 内容与切页尚未验收。页数正确也不代表完整。\n\n")
         stream.write(f"重复工作样本：{repeated_work}；工作身份未确认：{unknown_work}。不同 PDF 不等于不同工作。\n\n")
-        stream.write("| 样本 | 结果 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
-        stream.write("|---|---|---:|---|---|---|---|---|---|---:|---:|---:|---:|\n")
+        stream.write("| 样本 | 结果 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | PM後頁補救 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
+        stream.write("|---|---|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|\n")
         for row in rows:
             cost = f"RMB {row['cost']:.4f}" if row["cost"] is not None else "-"
             stream.write(
@@ -263,7 +263,8 @@ def _append_summary(rows: list[dict], path: Path) -> None:
                 f"{row.get('device_check', 'NOT_REVIEWED')} | {row.get('task_check', 'NOT_REVIEWED')} | "
                 f"{row.get('filename_check', 'NOT_REVIEWED')} | {row.get('task_type_check', 'NOT_TESTED')} | "
                 f"{row.get('circle_check', 'NOT_TESTED')} | "
-                f"{row.get('page_check', 'NOT_TESTED')} | {row['calls']} | "
+                f"{row.get('page_check', 'NOT_TESTED')} | "
+                f"{row.get('pm_crosspage_rescue', 'not_attempted')} | {row['calls']} | "
                 f"{row['seconds']:.1f}s | {row['tokens']} | {cost} |\n"
             )
         total_cost = f"RMB {sum(costs):.4f}" if costs else "-"
@@ -281,6 +282,15 @@ def _read_sample(doc, expected_type: str) -> tuple:
     if detected not in {"CM", "PM"} or detected != expected_type:
         return None, detected, metrics, None
     task, _tier, ocr = processor._ocr_and_match(doc, detected)
+    if (task is None and detected == "PM" and getattr(doc, "page_count", 0) == 4
+            and os.environ.get("JOBSHEET_PM_CROSSPAGE_RESCUE") == "1"):
+        # This is deliberately inside the read-only backtest, not Stage B.
+        # Original failures remain pending unless independent checklist and
+        # first-page evidence pass all gates and Asana still returns one task.
+        from . import pm_crosspage_rescue
+        task, _tier, ocr = pm_crosspage_rescue.try_rescue(doc, ocr, detected)
+        if ocr is not None:
+            ocr["ocr_metrics"] = nvidia_client.get_ocr_metrics()
     # The matching core resets its own metrics; include the earlier circle calls.
     for key, value in (ocr.get("ocr_metrics") or {}).items():
         if isinstance(value, (int, float)):
@@ -361,7 +371,7 @@ def run() -> list[dict]:
                 # Never log raw provider replies: a model could echo private
                 # jobsheet text. Keep an anonymous service-error checkpoint.
                 log.warning("[%s] 圖片服務本份暫時無法完成，繼續下一份", sample_id)
-                task, detected = None, None
+                task, detected, ocr = None, None, None
                 metrics = nvidia_client.get_ocr_metrics()
                 evaluation = _evaluate_service_error(sample, page_count)
             else:
@@ -376,6 +386,10 @@ def run() -> list[dict]:
         rows.append({
             "sample_id": sample_id,
             **evaluation,
+            "pm_crosspage_rescue": (
+                (ocr.get("_ocr_audit") or {}).get("pm_crosspage_rescue", "not_attempted")
+                if ocr else "not_attempted"
+            ),
             "same_work_as": inventory[sample_id]["same_work_as"],
             "business_identity_known": inventory[sample_id]["business_identity_known"],
             "expected_pending": sample.get("_verified_answer", False) and sample["expected"]["kind"] == "pending",
