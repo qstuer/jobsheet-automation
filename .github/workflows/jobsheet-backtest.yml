@@ -73,7 +73,7 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
           echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Recheck all 20 samples with corrected answers and separate device ranking
+      - name: Recheck all 20 samples with guarded PM checklist-date fallback
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json

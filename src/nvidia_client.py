@@ -1038,6 +1038,44 @@ def ocr_jobsheet_signature_date(
     raise NvidiaResponseError("簽署日期格式錯誤") from last_error
 
 
+def ocr_pm_checklist_date(
+        pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
+) -> Optional[str]:
+    """Test-branch fallback: transcribe only the first PM checklist's Date box.
+
+    This reader never sees Asana candidates or another page. Its output is
+    corroborating evidence, not permission to select a task on its own.
+    """
+    page = pdf_doc[page_idx]
+    rect = page.rect
+    left, top, right, bottom = (0.580, 0.120, 0.940, 0.175)
+    clip = fitz.Rect(rect.x0 + rect.width * left,
+                     rect.y0 + rect.height * top,
+                     rect.x0 + rect.width * right,
+                     rect.y0 + rect.height * bottom)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
+    image = ImageOps.autocontrast(Image.open(io.BytesIO(pix.tobytes("png"))).convert("L"))
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=92)
+    prompt = (
+        "Read ONLY the handwritten Date at the top of the FIRST PAGE of a PM "
+        "checklist. Copy day/month/year exactly; return null if unclear. "
+        "Do not infer from any other page, typical service dates or Asana task. "
+        'Return JSON only: {"date":null}'
+    )
+    raw = _call_vision(prompt, base64.b64encode(output.getvalue()).decode("ascii"),
+                       max_tokens=80, expects_json=True)
+    try:
+        parsed = _parse_json_object(raw, required_keys={"date"})
+    except (ValueError, json.JSONDecodeError, NvidiaResponseError):
+        return None
+    value = parsed["date"]
+    if value is not None and not isinstance(value, str):
+        return None
+    day = _parse_action_date(value)
+    return day.isoformat() if day else None
+
+
 def ocr_jobsheet_action_date_parts(
         pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
 ) -> Optional[str]:

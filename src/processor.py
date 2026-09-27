@@ -449,6 +449,59 @@ def _apply_customer_month_year_corroboration(
     return True
 
 
+def _apply_pm_checklist_date_corroboration(
+        consensus: dict, action_readings: list, focused_readings: list,
+        customer_signed_date: str | None, checklist_dates: list[str | None]
+) -> bool:
+    """Test-only fallback; a repeated checklist reading is never enough alone.
+
+    Require two matching reads of the first PM checklist, plus an exact
+    first-page ACTION DATE read and either customer sign-off or two matching
+    focused ACTION DATE reads. A conflicting customer date or a pair of
+    focused ACTION reads agreeing on another date vetoes the fallback.
+    The final Asana matcher still applies all device/task uniqueness gates.
+    """
+    audit = consensus.setdefault("_ocr_audit", {})
+    audit["pm_checklist_date_check"] = "unresolved"
+    days = [nvidia_client._parse_action_date(value) for value in checklist_dates]
+    if len(days) != 2 or days[0] is None or days[0] != days[1]:
+        return False
+    target = days[0]
+    age = (nvidia_client._today() - target).days
+    if not (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+            <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS):
+        audit["pm_checklist_date_check"] = "outside_window"
+        return False
+    signed = nvidia_client._parse_action_date(customer_signed_date)
+    focused = [nvidia_client._parse_action_date(row.get("service_date_raw"))
+               for row in focused_readings]
+    if (signed is not None and signed != target) or (
+            len(focused) == 2 and focused[0] is not None
+            and focused[0] == focused[1] and focused[0] != target):
+        audit["pm_checklist_date_check"] = "first_page_conflict"
+        return False
+    action = [
+        (nvidia_client._parse_action_date(value), value)
+        for row in action_readings
+        for value in [row.get("service_date_raw") or
+                      (row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw")]
+        if isinstance(value, str) and value.strip()
+    ]
+    exact = next((raw for day, raw in action if day == target), None)
+    first_page_support = signed == target or (
+        len(focused) == 2 and focused[0] == target and focused[1] == target
+    )
+    if not exact or not first_page_support:
+        audit["pm_checklist_date_check"] = "insufficient_first_page_support"
+        return False
+    consensus["service_date_raw"] = exact
+    consensus["service_date_iso"] = target.isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus["date_corrob"] = True
+    audit["pm_checklist_date_check"] = "corroborated"
+    return True
+
+
 def _ocr_and_match(doc, job_type):
     """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
     nvidia_client.reset_ocr_metrics()
@@ -697,6 +750,29 @@ def _ocr_and_match(doc, job_type):
                     date_recheck_blocked = False
                     log.info("  ACTION DATE 雙讀與客戶簽署月份一致，重新核對歷史工作")
                     task, tier = asana_client.find_task(consensus, job_type=job_type)
+
+    if (task is None and context_fields and job_type == "PM"
+            and getattr(doc, "page_count", 0) == 4):
+        # A PM checklist's Date is a second page-level observation, not an
+        # alternative source of truth. Two identical errors occurred in the
+        # private probe, so first-page corroboration and conflict vetoes are
+        # mandatory. This branch is absent from production Stage B settings.
+        checklist_dates = []
+        for zoom in (5.0, 6.0):
+            try:
+                checklist_dates.append(nvidia_client.ocr_pm_checklist_date(
+                    doc, 1, zoom=zoom
+                ))
+            except nvidia_client.NvidiaResponseError:
+                checklist_dates.append(None)
+        if _apply_pm_checklist_date_corroboration(
+                consensus, readings, date_focus, signed_dates[1], checklist_dates):
+            date_recheck_blocked = False
+            log.info("  PM 檢查表日期獲首頁獨立確認，重新核對歷史工作")
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  PM 檢查表日期不能安全確認：%s；維持待核對",
+                     consensus.get("_ocr_audit", {}).get("pm_checklist_date_check"))
 
     if (task is None and context_fields and asana_client._device_index is not None
             and all(consensus.get(field) for field in
