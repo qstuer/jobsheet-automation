@@ -1,0 +1,81 @@
+name: Jobsheet Checklist Date Probe - 20 Private Samples
+
+# Isolated-branch, read-only OCR experiment. It neither invokes Stage B nor
+# receives any OneDrive credential, and reviewed answers are withheld from OCR.
+on:
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-checklist-date-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-checklist-date-probe
+  cancel-in-progress: false
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/
+      - name: Restore rclone config
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download only the 20 reviewed copies and manifest
+        run: |
+          mkdir -p /tmp/jobsheet-backtest
+          for n in $(seq -w 1 20); do
+            id="B${n}"
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/${id}.pdf" \
+              "/tmp/jobsheet-backtest/${id}.pdf"
+          done
+          rclone copyto \
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260925.json" \
+            /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
+      - run: pip install -r requirements.txt
+      - name: Read independent checklist dates without cloud writes
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          JOBSHEET_CHECKLIST_DATE_REPORT: /tmp/checklist-dates-anonymous.json
+          OCR_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: python -m src.checklist_date_probe
+      - name: Preserve anonymous result only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checklist-dates-anonymous-results
+          path: /tmp/checklist-dates-anonymous.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Clean up private files and rclone credentials
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -rf /tmp/jobsheet-backtest
