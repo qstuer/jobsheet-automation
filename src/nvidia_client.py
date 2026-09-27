@@ -1038,6 +1038,45 @@ def ocr_jobsheet_signature_date(
     raise NvidiaResponseError("簽署日期格式錯誤") from last_error
 
 
+def ocr_jobsheet_customer_date_parts(
+        pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
+) -> Optional[str]:
+    """Read the three written digit groups separately in the customer date box.
+
+    Isolated-test alternative to one-shot transcription. Missing or doubtful
+    groups are not filled from another page, Asana, or a likely service date.
+    """
+    image_b64 = crop_jobsheet_field_card(
+        pdf_doc, page_idx, ("customer_signed_date",), zoom=zoom,
+        strong=zoom >= 6.0,
+    )
+    prompt = (
+        "Read only the handwritten CUSTOMER SIGNATURE DATE in this image. "
+        "Copy the three visible digit groups separately: day before the first "
+        "separator, month between separators, year after the second separator. "
+        "Ignore the stamp, printed labels, and dates on other pages. "
+        "If any digit is obscured or uncertain, return null for that whole "
+        "group; do not guess from a likely service date or task. "
+        'Return JSON only: {"day":null,"month":null,"year":null}. '
+        "For readable groups use strings containing only the written digits."
+    )
+    raw = _call_vision(prompt, image_b64, max_tokens=120, expects_json=True)
+    try:
+        data = _parse_json_object(raw, required_keys={"day", "month", "year"})
+    except (ValueError, json.JSONDecodeError, NvidiaResponseError):
+        return None
+    groups = [data[key] for key in ("day", "month", "year")]
+    if any(not isinstance(group, str) or not group.isdigit()
+           for group in groups):
+        return None
+    day, month, year = groups
+    if not (1 <= len(day) <= 2 and 1 <= len(month) <= 2
+            and len(year) in {2, 4}):
+        return None
+    parsed = _parse_action_date(f"{day}/{month}/{year}")
+    return parsed.isoformat() if parsed else None
+
+
 def ocr_pm_checklist_date(
         pdf_doc: fitz.Document, page_idx: int, zoom: float = 5.0
 ) -> Optional[str]:

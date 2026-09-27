@@ -1,0 +1,75 @@
+name: Jobsheet - Customer Date Parts Probe
+
+on:
+  push:
+    branches:
+      - codex/backtest-reviewed-20260923
+    paths:
+      - .github/workflows/jobsheet-customer-date-parts-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobsheet-customer-date-parts-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip \
+            'https://downloads.rclone.org/v1.75.0/rclone-v1.75.0-linux-amd64.zip'
+          unzip -q rclone.zip
+          sudo mv rclone-v1.75.0-linux-amd64/rclone /usr/local/bin/
+      - name: Restore private Drive connection
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download fingerprinted private samples
+        run: |
+          mkdir -p /tmp/jobsheet-customer-date-probe
+          for n in 01 04 06 07 08 09 10 19; do
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/B${n}.pdf" \
+              "/tmp/jobsheet-customer-date-probe/B${n}.pdf"
+          done
+          rclone copyto \
+            'googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260925.json' \
+            /tmp/jobsheet-customer-date-probe/manifest-reviewed-20260925.json
+          echo '81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-customer-date-probe/manifest-reviewed-20260925.json' | sha256sum -c -
+      - run: pip install -r requirements.txt
+      - name: Compare one-shot and segmented signature OCR without candidate dates
+        env:
+          JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-customer-date-probe
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-customer-date-probe/manifest-reviewed-20260925.json
+          JOBSHEET_CUSTOMER_DATE_REPORT: /tmp/jobsheet-customer-date-anonymous.json
+          OCR_PROVIDER: deepseek
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+        run: python -m src.customer_date_parts_probe
+      - name: Preserve anonymous read-status only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobsheet-customer-date-parts-anonymous
+          path: /tmp/jobsheet-customer-date-anonymous.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove private runner copies
+        if: always()
+        run: |
+          shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
+          rm -r /tmp/jobsheet-customer-date-probe
