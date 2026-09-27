@@ -1,7 +1,7 @@
 name: Jobsheet Checklist Date Probe - 20 Private Samples
 
-# Isolated-branch, read-only OCR experiment. It neither invokes Stage B nor
-# receives any OneDrive credential, and reviewed answers are withheld from OCR.
+# Isolated-branch, read-only OCR experiment. It separately grades the first
+# checklist Date and last customer Date; no Stage B or OneDrive credential.
 on:
   push:
     branches:

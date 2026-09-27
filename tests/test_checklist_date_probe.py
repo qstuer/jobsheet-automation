@@ -15,6 +15,8 @@ class ChecklistDateProbeTests(unittest.TestCase):
                            "2026-08-19", {"calls": 4})
         self.assertEqual(row["status"], "CONFIRMED_CORRECT")
         self.assertTrue(row["matches_reviewed"])
+        self.assertTrue(row["checklist_matches_reviewed"])
+        self.assertTrue(row["customer_matches_reviewed"])
         self.assertEqual(row["calls"], 4)
         self.assertNotIn("2026-08-19", str(row))
 
@@ -23,6 +25,8 @@ class ChecklistDateProbeTests(unittest.TestCase):
                            "2026-08-19", {})
         self.assertEqual(row["status"], "CONSISTENT_BUT_WRONG")
         self.assertFalse(row["matches_reviewed"])
+        self.assertFalse(row["checklist_matches_reviewed"])
+        self.assertFalse(row["customer_matches_reviewed"])
 
     def test_crosspage_conflict_or_unreadable_stays_unresolved(self):
         conflict = probe._grade(["2026-08-19"] * 2, ["2026-08-20"] * 2,
@@ -33,6 +37,8 @@ class ChecklistDateProbeTests(unittest.TestCase):
         self.assertEqual(missing["status"], "UNREADABLE_OR_DISAGREED")
         self.assertFalse(conflict["matches_reviewed"])
         self.assertFalse(missing["matches_reviewed"])
+        self.assertTrue(conflict["checklist_matches_reviewed"])
+        self.assertFalse(conflict["customer_matches_reviewed"])
 
     def test_changed_private_pdf_stops_before_model_call(self):
         with tempfile.TemporaryDirectory() as temporary:
