@@ -1,7 +1,7 @@
 name: Jobsheet Checklist Cross-page Probe - B10
 
-# Isolated-branch, B10-only read-only experiment. No production dispatch or
-# OneDrive credentials; the reviewed answer is withheld from the image model.
+# Isolated-branch, B10-only read-only experiment. Broad header and separate
+# product/serial cards are compared; no production dispatch or OneDrive secret.
 on:
   push:
     branches:

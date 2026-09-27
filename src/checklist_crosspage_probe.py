@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 # Normalized page rectangles: first checklist header and last checklist footer.
 CHECKLIST_HEADER = (0.055, 0.125, 0.935, 0.225)
 CHECKLIST_SIGNATURES = (0.050, 0.680, 0.955, 0.800)
+CHECKLIST_PRODUCT = (0.055, 0.175, 0.340, 0.225)
+CHECKLIST_SERIAL = (0.345, 0.175, 0.565, 0.225)
 ZOOMS = (5.0, 6.0)
 
 
@@ -41,8 +43,8 @@ def _panel_image(doc, page_index: int, box: tuple[float, ...], zoom: float) -> s
     return base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _read_json(image_b64: str, *, header: bool) -> dict:
-    if header:
+def _read_json(image_b64: str, *, section: str) -> dict:
+    if section == "header":
         fields = ("hospital", "product", "serial", "date")
         prompt = (
             "Strictly transcribe the handwritten values on the FIRST PAGE of a PM CHECKLIST. "
@@ -51,7 +53,7 @@ def _read_json(image_b64: str, *, header: bool) -> dict:
             "Use ? for a genuinely unclear character, null if a field is blank. "
             'Return JSON only: {"hospital":null,"product":null,"serial":null,"date":null}'
         )
-    else:
+    elif section == "signatures":
         fields = ("engineer_date", "customer_date")
         prompt = (
             "Strictly transcribe only the two handwritten dates at the bottom of the LAST "
@@ -59,6 +61,23 @@ def _read_json(image_b64: str, *, header: bool) -> dict:
             "Ignore any printed calibration date or other text. Do not infer missing digits. "
             'Return JSON only: {"engineer_date":null,"customer_date":null}'
         )
+    elif section == "product":
+        fields = ("product",)
+        prompt = (
+            "Transcribe only the handwritten value beside System on this PM checklist. "
+            "Do not infer from typical Philips models or previous images. "
+            'Return JSON only: {"product":null}'
+        )
+    elif section == "serial":
+        fields = ("serial",)
+        prompt = (
+            "Transcribe only the handwritten value beside sn on this PM checklist. "
+            "Copy each visible character. Write ? for a truly unclear character. "
+            "Do not infer from product, typical serial patterns, or previous images. "
+            'Return JSON only: {"serial":null}'
+        )
+    else:
+        raise ValueError("unknown checklist section")
     last_error = None
     for _ in range(2):
         raw = nvidia_client._call_vision(
@@ -91,6 +110,7 @@ def _read_date(value: str | None) -> str | None:
 
 
 def _anonymous_report(header_reads: list[dict], signature_reads: list[dict],
+                      product_reads: list[dict], serial_reads: list[dict],
                       observed: dict, expected: dict, metrics: dict) -> dict:
     expected_serial = _serial(expected.get("serial"))
     observed_date = _read_date(observed.get("service_date_raw"))
@@ -99,11 +119,15 @@ def _anonymous_report(header_reads: list[dict], signature_reads: list[dict],
     engineer_dates = [_read_date(read.get("engineer_date")) for read in signature_reads]
     customer_dates = [_read_date(read.get("customer_date")) for read in signature_reads]
     products = [asana_client.product_group(read.get("product")) for read in header_reads]
+    product_cards = [asana_client.product_group(read.get("product")) for read in product_reads]
     wanted_product = asana_client.product_group(observed.get("product_raw"))
     hospitals = [asana_client.hospital_core(read.get("hospital")) for read in header_reads]
     wanted_hospital = asana_client.hospital_core(observed.get("hospital_raw"))
     serial_agreed = bool(header_serials[0] and header_serials[0] == header_serials[1]
                          and nvidia_client._valid_serial_token(header_serials[0]))
+    serial_cards = [_serial(read.get("serial")) for read in serial_reads]
+    serial_card_agreed = bool(serial_cards[0] and serial_cards[0] == serial_cards[1]
+                              and nvidia_client._valid_serial_token(serial_cards[0]))
     report = {
         "sample_id": "B10",
         "page_count_ok": True,
@@ -111,8 +135,15 @@ def _anonymous_report(header_reads: list[dict], signature_reads: list[dict],
         "checklist_serial_matches_reviewed": bool(serial_agreed and header_serials[0] == expected_serial),
         "checklist_serial_compatible_with_sheet": bool(serial_agreed and
             _compatible_partial(observed.get("serial_raw"), header_serials[0])),
+        "serial_card_two_reads_agree": serial_card_agreed,
+        "serial_card_matches_reviewed": bool(serial_card_agreed and
+                                              serial_cards[0] == expected_serial),
+        "serial_card_compatible_with_sheet": bool(serial_card_agreed and
+            _compatible_partial(observed.get("serial_raw"), serial_cards[0])),
         "checklist_product_two_reads_match_sheet": bool(wanted_product and
             products[0] == products[1] == wanted_product),
+        "product_card_two_reads_match_sheet": bool(wanted_product and
+            product_cards[0] == product_cards[1] == wanted_product),
         "checklist_hospital_two_reads_match_sheet": bool(wanted_hospital and
             hospitals[0] == hospitals[1] == wanted_hospital),
         "checklist_date_two_reads_match_sheet": bool(observed_date and
@@ -130,6 +161,13 @@ def _anonymous_report(header_reads: list[dict], signature_reads: list[dict],
         "checklist_serial_two_reads_agree", "checklist_serial_compatible_with_sheet",
         "checklist_product_two_reads_match_sheet", "checklist_hospital_two_reads_match_sheet",
         "checklist_date_two_reads_match_sheet",
+        "last_page_engineer_date_two_reads_match_sheet",
+        "last_page_customer_date_two_reads_match_sheet",
+    ))
+    report["crosspage_card_evidence_complete"] = all(report[key] for key in (
+        "serial_card_two_reads_agree", "serial_card_compatible_with_sheet",
+        "serial_card_matches_reviewed", "product_card_two_reads_match_sheet",
+        "checklist_hospital_two_reads_match_sheet", "checklist_date_two_reads_match_sheet",
         "last_page_engineer_date_two_reads_match_sheet",
         "last_page_customer_date_two_reads_match_sheet",
     ))
@@ -155,12 +193,17 @@ def run() -> dict:
         if doc.page_count != 4:
             raise backtest.BacktestError("B10 不是完整四頁 PM，停止只讀測試")
         nvidia_client.reset_ocr_metrics()
-        header_reads = [_read_json(_panel_image(doc, 1, CHECKLIST_HEADER, zoom), header=True)
+        header_reads = [_read_json(_panel_image(doc, 1, CHECKLIST_HEADER, zoom), section="header")
                         for zoom in ZOOMS]
         signature_reads = [_read_json(_panel_image(doc, 3, CHECKLIST_SIGNATURES, zoom),
-                                      header=False) for zoom in ZOOMS]
+                                      section="signatures") for zoom in ZOOMS]
+        product_reads = [_read_json(_panel_image(doc, 1, CHECKLIST_PRODUCT, zoom),
+                                    section="product") for zoom in ZOOMS]
+        serial_reads = [_read_json(_panel_image(doc, 1, CHECKLIST_SERIAL, zoom),
+                                   section="serial") for zoom in ZOOMS]
     report = _anonymous_report(
-        header_reads, signature_reads, sample["observed_fields"], sample["expected"],
+        header_reads, signature_reads, product_reads, serial_reads,
+        sample["observed_fields"], sample["expected"],
         nvidia_client.get_ocr_metrics(),
     )
     output = Path(os.environ.get("JOBSHEET_CHECKLIST_REPORT", "/tmp/checklist-anonymous.json"))

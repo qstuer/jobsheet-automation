@@ -20,14 +20,18 @@ class ChecklistCrosspageProbeTests(unittest.TestCase):
         header = {"hospital": "GH-3F", "product": "EPIQ CVx",
                   "serial": "SZ725B0149", "date": "20/8/2026"}
         footer = {"engineer_date": "20/8/2026", "customer_date": "20/8/2026"}
+        product = {"product": "EPIQ CVx"}
+        serial = {"serial": "SZ725B0149"}
         observed = {"hospital_raw": "GH-3F", "product_raw": "EPIQ CVx",
                     "serial_raw": "SZ?25B0149", "service_date_raw": "2026-08-20"}
         expected = {"serial": "SZ725B0149"}
         report = probe._anonymous_report([header, header], [footer, footer],
-                                         observed, expected, {"calls": 4})
+                                         [product, product], [serial, serial],
+                                         observed, expected, {"calls": 8})
         self.assertTrue(report["crosspage_evidence_complete"])
+        self.assertTrue(report["crosspage_card_evidence_complete"])
         self.assertTrue(report["checklist_serial_matches_reviewed"])
-        self.assertEqual(report["calls"], 4)
+        self.assertEqual(report["calls"], 8)
         self.assertNotIn("SZ725B0149", str(report))
         self.assertNotIn("GH-3F", str(report))
 
@@ -35,12 +39,29 @@ class ChecklistCrosspageProbeTests(unittest.TestCase):
         header = {"hospital": "GH-3F", "product": "EPIQ CVx",
                   "serial": "SZ725B0149", "date": "20/8/2026"}
         footer = {"engineer_date": "20/9/2026", "customer_date": "20/8/2026"}
+        product = {"product": "EPIQ CVx"}
+        serial = {"serial": "SZ725B0149"}
         observed = {"hospital_raw": "GH-3F", "product_raw": "EPIQ CVx",
                     "serial_raw": "SZ?25B0149", "service_date_raw": "2026-08-20"}
         report = probe._anonymous_report([header, header], [footer, footer],
+                                         [product, product], [serial, serial],
                                          observed, {"serial": "SZ725B0149"}, {})
         self.assertFalse(report["last_page_engineer_date_two_reads_match_sheet"])
         self.assertFalse(report["crosspage_evidence_complete"])
+        self.assertFalse(report["crosspage_card_evidence_complete"])
+
+    def test_agreeing_wrong_serial_is_not_graded_correct(self):
+        header = {"hospital": "GH-3F", "product": "EPIQ CVx",
+                  "serial": "SZ725B0149", "date": "20/8/2026"}
+        footer = {"engineer_date": "20/8/2026", "customer_date": "20/8/2026"}
+        observed = {"hospital_raw": "GH-3F", "product_raw": "EPIQ CVx",
+                    "serial_raw": "SZ?25B0149", "service_date_raw": "2026-08-20"}
+        report = probe._anonymous_report(
+            [header, header], [footer, footer], [{"product": "EPIQ CVx"}] * 2,
+            [{"serial": "SZ825B0149"}] * 2, observed, {"serial": "SZ725B0149"}, {})
+        self.assertTrue(report["serial_card_two_reads_agree"])
+        self.assertFalse(report["serial_card_matches_reviewed"])
+        self.assertFalse(report["crosspage_card_evidence_complete"])
 
     def test_changed_private_pdf_stops_before_any_model_call(self):
         with tempfile.TemporaryDirectory() as temporary:
