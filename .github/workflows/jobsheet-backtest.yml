@@ -73,12 +73,11 @@ jobs:
             /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
           echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
       - run: pip install -r requirements.txt
-      - name: Recheck five samples with corrected answer and separate device ranking
+      - name: Recheck all 20 samples with corrected answers and separate device ranking
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
-          JOBSHEET_BACKTEST_SAMPLE_IDS: B01,B03,B04,B07,B10
           OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.
