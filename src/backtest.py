@@ -14,14 +14,14 @@ import logging
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from contextlib import ExitStack
 from unittest.mock import patch
 
 import fitz
 
-from . import asana_client, asana_index, nvidia_client, processor, rclone_helper
+from . import asana_client, asana_index, config, nvidia_client, processor, rclone_helper, upload_date_prior
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("backtest")
@@ -244,6 +244,10 @@ def _append_summary(rows: list[dict], path: Path) -> None:
     seconds = sum(row["seconds"] for row in rows)
     tokens = sum(row["tokens"] for row in rows)
     costs = [row["cost"] for row in rows if row["cost"] is not None]
+    prior_counts = {
+        outcome: sum(row.get("upload_prior", {}).get("status") == outcome for row in rows)
+        for outcome in ("CORRECT", "WRONG", "PENDING", "NO_REVIEWED_DATE")
+    }
     with path.open("a", encoding="utf-8") as stream:
         stream.write("## Jobsheet 20 份私人只讀回測\n\n")
         stream.write(
@@ -252,13 +256,24 @@ def _append_summary(rows: list[dict], path: Path) -> None:
             "OneDrive 写入：**0**。\n\n"
         )
         stream.write("这不是全流程通过率：圈选独立列出；逐栏准确率、checklist 内容与切页尚未验收。页数正确也不代表完整。\n\n")
+        if any(prior_counts.values()):
+            stream.write(
+                "模擬上傳日期（人工日期作錨、延後 45 天；不是實際上傳時間）"
+                f"：正確 {prior_counts['CORRECT']}、錯誤 {prior_counts['WRONG']}、"
+                f"待核對 {prior_counts['PENDING']}、缺日期 {prior_counts['NO_REVIEWED_DATE']}。"
+                "候選設備由模型實讀欄位搜尋，人工答案不參與搜尋；"
+                "此項不是正式流程的自動準確率。\n\n"
+            )
         stream.write(f"重复工作样本：{repeated_work}；工作身份未确认：{unknown_work}。不同 PDF 不等于不同工作。\n\n")
-        stream.write("| 样本 | 结果 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | PM後頁補救 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
-        stream.write("|---|---|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|\n")
+        stream.write("| 样本 | 结果 | 診斷：模擬上傳日 | 診斷：設備 | 診斷：日期獨立核對 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | PM後頁補救 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
+        stream.write("|---|---|---|---|---|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|\n")
         for row in rows:
             cost = f"RMB {row['cost']:.4f}" if row["cost"] is not None else "-"
+            prior = row.get("upload_prior") or {}
             stream.write(
                 f"| {row['sample_id']} | {row['status']} | "
+                f"{prior.get('status', 'NOT_RUN')} | {prior.get('device_check', '-')} | "
+                f"{'YES' if prior.get('model_date_verified') else 'NO'} | "
                 f"{row.get('device_candidate_rank', 'NOT_TESTED')} | "
                 f"{row.get('device_check', 'NOT_REVIEWED')} | {row.get('task_check', 'NOT_REVIEWED')} | "
                 f"{row.get('filename_check', 'NOT_REVIEWED')} | {row.get('task_type_check', 'NOT_TESTED')} | "
@@ -309,6 +324,68 @@ def _device_candidate_rank(ocr: dict | None, expected_serial: str | None,
         if asana_client._norm(candidate["row"].get("serial")) == wanted:
             return rank if rank <= 10 else "OUTSIDE_TOP_10"
     return "NOT_IN_POOL"
+
+
+def _upload_prior_diagnostic(sample: dict, ocr: dict | None,
+                             detected_type: str | None, page_count: int) -> dict:
+    """Test a hypothetical upload date *after* OCR, never feed it to vision.
+
+    The anchor is human-reviewed jobsheet data and is therefore an oracle
+    scenario, not an end-to-end automatic accuracy measurement. The reviewed
+    answer is used only for the anchor and grading, never for device lookup.
+    """
+    if not os.environ.get("JOBSHEET_SIM_UPLOAD_LAG_DAYS"):
+        return {"status": "NOT_RUN"}
+    if (not sample.get("_verified_answer") or sample["expected"]["kind"] != "match"
+            or page_count != (4 if sample["job_type"] == "PM" else 1)):
+        return {"status": "NOT_APPLICABLE"}
+    lag = int(os.environ["JOBSHEET_SIM_UPLOAD_LAG_DAYS"])
+    if lag not in {14, 30, 45, 60}:
+        raise BacktestError("模擬上傳日期延後天數不正確")
+    anchor = asana_client._parse_date(
+        (sample.get("observed_fields") or {}).get("service_date_raw")
+    )
+    if anchor is None:
+        return {"status": "NO_REVIEWED_DATE"}
+    if not ocr or detected_type != sample["job_type"]:
+        return {"status": "PENDING", "reason": "NO_USABLE_OCR"}
+
+    ranked = asana_client._rank_index_devices(ocr, detected_type)
+    if not ranked:
+        return {"status": "PENDING", "reason": "NO_DEVICE"}
+    if (len(ranked) > 1 and ranked[0]["serial_similarity"] -
+            ranked[1]["serial_similarity"] <= config.INDEX_SERIAL_CLOSE_GAP):
+        return {"status": "PENDING", "reason": "DEVICE_TIE"}
+    row = ranked[0]["row"]
+    device_correct = asana_client._norm(row.get("serial")) == asana_client._norm(
+        sample["expected"]["serial"]
+    )
+    upload_day = anchor + timedelta(days=lag)
+    pool = upload_date_prior.shortlist(
+        row.get("task_refs") or [], detected_type, upload_day,
+        asana_client._parse_date,
+    )
+    # Repeated model readings of the same mistaken digit do not count as
+    # corroboration. Only an independently checked ACTION DATE can separate
+    # two visits in this branch.
+    action_day = (
+        asana_client._parse_date(ocr.get("service_date_iso") or
+                                 ocr.get("service_date_raw"))
+        if (ocr.get("date_corrob") and not ocr.get("_date_recheck_blocked")
+            and ocr.get("date_source") == "ACTION_DATE") else None
+    )
+    chosen = upload_date_prior.select_visit(
+        pool, action_day, upload_day, asana_client._parse_date,
+    )
+    return {
+        "status": ("PENDING" if chosen is None else
+                   "CORRECT" if chosen == sample["expected"]["task_gid"] else "WRONG"),
+        "reason": ("NO_VISIT" if not pool else "VISIT_TIE" if chosen is None else
+                   "SELECTED"),
+        "device_check": "PASS" if device_correct else "FAIL",
+        "candidate_count": len(pool),
+        "model_date_verified": action_day is not None,
+    }
 
 
 def _deny_cloud_operation(*args, **kwargs):
@@ -381,11 +458,13 @@ def run() -> list[dict]:
                         ocr, sample["expected"].get("serial"), sample["job_type"]
                     ),
                 )
+        upload_prior = _upload_prior_diagnostic(sample, ocr, detected, page_count)
         status = evaluation["status"]
         log.info("[%s] %s（客户资料已隐藏）", sample_id, status)
         rows.append({
             "sample_id": sample_id,
             **evaluation,
+            "upload_prior": upload_prior,
             "pm_crosspage_rescue": (
                 (ocr.get("_ocr_audit") or {}).get("pm_crosspage_rescue", "not_attempted")
                 if ocr else "not_attempted"

@@ -15,7 +15,7 @@ on:
   # Only an edit to this test workflow may start the isolated read-only run.
   push:
     branches:
-      - codex/backtest-reviewed-20260923
+      - codex/upload-date-prior-test-20260928
     paths:
       - .github/workflows/jobsheet-backtest.yml
 
@@ -31,7 +31,7 @@ env:
 
 jobs:
   backtest:
-    if: github.ref == 'refs/heads/codex/backtest-reviewed-20260923'
+    if: github.ref == 'refs/heads/codex/upload-date-prior-test-20260928'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -78,6 +78,9 @@ jobs:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
           JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
           JOBSHEET_BACKTEST_REPORT: /tmp/backtest-results.json
+          # Private oracle scenario only: reviewed jobsheet date + 45 days is
+          # supplied after OCR. It never enters the image prompt or production.
+          JOBSHEET_SIM_UPLOAD_LAG_DAYS: '45'
           OCR_PROVIDER: ${{ inputs.ocr_provider || 'deepseek' }}
           # Only this read-only backtest uses the scored single-field strategy.
           # Production Stage B remains unchanged until the 20 samples pass.
