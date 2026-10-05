@@ -19,7 +19,28 @@ def main():
     if job not in (1, 2, 3, 4):
         raise ValueError("Only the four explicitly authorized PDFs may be tested")
     filename = f"20261005072226_001__job{job}_PM.pdf"
-    logging.disable(logging.CRITICAL)
+    trace = []
+
+    class SafeTrace(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            for phrase, category in (
+                ("設備索引沒有候選", "index_miss_live_fallback"),
+                ("已鎖定一部設備", "device_locked_live_tasks_read"),
+                ("所有歷史工作都與 ACTION DATE", "task_date_outside_window"),
+                ("serial 模糊但多欄核對命中", "fuzzy_serial_multifield_match"),
+                ("Asana 多欄核對命中", "multifield_match"),
+                ("類型衝突", "project_type_conflict_filtered"),
+                ("保留待核對", "ambiguous_candidate_review"),
+                ("分格複核後仍沒有唯一", "no_unique_task"),
+            ):
+                if phrase in message and category not in trace:
+                    trace.append(category)
+
+    logging.disable(logging.NOTSET)
+    logging.getLogger().handlers.clear()
+    logging.getLogger().addHandler(SafeTrace())
+    logging.getLogger().setLevel(logging.INFO)
 
     # A second guard below the caller: even an accidental finalization must fail.
     original_run_result = rclone_helper.run_result
@@ -69,12 +90,17 @@ def main():
                 task, tier, ocr = processor._ocr_and_match(doc, "PM")
             report["matched"] = task is not None
             report["tier"] = tier
-            report["field_receipts"] = {
-                field: {"present": bool(ocr.get(field)), "receipt": receipt(ocr.get(field))}
-                for field in ("hospital_raw", "location", "department_room_raw",
-                              "product", "serial", "phone", "contact_person_raw",
-                              "asset", "action_date", "order_no")
-            }
+            report["field_receipts"] = {}
+            # Use the real production OCR schema, not display-column aliases.
+            # Lists retain each independently transcribed candidate as a proof.
+            for field in ("hospital_raw", "department_room_raw", "product_raw",
+                          "serial_candidates", "serial_visual_candidates",
+                          "phone_candidates", "contact_person_raw", "asset_candidates",
+                          "service_date_raw", "date_source", "order_no"):
+                value = ocr.get(field)
+                values = value if isinstance(value, list) else [value] if value else []
+                report["field_receipts"][field] = {
+                    "present": bool(values), "receipts": [receipt(item) for item in values]}
             if task:
                 planned, order_no = processor._planned_filename(task)
                 report["task_receipt"] = receipt(task.get("gid"))
@@ -89,6 +115,8 @@ def main():
         report["metrics"] = {field: metrics.get(field) for field in (
             "calls", "seconds", "total_tokens", "estimated_cost_cny_upper")}
         report["elapsed_seconds"] = round(time.monotonic() - started, 1)
+        report["trace"] = trace
+        report["measurement_schema"] = 2
         (out / f"job{job}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report), flush=True)
     # A green run means the measurement finished, NOT that its match is correct.
