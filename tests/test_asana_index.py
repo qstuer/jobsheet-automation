@@ -45,9 +45,9 @@ class AsanaIndexTests(unittest.TestCase):
 
     def test_same_device_merges_history_but_different_serials_stay_separate(self):
         rows = asana_index.build_index([
-            task("1", "PYNEH / Affiniti 70 / US123F4567", notes="Phone 61234567 Contact: Alice Asset# 19130438"),
-            task("2", "PYN / Affiniti 70G / US123F4567", notes="Phone 61234569 Contact: Bob Asset# 19130438", project_type="CM"),
-            task("3", "PYNEH / Affiniti 70 / US123F4568", notes="Phone 61234568 Asset# 19130439"),
+            task("1", "PYNEH / Affiniti 70 / US123F4567", notes="Phone 99990011 Contact: Alice Asset# 88880001"),
+            task("2", "PYN / Affiniti 70G / US123F4567", notes="Phone 99990013 Contact: Bob Asset# 88880001", project_type="CM"),
+            task("3", "PYNEH / Affiniti 70 / US123F4568", notes="Phone 99990012 Asset# 88880002"),
         ], window_start=date(2025, 1, 1), window_end=date(2026, 12, 31))
         self.assertEqual(rows["device_count"], 2)
         merged = next(row for row in rows["devices"] if row["serial"] == "US123F4567")
@@ -59,27 +59,27 @@ class AsanaIndexTests(unittest.TestCase):
         refs = {ref["gid"]: ref for ref in merged["task_refs"]}
         self.assertEqual(refs["1"]["contacts"], ["Alice"])
         self.assertEqual(refs["2"]["contacts"], ["Bob"])
-        self.assertEqual(refs["1"]["phones"], ["61234567"])
-        self.assertEqual(refs["2"]["phones"], ["61234569"])
+        self.assertEqual(refs["1"]["phones"], ["99990011"])
+        self.assertEqual(refs["2"]["phones"], ["99990013"])
         self.assertEqual(rows["merged_task_count"], 1)
 
     def test_unlabelled_asset_number_is_not_indexed_as_phone(self):
         record = asana_index.task_to_record(task(
             "1",
             "PYN / Affiniti 70 / US123F4567",
-            notes="Asset# 19130438\nSecondary asset 1281993",
+            notes="Asset# 88880001\nSecondary asset 8888002",
         ), "PM")
-        self.assertEqual(["19130438", "1281993"], record["assets"])
+        self.assertEqual(["88880001", "8888002"], record["assets"])
         self.assertEqual([], record["phones"])
 
     def test_labelled_phone_is_kept_while_asset_is_excluded(self):
         record = asana_index.task_to_record(task(
             "1",
             "PYN / Affiniti 70 / US123F4567",
-            notes="Phone: 25956917\nAsset# 19130438",
+            notes="Phone: 99990001\nAsset# 88880001",
         ), "PM")
-        self.assertEqual(["25956917"], record["phones"])
-        self.assertEqual(["19130438"], record["assets"])
+        self.assertEqual(["99990001"], record["phones"])
+        self.assertEqual(["88880001"], record["assets"])
 
     def test_month_named_projects_are_pm(self):
         self.assertEqual("PM", asana_index._project_is_pm_cm("2026 Jun"))
@@ -89,37 +89,37 @@ class AsanaIndexTests(unittest.TestCase):
     def test_unlabelled_contact_after_phone_and_wo_are_indexed(self):
         record = asana_index.task_to_record(task(
             "1",
-            "PYN / Affiniti 70 / US123F4567 / 61877075",
-            notes="1 / 2 PMS\n25956917 Ms.Yan\nwo: 19130438",
+            "PYN / Affiniti 70 / US123F4567 / 60000011",
+            notes="1 / 2 PMS\n99990001 Ms.Sample\nwo: 88880001",
         ), "PM")
-        self.assertEqual(["25956917"], record["phones"])
-        self.assertEqual(["Ms.Yan"], record["contacts"])
-        self.assertEqual(["19130438"], record["assets"])
+        self.assertEqual(["99990001"], record["phones"])
+        self.assertEqual(["Ms.Sample"], record["contacts"])
+        self.assertEqual(["88880001"], record["assets"])
 
     def test_one_extra_phone_digit_is_kept_only_as_fuzzy_evidence(self):
         record = asana_index.task_to_record(task(
             "1",
-            "PYNEH / EPIQ Elite / SZO23B2128 / 61877080",
-            notes="Ben 60124270\nworkshop 225956184\nasset: 2311298",
+            "PYNEH / EPIQ Elite / SZY00B0007 / 60000013",
+            notes="Ben 99990015\nworkshop 222200001\nasset: 8888003",
         ), "PM")
-        self.assertIn("225956184", record["phones"])
-        self.assertNotIn("61877080", record["phones"])
-        self.assertNotIn("2311298", record["phones"])
+        self.assertIn("222200001", record["phones"])
+        self.assertNotIn("60000013", record["phones"])
+        self.assertNotIn("8888003", record["phones"])
 
     def test_old_task_is_outside_two_year_window_and_order_is_not_indexed(self):
         rows = asana_index.build_index([
             task("old", "QEH / CX50 / US999F9999", modified="2022-01-01T00:00:00Z",
                  due_on="2022-01-01"),
-            task("new", "QEH / CX50 / US999F9999", notes="Order 61877075"),
+            task("new", "QEH / CX50 / US999F9999", notes="Order 60000011"),
         ], window_start=date(2025, 1, 1), window_end=date(2026, 12, 31))
         self.assertEqual(rows["task_count_in_window"], 1)
         row = rows["devices"][0]
         self.assertNotIn("order_no", row)
-        self.assertNotIn("61877075", json.dumps(row))
+        self.assertNotIn("60000011", json.dumps(row))
 
     def test_missing_serial_is_weak_row(self):
         rows = asana_index.build_index([
-            task("weak", "Tung Wah Hospital / Affiniti 70", notes="Room ICU Phone 61234567")
+            task("weak", "Sample Regional Hospital / Affiniti 70", notes="Room ICU Phone 99990011")
         ], window_start=date(2025, 1, 1), window_end=date(2026, 12, 31))
         self.assertTrue(rows["devices"][0]["weak_identity"])
         self.assertEqual(rows["devices"][0]["serial"], "")
@@ -145,7 +145,8 @@ class AsanaIndexTests(unittest.TestCase):
                 encoding="utf-8-sig", newline=""
             ) as stream:
                 locations = list(csv.DictReader(stream))
-            self.assertEqual("Queen Mary Hospital", locations[0]["canonical_hospital"])
+            # Code-only Asana data cannot establish an official full name.
+            self.assertEqual("QMH", locations[0]["canonical_hospital"])
             self.assertEqual("true", locations[0]["match_enabled"])
 
     def test_incremental_build_reprocesses_only_changed_task(self):
@@ -215,19 +216,19 @@ class AsanaIndexClientTests(unittest.TestCase):
 
     @staticmethod
     def _ref(gid, *, date_value="2026-09-08", job_type="PM",
-             phone="61234567", contact="Alice", room="3F"):
+             phone="99990011", contact="Alice", room="3F"):
         return {
             "gid": gid, "work_dates": [date_value], "job_type": job_type,
             "location": "PYNEH", "hospital": "PYNEH",
             "hospital_aliases": ["PYN", "PYNEH"],
             "department_rooms": [room], "product": "Affiniti 70",
             "product_family": "AFFINITI",
-            "product_variant": "Affiniti 70", "serial": "USN16F0565",
-            "phones": [phone], "contacts": [contact], "assets": ["19130438"],
+            "product_variant": "Affiniti 70", "serial": "USX00F0001",
+            "phones": [phone], "contacts": [contact], "assets": ["88880001"],
         }
 
     @classmethod
-    def _device(cls, serial="USN16F0565", *, gid="task-1", phone="61234567",
+    def _device(cls, serial="USX00F0001", *, gid="task-1", phone="99990011",
                 contact="Alice", date_value="2026-09-08"):
         ref = cls._ref(gid, date_value=date_value, phone=phone, contact=contact)
         ref["serial"] = serial
@@ -239,31 +240,31 @@ class AsanaIndexClientTests(unittest.TestCase):
             "hospitals": ["PYNEH"], "locations": ["PYN", "PYNEH-3F"],
             "hospital_aliases": ["PYN", "PYNEH"],
             "department_rooms": ["3F"], "phones": [phone],
-            "contacts": [contact], "assets": ["19130438"],
+            "contacts": [contact], "assets": ["88880001"],
             "work_dates": [date_value], "job_types": ["PM"],
             "task_refs": [ref],
         }
 
     @staticmethod
-    def _ocr(serial="USN16F0565", **overrides):
+    def _ocr(serial="USX00F0001", **overrides):
         data = {
             "order_no": None, "serial_candidates": [serial],
             "serial_no": serial, "product_raw": "Affiniti 70G",
             "hospital_raw": "PYN", "department_room_raw": "3F",
-            "phone_candidates": ["61234567"], "contact_person_raw": "Alice",
-            "asset_candidates": ["19130438"], "service_date_raw": "08/09/2026",
+            "phone_candidates": ["99990011"], "contact_person_raw": "Alice",
+            "asset_candidates": ["88880001"], "service_date_raw": "08/09/2026",
             "date_source": "ACTION_DATE",
         }
         data.update(overrides)
         return data
 
     @staticmethod
-    def _live(gid, *, serial="USN16F0565", date_value="2026-09-08",
-              phone="61234567", contact="Alice"):
+    def _live(gid, *, serial="USX00F0001", date_value="2026-09-08",
+              phone="99990011", contact="Alice"):
         return {
             "gid": gid,
             "name": f"PYNEH / Affiniti 70 / {serial}",
-            "notes": f"Phone: {phone}\nContact: {contact}\nAsset# 19130438",
+            "notes": f"Phone: {phone}\nContact: {contact}\nAsset# 88880001",
             "memberships": [{"project": {"name": "PM Jobs"}}],
             "due_on": date_value, "start_on": "",
         }
@@ -289,13 +290,13 @@ class AsanaIndexClientTests(unittest.TestCase):
             }],
         }
         asana_client.set_device_index(index)
-        live = {"gid": "123", "name": "QMH / CX50 / US123F4567 / 61877075",
+        live = {"gid": "123", "name": "QMH / CX50 / US123F4567 / 60000011",
                 "notes": "", "memberships": [{"project": {"name": "PM Jobs"}}],
                 "due_on": "2026-09-08", "start_on": ""}
         with patch.object(asana_client, "_fetch_task", return_value=live) as fetch, \
                 patch.object(asana_client, "_gather_pool") as live_search:
             found, tier = asana_client.find_task({
-                "order_no": "61877075",
+                "order_no": "60000011",
                 "serial_candidates": ["US123F4567"], "product_raw": "CX50",
                 "hospital_raw": "QMH", "date_source": "ACTION_DATE",
                 "service_date_raw": "08/09/2026",
@@ -308,7 +309,7 @@ class AsanaIndexClientTests(unittest.TestCase):
     def test_index_miss_uses_live_fallback(self):
         asana_client.set_device_index({"schema_version": 3, "devices": []})
         with patch.object(asana_client, "_gather_pool", return_value=[]) as live_search:
-            found, tier = asana_client.find_task({"order_no": "61877075"})
+            found, tier = asana_client.find_task({"order_no": "60000011"})
         self.assertIsNone(found)
         self.assertEqual(tier, 0)
         live_search.assert_called_once()
@@ -325,18 +326,18 @@ class AsanaIndexClientTests(unittest.TestCase):
     def test_live_month_project_contact_and_typo_phone_match_index_rules(self):
         live = {
             "gid": "task",
-            "name": "PYNEH / EPIQ Elite / SZO23B2128 / 61877080",
-            "notes": "workshop 225956184\n25956917 Ms.Yan\nasset: 2311298",
+            "name": "PYNEH / EPIQ Elite / SZY00B0007 / 60000013",
+            "notes": "workshop 222200001\n99990001 Ms.Sample\nasset: 8888003",
             "memberships": [{"project": {"name": "2026 Jul"}}],
         }
         self.assertEqual("PM", asana_client._task_job_type(live))
-        self.assertIn("Ms.Yan", asana_client._task_contacts(live))
-        self.assertIn("225956184", asana_client._task_phones(live))
+        self.assertIn("Ms.Sample", asana_client._task_contacts(live))
+        self.assertIn("222200001", asana_client._task_phones(live))
         scored = asana_client._candidate_score(
             live,
             {
-                "phone_candidates": ["25956184"],
-                "asset_candidates": ["2311298"],
+                "phone_candidates": ["99990002"],
+                "asset_candidates": ["8888003"],
             },
             serials=[], hosp=None, product=None, job_type="PM",
         )
@@ -344,7 +345,7 @@ class AsanaIndexClientTests(unittest.TestCase):
         self.assertIn("asset_exact", scored["support"])
 
     def test_serial_one_two_or_three_errors_can_match_with_multiple_fields(self):
-        for observed in ("USN16F056G", "USN16F05GG", "USN16F0GGG"):
+        for observed in ("USX00F000G", "USX00F00GG", "USX00F0GGG"):
             with self.subTest(observed=observed):
                 asana_client.set_device_index({
                     "schema_version": 3, "devices": [self._device()],
@@ -365,7 +366,7 @@ class AsanaIndexClientTests(unittest.TestCase):
         with patch.object(asana_client, "_fetch_task", return_value=self._live("task-1")) as fetch, \
                 patch.object(asana_client, "_gather_pool") as fallback:
             found, tier = asana_client.find_task(
-                self._ocr("USN16FGGGX"), job_type="PM"
+                self._ocr("USX00FGGGG"), job_type="PM"
             )
         self.assertEqual("task-1", found["gid"])
         self.assertEqual(2, tier)
@@ -377,7 +378,7 @@ class AsanaIndexClientTests(unittest.TestCase):
             "schema_version": 3, "devices": [self._device()],
         })
         sparse = self._ocr(
-            "USN16F056G", hospital_raw=None, department_room_raw=None,
+            "USX00F000G", hospital_raw=None, department_room_raw=None,
             phone_candidates=[], contact_person_raw=None, asset_candidates=[],
             service_date_raw=None, date_source=None,
         )
@@ -407,32 +408,32 @@ class AsanaIndexClientTests(unittest.TestCase):
         fallback.assert_not_called()
 
     def test_two_close_devices_with_small_score_gap_stay_pending(self):
-        other = self._device("USN16F0566", gid="task-2")
+        other = self._device("USX00F0002", gid="task-2")
         asana_client.set_device_index({
             "schema_version": 3, "devices": [self._device(), other],
         })
         with patch.object(asana_client, "_fetch_task") as fetch:
             found, tier = asana_client.find_task(
-                self._ocr("USN16F056X"), job_type="PM"
+                self._ocr("USX00F000X"), job_type="PM"
             )
         self.assertIsNone(found)
         self.assertEqual(0, tier)
         fetch.assert_not_called()
 
     def test_historical_task_is_selected_by_its_date_and_phone_not_recency(self):
-        device = self._device(gid="older", phone="61234567", date_value="2026-09-08")
+        device = self._device(gid="older", phone="99990011", date_value="2026-09-08")
         newer = self._ref(
-            "newer", date_value="2026-09-14", phone="69876543", contact="Bob"
+            "newer", date_value="2026-09-14", phone="99990014", contact="Bob"
         )
         device["task_refs"].append(newer)
-        device["phones"].append("69876543")
+        device["phones"].append("99990014")
         device["contacts"].append("Bob")
         device["work_dates"].append("2026-09-14")
         asana_client.set_device_index({"schema_version": 3, "devices": [device]})
         live = {
             "older": self._live("older"),
             "newer": self._live(
-                "newer", date_value="2026-09-14", phone="69876543", contact="Bob"
+                "newer", date_value="2026-09-14", phone="99990014", contact="Bob"
             ),
         }
         with patch.object(asana_client, "_fetch_task", side_effect=lambda gid: live[gid]):
@@ -457,9 +458,9 @@ class AsanaIndexClientTests(unittest.TestCase):
         with patch.object(
             asana_client, "_fetch_task", return_value=self._live("task-1")
         ), self.assertLogs(asana_client.log, level="INFO") as captured:
-            asana_client.find_task(self._ocr("USN16F056G"), job_type="PM")
+            asana_client.find_task(self._ocr("USX00F000G"), job_type="PM")
         output = "\n".join(captured.output)
-        for private_value in ("USN16F0565", "61234567", "Alice", "19130438"):
+        for private_value in ("USX00F0001", "99990011", "Alice", "88880001"):
             self.assertNotIn(private_value, output)
 
 

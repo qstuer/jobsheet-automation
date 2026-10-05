@@ -19,11 +19,12 @@ import os
 import re
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import fitz
 
-from . import asana_client, asana_index, batch_state, config, nvidia_client, rclone_helper
+from . import asana_client, asana_index, batch_state, config, nvidia_client, pending_review, private_ocr_context, rclone_helper, selection_audit
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -35,6 +36,9 @@ SOURCE_QUEUE_ENV = config.JOBSHEET_SOURCE_QUEUE_ENV
 CONFIRMED_FILENAME_ENV = "JOBSHEET_CONFIRMED_FILENAME"
 ASANA_INDEX_FILE_ENV = "ASANA_INDEX_LOCAL_FILE"
 ASANA_INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
+CONTEXT_FIELD_OCR_ENV = "JOBSHEET_CONTEXT_FIELD_OCR"
+REVIEW_ACTION_DATE_ENV = "JOBSHEET_REVIEW_ACTION_DATE"
+REVIEW_TASK_ENV = "JOBSHEET_REVIEW_TASK"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -169,6 +173,40 @@ def _finalize_match(local_pdf: Path, task: dict, tier: int,
     return result
 
 
+def _finalize_neutral_device(local_pdf: Path, neutral_name: str,
+                             job_type: str, source_name: str) -> dict:
+    """Use a type suffix only when the neutral name collides with other content."""
+    remote = f"{config.ONEDRIVE_OUTPUT}/{neutral_name}"
+    stat = rclone_helper.remote_stat(remote)
+    candidate = neutral_name
+    identical = stat is not None and (
+        rclone_helper.remote_matches(local_pdf, remote, stat=stat)
+        or rclone_helper.remote_visually_matches(local_pdf, remote)
+    )
+    if identical:
+        _USED_NAMES.add(neutral_name)
+        return {
+            "status": "已存在（設備名稱，相同內容沒有重傳）",
+            "state": "already_exists", "onedrive": neutral_name,
+            "planned": neutral_name, "device_only": True,
+        }
+    if stat is not None or neutral_name in _USED_NAMES:
+        stem = neutral_name[:-4] if neutral_name.lower().endswith(".pdf") else neutral_name
+        candidate = f"{stem} - {job_type}.pdf"
+    uploaded = rclone_helper.upload_unique(
+        local_pdf, config.ONEDRIVE_OUTPUT, candidate, _USED_NAMES,
+        source_name=source_name, return_details=True,
+    )
+    log.info("  ↑ OneDrive 上傳完成（設備確認；歷史工作仍無法唯一區分）")
+    return {
+        "status": "完成（設備名稱，工作未唯一確認）",
+        "state": uploaded["disposition"],
+        "onedrive": uploaded["filename"],
+        "planned": candidate,
+        "device_only": True,
+    }
+
+
 # ── 多輪 OCR + 配對 ───────────────────────────────────────────
 
 def _norm_evidence(value) -> str:
@@ -204,10 +242,7 @@ def _near_serial_consensus(readings: list) -> list:
         seen_this_round = set()
         for value in reading.get("serial_candidates") or []:
             normalized = _norm_evidence(value)
-            plausible = (
-                bool(re.fullmatch(r"[A-Z]{2,3}[A-Z0-9]{6,9}", normalized))
-                and sum(char.isdigit() for char in normalized) >= 4
-            )
+            plausible = nvidia_client._valid_serial_token(value)
             if plausible and normalized not in seen_this_round:
                 entries.append((round_index, value, normalized))
                 seen_this_round.add(normalized)
@@ -229,6 +264,7 @@ def _consensus_ocr(readings: list) -> dict:
     if not readings:
         return {}
     result = {}
+    consensus_rejections = {}
     list_fields = {
         "serial_candidates", "phone_candidates", "asset_candidates",
         "work_order_candidates", "unreadable_fields",
@@ -242,15 +278,24 @@ def _consensus_ocr(readings: list) -> dict:
         for reading in readings:
             value = reading.get(field)
             if field == "hospital_raw":
-                key = _norm_evidence(asana_client.hospital_core(value))
+                # Keep identical raw short-code readings even when that code
+                # has not yet been promoted to a trusted hospital alias.
+                # Matching still calls hospital_core(), so this is not a vote
+                # that the abbreviation denotes a particular hospital.
+                key = _norm_evidence(asana_client.hospital_core(value) or value)
             elif field == "product_raw":
                 key = _norm_evidence(asana_client.normalize_product(value))
+            elif field == "service_date_raw":
+                parsed = nvidia_client._parse_action_date(value)
+                key = parsed.isoformat() if parsed else ""
             else:
                 key = _norm_evidence(value)
             if key:
                 buckets.setdefault(key, []).append(value)
         winners = [values for values in buckets.values() if len(values) >= 2]
         result[field] = winners[0][0] if len(winners) == 1 else None
+        if not result[field] and any(reading.get(field) for reading in readings):
+            consensus_rejections[field] = "conflicting_readings" if len(buckets) > 1 else "insufficient_valid_readings"
 
     for field in list_fields:
         buckets = {}
@@ -262,6 +307,8 @@ def _consensus_ocr(readings: list) -> dict:
                     buckets.setdefault(key, []).append(value)
                     seen_this_round.add(key)
         result[field] = [values[0] for values in buckets.values() if len(values) >= 2][:3]
+        if field != "unreadable_fields" and buckets and not result[field]:
+            consensus_rejections[field] = "no_repeated_candidate"
 
     # 完全一致仍是首選；但只要任何獨立輪次曾抄出另一個有效 serial，便保留
     # 「有爭議」標記。即使第三輪令其中一個讀數取得多數，也不能因此把曾見的
@@ -285,12 +332,17 @@ def _consensus_ocr(readings: list) -> dict:
     if not result.get("serial_candidates"):
         result["serial_candidates"] = _near_serial_consensus(readings)
         result["serial_ambiguous"] = bool(result["serial_candidates"])
+        if result["serial_candidates"]:
+            consensus_rejections.pop("serial_candidates", None)
 
     # prompt 已限定 service_date_raw 只能抄 ACTION DATE。若兩輪對日期本身有
     # 共識、但模型漏填可選的 date_source，不應因此丟掉最能區分同一設備
     # 不同月份 PM 的證據。單輪日期仍不會通過上方共識。
     if result.get("service_date_raw") and not result.get("date_source"):
         result["date_source"] = "ACTION_DATE"
+        consensus_rejections.pop("date_source", None)
+    parsed = nvidia_client._parse_action_date(result.get("service_date_raw"))
+    result["service_date_iso"] = parsed.isoformat() if parsed else None
 
     result["serial_no"] = next(iter(result.get("serial_candidates", [])), None)
     result["product"] = asana_client.normalize_product(result.get("product_raw"))
@@ -299,11 +351,205 @@ def _consensus_ocr(readings: list) -> dict:
         result.get("department_room_raw")
     )
     result["customer"] = result.get("hospital_raw")
+    # This private trace is never a source of matching evidence or a log entry.
+    # Keep every pass, including values subsequently rejected or outvoted.
+    result["_ocr_audit"] = {
+        "readings": [deepcopy({
+            "context": reading.get("_read_context", {}),
+            **reading.get("_ocr_audit", {
+                "raw": {key: reading[key] for key in nvidia_client._OCR_MODEL_FIELDS if key in reading},
+                "normalized": {key: value for key, value in reading.items() if not key.startswith("_")},
+                "rejections": {},
+            }),
+        }) for reading in readings],
+        "consensus_rejections": consensus_rejections,
+    }
     return result
+
+
+def _apply_focused_action_date(consensus: dict, focused_readings: list) -> bool:
+    """In the isolated backtest, only two agreeing date-panel reads may replace a broad-card date.
+
+    Broad cards can independently make the same month error. Their votes remain
+    in the private audit, but cannot outvote this pair. If either focused read
+    fails or they disagree, discard the date as matching evidence altogether.
+    """
+    dates = [nvidia_client._parse_action_date(row.get("service_date_raw"))
+             for row in focused_readings]
+    agreed = len(dates) == 2 and dates[0] is not None and dates[0] == dates[1]
+    audit = consensus.setdefault("_ocr_audit", {})
+    audit["date_recheck"] = "agreed" if agreed else "unresolved"
+    if agreed:
+        consensus["service_date_raw"] = focused_readings[0]["service_date_raw"]
+        consensus["service_date_iso"] = dates[0].isoformat()
+        consensus["date_source"] = "ACTION_DATE"
+        return True
+    consensus["service_date_raw"] = None
+    consensus["service_date_iso"] = None
+    consensus["date_source"] = None
+    return False
+
+
+def _apply_signature_date_corroboration(
+        consensus: dict, action_readings: list, signed_dates: list
+) -> bool:
+    """Use the customer's signed date to corroborate ACTION DATE, not replace it.
+
+    Engineers may sign days before the customer. Requiring both signatures to
+    agree discarded real visits. The customer date is only a cross-check: an
+    independently read ACTION DATE must match it, or two differently rendered
+    focused reads may each differ by at most one digit. Any wider conflict
+    blocks correction. No Asana answer is given to OCR or used here.
+    """
+    dates = [nvidia_client._parse_action_date(value) for value in signed_dates]
+    audit = consensus.setdefault("_ocr_audit", {})
+    if len(dates) != 2 or dates[1] is None:
+        audit["signature_date_check"] = "unresolved"
+        return False
+    target = dates[1]
+    age = (nvidia_client._today() - target).days
+    if not (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+            <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS):
+        audit["signature_date_check"] = "outside_window"
+        return False
+    action = [
+        (nvidia_client._parse_action_date(value), value,
+         (row.get("_read_context") or {}).get("stage"),
+         (row.get("_read_context") or {}).get("zoom"))
+        for row in action_readings
+        for value in [row.get("service_date_raw") or
+                      (row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw")]
+        if isinstance(value, str) and value.strip()
+    ]
+    valid = [(day, raw, stage, zoom) for day, raw, stage, zoom in action if day is not None]
+    target_digits = target.strftime("%Y%m%d")
+    distance = lambda day: sum(left != right for left, right in zip(
+        day.strftime("%Y%m%d"), target_digits
+    ))
+    focused_near = {
+        (stage, zoom) for day, _, stage, zoom in valid
+        if stage in {"date_recheck", "date_parts"} and distance(day) <= 1
+    }
+    focused_far = any(
+        distance(day) > 1 for day, _, stage, _ in valid
+        if stage in {"date_recheck", "date_parts"}
+    )
+    exact_present = any(day == target for day, _, _, _ in valid)
+    paired_near = len(focused_near) >= 2 and not focused_far
+    if not valid or not (
+        paired_near or (
+            exact_present and all(distance(day) <= 1 for day, _, _, _ in valid)
+        )
+    ):
+        audit["signature_date_check"] = "no_action_date_agreement"
+        return False
+    exact = next((raw for day, raw, _, _ in valid if day == target), None)
+    raw = exact or target.strftime("%d/%m/%Y")
+    consensus["service_date_raw"] = raw
+    consensus["service_date_iso"] = target.isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus["date_corrob"] = True
+    audit["signature_date_check"] = (
+        "corroborated" if exact else "one_digit_customer_correction"
+    )
+    return True
+
+
+def _apply_customer_month_year_corroboration(
+        consensus: dict, action_dates: list, customer_months: list
+) -> bool:
+    """Use two ACTION DATE reads only when customer month/year also agrees.
+
+    The customer stamp can hide the day, so this is weaker than a full signed
+    date. It does not earn the extra date-corroboration score, and the normal
+    Asana task uniqueness gates still decide whether matching is safe.
+    """
+    audit = consensus.setdefault("_ocr_audit", {})
+    days = [nvidia_client._parse_action_date(value) for value in action_dates]
+    agreed = (
+        len(days) == 2 and days[0] is not None and days[0] == days[1]
+        and len(customer_months) == 2
+        and customer_months[0] is not None
+        and customer_months[0] == customer_months[1]
+        and days[0].strftime("%Y-%m") == customer_months[0]
+    )
+    if agreed:
+        age = (nvidia_client._today() - days[0]).days
+        agreed = (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+                  <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS)
+    audit["customer_month_year_check"] = "agreed" if agreed else "unresolved"
+    if not agreed:
+        return False
+    consensus["service_date_raw"] = action_dates[0]
+    consensus["service_date_iso"] = days[0].isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus.pop("date_corrob", None)
+    return True
+
+
+def _apply_pm_checklist_date_corroboration(
+        consensus: dict, action_readings: list, focused_readings: list,
+        customer_signed_date: str | None, checklist_dates: list[str | None]
+) -> bool:
+    """Test-only fallback; a repeated checklist reading is never enough alone.
+
+    Require two matching reads of the first PM checklist, plus an exact
+    first-page ACTION DATE read and either customer sign-off or two matching
+    focused ACTION DATE reads. A conflicting customer date or a pair of
+    focused ACTION reads agreeing on another date vetoes the fallback.
+    The final Asana matcher still applies all device/task uniqueness gates.
+    """
+    audit = consensus.setdefault("_ocr_audit", {})
+    audit["pm_checklist_date_check"] = "unresolved"
+    days = [nvidia_client._parse_action_date(value) for value in checklist_dates]
+    if len(days) != 2 or days[0] is None or days[0] != days[1]:
+        return False
+    target = days[0]
+    age = (nvidia_client._today() - target).days
+    if not (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+            <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS):
+        audit["pm_checklist_date_check"] = "outside_window"
+        return False
+    signed = nvidia_client._parse_action_date(customer_signed_date)
+    focused = [nvidia_client._parse_action_date(row.get("service_date_raw"))
+               for row in focused_readings]
+    if (signed is not None and signed != target) or (
+            len(focused) == 2 and focused[0] is not None
+            and focused[0] == focused[1] and focused[0] != target):
+        audit["pm_checklist_date_check"] = "first_page_conflict"
+        return False
+    action = [
+        (nvidia_client._parse_action_date(value), value)
+        for row in action_readings
+        for value in [row.get("service_date_raw") or
+                      (row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw")]
+        if isinstance(value, str) and value.strip()
+    ]
+    exact = next((raw for day, raw in action if day == target), None)
+    first_page_support = signed == target or (
+        len(focused) == 2 and focused[0] == target and focused[1] == target
+    )
+    if not exact or not first_page_support:
+        audit["pm_checklist_date_check"] = "insufficient_first_page_support"
+        return False
+    consensus["service_date_raw"] = exact
+    consensus["service_date_iso"] = target.isoformat()
+    consensus["date_source"] = "ACTION_DATE"
+    consensus["date_corrob"] = True
+    audit["pm_checklist_date_check"] = "corroborated"
+    return True
 
 
 def _ocr_and_match(doc, job_type):
     """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
+    if os.environ.get("JOBSHEET_EVIDENCE_LIVE_RULES") == "1":
+        # Experimental integration is explicitly read-only until repeated real
+        # document tests pass. Merely setting the flag must not enable uploads.
+        if os.environ.get(DRY_RUN_ENV) != "1":
+            raise ValueError("Integrated evidence rules require read-only mode")
+        from . import matching_rules
+        reference_day = asana_client._parse_date(os.environ.get("JOBSHEET_ORIGINAL_UPLOAD_DATE"))
+        return matching_rules.read_and_match(doc, job_type, reference_day)
     nvidia_client.reset_ocr_metrics()
     primary = nvidia_client.ocr_jobsheet_fields(
         doc, 0, zoom=config.OCR_ZOOM_DEFAULT
@@ -311,7 +557,9 @@ def _ocr_and_match(doc, job_type):
     identity = nvidia_client.ocr_jobsheet_identity_fields(
         doc, 0, zoom=config.OCR_IDENTITY_ZOOM
     )
-    readings = [primary, identity]
+    context_fields = os.environ.get(CONTEXT_FIELD_OCR_ENV) == "1"
+    def contextual(reading, stage, zoom, field=None):
+        return {**reading, "_read_context": {"stage": stage, "zoom": zoom, "field": field}}
 
     def visible_fields(reading):
         return [
@@ -324,7 +572,29 @@ def _ocr_and_match(doc, job_type):
 
     log.info(f"  OCR 分格首讀：已讀到 {visible_fields(primary)}")
     log.info(f"  OCR 身分欄複核：已讀到 {visible_fields(identity)}")
+    if context_fields:
+        # The scored single-field card is authoritative for these two fields.
+        # Keep the earlier raw readings in their private audit snapshots, but
+        # do not let two matching mistakes on broad cards become OCR votes.
+        primary = {**primary, "product_raw": None, "hospital_raw": None}
+        identity = {**identity, "product_raw": None, "hospital_raw": None}
+    readings = [contextual(primary, "primary", config.OCR_ZOOM_DEFAULT),
+                contextual(identity, "identity", config.OCR_IDENTITY_ZOOM)]
+    if context_fields:
+        vocabulary = private_ocr_context.build_vocabulary(asana_client._device_index)
+        for field in ("product_raw", "hospital_raw"):
+            for _ in range(2):
+                reading = nvidia_client.ocr_jobsheet_context_field(doc, 0, field, vocabulary)
+                readings.append(contextual(reading, "context_field", 5.0, field))
     consensus = _consensus_ocr(readings)
+    if context_fields and not all(
+            consensus.get(field) for field in ("product_raw", "hospital_raw")):
+        # One model response cannot decide the hospital or product, and old
+        # broad-card readings cannot rescue a disagreement. No Asana match is
+        # attempted, so an uncertain card cannot produce a OneDrive upload.
+        consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+        log.warning("  產品或醫院單格兩輪未一致，保留待核對")
+        return None, 0, consensus
 
     # Order No. 可以合法留白；只有模型曾看見卻未通過格式時才精讀。
     order_needs_focus = any(
@@ -334,7 +604,10 @@ def _ocr_and_match(doc, job_type):
     ) and not consensus.get("order_no")
     focus_fields = [
         field for field in ("product_raw", "serial_candidates", "hospital_raw")
-        if not consensus.get(field)
+        if (not consensus.get(field)
+            or (field == "hospital_raw" and not asana_client.hospital_core(
+                consensus.get(field))))
+        and (not context_fields or field == "serial_candidates")
     ]
     if order_needs_focus:
         focus_fields.insert(0, "order_no")
@@ -349,7 +622,7 @@ def _ocr_and_match(doc, job_type):
             except nvidia_client.NvidiaResponseError:
                 log.warning(f"  {field} 單格 {zoom}x 暫時無法完成")
                 continue
-            readings.append(reading)
+            readings.append(contextual(reading, "focused_identity", zoom, field))
             consensus = _consensus_ocr(readings)
             if consensus.get(field):
                 break
@@ -362,13 +635,16 @@ def _ocr_and_match(doc, job_type):
         serial_focus = []
         for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
             try:
-                candidates = nvidia_client.ocr_jobsheet_serial_candidates(
-                    doc, 0, zoom=zoom
+                reading = nvidia_client.ocr_jobsheet_serial_candidates(
+                    doc, 0, zoom=zoom, with_audit=True
                 )
             except nvidia_client.NvidiaResponseError:
                 log.warning(f"  serial 單格 {zoom}x 暫時無法完成")
                 continue
-            serial_focus.append({"serial_candidates": candidates})
+            # Compatibility for older callers/test fixtures returning a list.
+            if isinstance(reading, list):
+                reading = nvidia_client._normalize_ocr_data({"serial_candidates": reading})
+            serial_focus.append(contextual(reading, "serial_recheck", zoom, "serial_candidates"))
         readings.extend(serial_focus)
         consensus = _consensus_ocr(readings)
         task, tier = asana_client.find_task(consensus, job_type=job_type)
@@ -379,7 +655,7 @@ def _ocr_and_match(doc, job_type):
             support = nvidia_client.ocr_jobsheet_support_fields(
                 doc, 0, zoom=config.OCR_SUPPORT_ZOOM
             )
-            readings.append(support)
+            readings.append(contextual(support, "support", config.OCR_SUPPORT_ZOOM))
             consensus = _consensus_ocr(readings)
             log.info(f"  輔助欄共識：{visible_fields(consensus)}")
             task, tier = asana_client.find_task(consensus, job_type=job_type)
@@ -410,13 +686,171 @@ def _ocr_and_match(doc, job_type):
                 except nvidia_client.NvidiaResponseError:
                     log.warning(f"  {labels[field]} 單格 {zoom}x 暫時無法完成")
                     continue
-                readings.append(reading)
+                readings.append(contextual(reading, "focused_support", zoom, field))
                 consensus = _consensus_ocr(readings)
                 if consensus.get(field):
                     break
         task, tier = asana_client.find_task(consensus, job_type=job_type)
 
-    if task is None:
+    date_recheck_blocked = False
+    if task is None and context_fields:
+        # Test branch only: when task selection remains unresolved, re-read the
+        # ACTION DATE panel twice even if the broad cards agreed or could not
+        # parse any date. Never show candidate dates to the model or use just
+        # one focused reading to override another.
+        log.info("  歷史工作未能確定，ACTION DATE 單格兩輪獨立複核")
+        date_focus = []
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "service_date_raw", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                log.warning("  ACTION DATE 單格 %.1fx 暫時無法完成", zoom)
+                continue
+            date_focus.append(contextual(reading, "date_recheck", zoom, "service_date_raw"))
+        readings.extend(date_focus)
+        consensus = _consensus_ocr(readings)
+        if _apply_focused_action_date(consensus, date_focus):
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            date_recheck_blocked = True
+            log.info("  ACTION DATE 單格兩輪未一致，不憑原先日期自動配對")
+
+    if task is None and context_fields:
+        # Opt-in backtest only. Customer sign-off may corroborate one ambiguous
+        # handwritten digit; engineer sign-off can precede the visit and is
+        # not required to match. Neither crop receives Asana candidate data.
+        signed_dates = []
+        for field in ("engineer_signed_date", "customer_signed_date"):
+            try:
+                signed_dates.append(nvidia_client.ocr_jobsheet_signature_date(
+                    doc, 0, field, zoom=5.0
+                ))
+            except nvidia_client.NvidiaResponseError:
+                signed_dates.append(None)
+        log.info("  日期診斷：ACTION有效讀數=%s、ACTION原文讀數=%s、工程師簽署可讀=%s、客戶簽署可讀=%s",
+                 sum(bool(row.get("service_date_raw")) for row in readings),
+                 sum(bool((row.get("_ocr_audit") or {}).get("raw", {}).get("service_date_raw"))
+                     for row in readings),
+                 signed_dates[0] is not None, signed_dates[1] is not None)
+        if _apply_signature_date_corroboration(consensus, readings, signed_dates):
+            date_recheck_blocked = False
+            log.info("  ACTION DATE 獲客戶簽署日期獨立確認，重新核對歷史工作")
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  簽署日期未能安全確認 ACTION DATE：%s，不作日期修正",
+                     consensus.get("_ocr_audit", {}).get("signature_date_check"))
+            customer_date = nvidia_client._parse_action_date(signed_dates[1])
+            if customer_date is not None:
+                # The generic JSON field reader often returns null for an
+                # otherwise legible date. Ask for day/month/year separately,
+                # twice, without showing the customer or Asana date to OCR.
+                # Both readings must match customer sign-off, and the same
+                # ACTION DATE conflict guard still applies.
+                part_dates = []
+                for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+                    try:
+                        part_dates.append(nvidia_client.ocr_jobsheet_action_date_parts(
+                            doc, 0, zoom=zoom
+                        ))
+                    except nvidia_client.NvidiaResponseError:
+                        part_dates.append(None)
+                agreed = (len(part_dates) == 2 and part_dates[0] is not None
+                          and part_dates[0] == part_dates[1])
+                consensus.setdefault("_ocr_audit", {})["date_parts_recheck"] = (
+                    "agreed" if agreed else "unresolved"
+                )
+                log.info("  日期分段診斷：有效讀數=%s、兩輪同值=%s",
+                         sum(value is not None for value in part_dates), agreed)
+                if agreed:
+                    parts_readings = [
+                        {"service_date_raw": value,
+                         "_read_context": {"stage": "date_parts", "zoom": zoom}}
+                        for value, zoom in zip(part_dates, config.OCR_FOCUSED_RETRY_ZOOMS)
+                    ]
+                    if _apply_signature_date_corroboration(
+                            consensus, [*readings, *parts_readings], signed_dates):
+                        date_recheck_blocked = False
+                        log.info("  ACTION DATE 分段雙讀獲客戶簽署日期確認，重新核對歷史工作")
+                        task, tier = asana_client.find_task(consensus, job_type=job_type)
+            else:
+                # A stamp may obscure the customer DAY while leaving month and
+                # year legible. Two independent ACTION DATE part readings must
+                # agree in full, and two customer readings must confirm their
+                # month/year. Never fill the day from Asana or scan date.
+                customer_months = []
+                part_dates = []
+                for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+                    try:
+                        customer_months.append(nvidia_client.ocr_jobsheet_customer_month_year(
+                            doc, 0, zoom=zoom
+                        ))
+                    except nvidia_client.NvidiaResponseError:
+                        customer_months.append(None)
+                    try:
+                        part_dates.append(nvidia_client.ocr_jobsheet_action_date_parts(
+                            doc, 0, zoom=zoom
+                        ))
+                    except nvidia_client.NvidiaResponseError:
+                        part_dates.append(None)
+                if _apply_customer_month_year_corroboration(
+                        consensus, part_dates, customer_months):
+                    date_recheck_blocked = False
+                    log.info("  ACTION DATE 雙讀與客戶簽署月份一致，重新核對歷史工作")
+                    task, tier = asana_client.find_task(consensus, job_type=job_type)
+
+    if (task is None and context_fields and job_type == "PM"
+            and getattr(doc, "page_count", 0) == 4):
+        # A PM checklist's Date is a second page-level observation, not an
+        # alternative source of truth. Two identical errors occurred in the
+        # private probe, so first-page corroboration and conflict vetoes are
+        # mandatory. This branch is absent from production Stage B settings.
+        checklist_dates = []
+        for zoom in (5.0, 6.0):
+            try:
+                checklist_dates.append(nvidia_client.ocr_pm_checklist_date(
+                    doc, 1, zoom=zoom
+                ))
+            except nvidia_client.NvidiaResponseError:
+                checklist_dates.append(None)
+        if _apply_pm_checklist_date_corroboration(
+                consensus, readings, date_focus, signed_dates[1], checklist_dates):
+            date_recheck_blocked = False
+            log.info("  PM 檢查表日期獲首頁獨立確認，重新核對歷史工作")
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  PM 檢查表日期不能安全確認：%s；維持待核對",
+                     consensus.get("_ocr_audit", {}).get("pm_checklist_date_check"))
+
+    if (task is None and context_fields and asana_client._device_index is not None
+            and all(consensus.get(field) for field in
+                    ("serial_candidates", "product_raw", "hospital_raw"))):
+        # Isolated backtest only. A repeated PM may have an ambiguous handwritten
+        # month; independently transcribed probe/part IDs can distinguish its
+        # live Asana task. Never show the model Asana descriptions or candidate
+        # identifiers. One pass or one matching code is not sufficient.
+        log.info("  歷史工作仍未確定，ACTION TAKEN 識別碼做兩輪獨立抄錄")
+        action_reads = []
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                action_reads.append(nvidia_client.ocr_jobsheet_action_identifiers(
+                    doc, 0, zoom=zoom
+                ))
+            except nvidia_client.NvidiaResponseError:
+                log.warning("  ACTION TAKEN 單格 %.1fx 暫時無法完成", zoom)
+        action_ids = [value for value in action_reads[0]
+                      if value in set(action_reads[1])] if len(action_reads) == 2 else []
+        consensus.setdefault("_ocr_audit", {})["action_identifier_recheck"] = {
+            "readings": deepcopy(action_reads), "agreed": list(action_ids),
+        }
+        if len(action_ids) >= 2:
+            consensus["action_identifiers"] = action_ids
+            task, tier = asana_client.find_task(consensus, job_type=job_type)
+        else:
+            log.info("  ACTION TAKEN 沒有兩個獨立一致的識別碼，不作工作證據")
+
+    if task is None and not date_recheck_blocked:
         # The fixed program has already applied product, hospital and serial
         # gates.  Only a close top-two tie reaches the vision model, with at
         # most ten rows and no freedom to invent a table-external answer.
@@ -450,6 +884,7 @@ def _ocr_and_match(doc, job_type):
 
     metrics = nvidia_client.get_ocr_metrics()
     consensus["ocr_metrics"] = metrics
+    consensus["_date_recheck_blocked"] = date_recheck_blocked
     cost = metrics.get("estimated_cost_cny_upper")
     cost_text = f"，費用上限約 RMB {cost:.4f}" if cost is not None else ""
     log.info(
@@ -460,6 +895,112 @@ def _ocr_and_match(doc, job_type):
         return task, tier, consensus
     log.warning("  分格複核後仍沒有唯一可靠的 Asana 工作")
     return None, 0, consensus
+
+
+def _ocr_for_pending_review(doc) -> dict:
+    """Read identity and support only; the human has supplied ACTION DATE.
+
+    Do not run the automatic matcher or repeat its date/signature/probe OCR
+    loop. The supplied date is never shown to the image model.
+    """
+    nvidia_client.reset_ocr_metrics()
+    primary = nvidia_client.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_DEFAULT)
+    identity = nvidia_client.ocr_jobsheet_identity_fields(
+        doc, 0, zoom=config.OCR_IDENTITY_ZOOM
+    )
+    context_fields = os.environ.get(CONTEXT_FIELD_OCR_ENV) == "1"
+    if context_fields:
+        primary = {**primary, "product_raw": None, "hospital_raw": None}
+        identity = {**identity, "product_raw": None, "hospital_raw": None}
+    readings = [
+        {**primary, "_read_context": {"stage": "primary", "zoom": config.OCR_ZOOM_DEFAULT}},
+        {**identity, "_read_context": {"stage": "identity", "zoom": config.OCR_IDENTITY_ZOOM}},
+    ]
+    if context_fields:
+        vocabulary = private_ocr_context.build_vocabulary(asana_client._device_index)
+        for field in ("product_raw", "hospital_raw"):
+            for _ in range(2):
+                reading = nvidia_client.ocr_jobsheet_context_field(doc, 0, field, vocabulary)
+                readings.append({**reading, "_read_context": {
+                    "stage": "context_field", "zoom": 5.0, "field": field,
+                }})
+    consensus = _consensus_ocr(readings)
+    if context_fields and not all(consensus.get(field) for field in
+                                  ("product_raw", "hospital_raw")):
+        consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+        return consensus
+    # A complete phone helps verify a one-character Serial discrepancy. Read
+    # the support card once; it does not receive the human date or Asana task.
+    try:
+        support = nvidia_client.ocr_jobsheet_support_fields(
+            doc, 0, zoom=config.OCR_SUPPORT_ZOOM
+        )
+        readings.append({**support, "_read_context": {
+            "stage": "support", "zoom": config.OCR_SUPPORT_ZOOM,
+        }})
+        consensus = _consensus_ocr(readings)
+    except nvidia_client.NvidiaResponseError:
+        log.warning("  輔助欄暫時無法辨認，不以日期取代身分證據")
+    # A phone seen on only one broad card is useful to recheck, but not yet
+    # independent evidence. Two focused tries at most; only repeated reads
+    # can enter consensus. The human date and Asana data are not shown here.
+    if not consensus.get("phone_candidates") and any(
+            reading.get("phone_candidates") for reading in readings):
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "phone_candidates", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_phone", "zoom": zoom,
+                "field": "phone_candidates",
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get("phone_candidates"):
+                break
+    # A handwritten "Asset#" often sits in Dept./Room rather than a separate
+    # asset box. Re-read that visible panel only when a broad pass saw content
+    # there but no Asset reached two-pass consensus. A blank department does
+    # not justify extra calls, and one focused result still is not evidence.
+    # One final differently scaled read is allowed only if the first two
+    # disagree; all three see the source alone, never the Asana Asset.
+    if not consensus.get("asset_candidates") and any(
+            reading.get("department_room_raw") or reading.get("asset_candidates")
+            for reading in readings):
+        for zoom in (*config.OCR_FOCUSED_RETRY_ZOOMS, 5.5):
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, "department_room_raw", zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_asset_panel", "zoom": zoom,
+                "field": "department_room_raw",
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get("asset_candidates"):
+                break
+    for field in ("product_raw", "hospital_raw", "serial_candidates"):
+        if consensus.get(field) or (context_fields and field != "serial_candidates"):
+            continue
+        for zoom in config.OCR_FOCUSED_RETRY_ZOOMS:
+            try:
+                reading = nvidia_client.ocr_jobsheet_focused_field(
+                    doc, 0, field, zoom=zoom
+                )
+            except nvidia_client.NvidiaResponseError:
+                continue
+            readings.append({**reading, "_read_context": {
+                "stage": "focused_identity", "zoom": zoom, "field": field,
+            }})
+            consensus = _consensus_ocr(readings)
+            if consensus.get(field):
+                break
+    consensus["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+    return consensus
 
 
 def _parse_job_type(filename: str):
@@ -503,8 +1044,14 @@ def _save_result(work_dir: Path, manifest: dict, filename: str,
 def _process_split_file(filename: str, work_dir: Path,
                         source_folder: str = None,
                         dry_run: bool = False,
-                        confirmed_filename: str = "") -> dict:
+                        confirmed_filename: str = "",
+                        review_action_date: str = "",
+                        review_task: str = "") -> dict:
     source_folder = source_folder or config.GDRIVE_SPLIT
+    if (review_action_date or review_task) and (
+            not review_action_date or not dry_run or confirmed_filename
+            or source_folder != config.GDRIVE_PENDING):
+        raise ValueError("受控核對只能在 _PENDING 單檔只讀模式使用")
     remote = f"{source_folder}/{filename}"
     local = work_dir / filename
     rclone_helper.download(remote, local)
@@ -532,7 +1079,12 @@ def _process_split_file(filename: str, work_dir: Path,
     job_type = _parse_job_type(filename)
     try:
         with fitz.open(local) as doc:
-            task, tier, ocr = _ocr_and_match(doc, job_type)
+            if review_action_date and len(doc) != (4 if job_type == "PM" else 1 if job_type == "CM" else -1):
+                return {"status": "受控核對：頁數或工作類型不合格", "state": "pending"}
+            if review_action_date:
+                task, tier, ocr = None, 0, _ocr_for_pending_review(doc)
+            else:
+                task, tier, ocr = _ocr_and_match(doc, job_type)
     except nvidia_client.NvidiaResponseError as exc:
         if dry_run:
             local.unlink(missing_ok=True)
@@ -564,16 +1116,39 @@ def _process_split_file(filename: str, work_dir: Path,
             "status": "等待自動重試", "state": "retryable", "attempts": attempts,
         }
 
+    if review_action_date:
+        # This branch is reachable only with dry_run=true (checked in main).
+        # It is deliberately before the ordinary upload branch. A human date
+        # or task choice may not bypass device, visit and live-Asana checks.
+        reviewed = pending_review.review_ocr(
+            ocr, job_type, review_action_date, review_task
+        )
+        if reviewed["status"] != "READY_READ_ONLY":
+            local.unlink(missing_ok=True)
+            message = pending_review.REASON_MESSAGES.get(reviewed["reason"], "證據不足")
+            return {"status": f"受控核對：{message}；仍待確認", "reason": reviewed["reason"],
+                    "candidate_count": reviewed.get("candidate_count")}
+        planned, _ = _planned_filename(reviewed["task"])
+        proof = selection_audit.receipt(
+            local, task_gid=str(reviewed["task"].get("gid") or ""), filename=planned,
+        )
+        local.unlink(missing_ok=True)
+        return {"status": "受控核對：只讀通過，尚未上傳", "planned": planned,
+                "selection_receipt": proof,
+                "ocr_metrics": ocr.get("ocr_metrics", {})}
+
     if task is not None:
         log.info(f"  Asana 第 {tier} 層命中")
         planned, order_no = _planned_filename(task)
         if dry_run:
+            proof = selection_audit.receipt(local, task_gid=str(task.get("gid") or ""), filename=planned)
             local.unlink(missing_ok=True)
             return {
                 "status": "預覽：可以可靠配對",
                 "planned": planned,
                 "order_no": order_no or None,
                 "asana_task_gid": task.get("gid"),
+                "selection_receipt": proof,
                 "tier": tier,
                 "ocr_preview": _dry_run_ocr_preview(ocr),
                 "ocr_metrics": ocr.get("ocr_metrics", {}),
@@ -581,30 +1156,51 @@ def _process_split_file(filename: str, work_dir: Path,
         result = _finalize_match(local, task, tier, filename)
         result["ocr_metrics"] = ocr.get("ocr_metrics", {})
     else:
-        # 名稱未確認時絕不把猜測結果送到正式 OneDrive。保留完整 PDF 在私人
-        # Google Drive，之後可人工核對或用改良後的 matcher 重試。
-        log.warning("  ⚠ 多輪核對仍不確定 → 留在 Google Drive _PENDING")
-        if dry_run:
-            local.unlink(missing_ok=True)
-            return {
-                "status": "預覽：證據不足，會留待人工核對",
-                "ocr_preview": _dry_run_ocr_preview(ocr),
-                "ocr_metrics": ocr.get("ocr_metrics", {}),
-            }
-        if source_folder == config.GDRIVE_PENDING:
-            pending_name = filename
+        # A generic device name is permitted only for *genuinely competing*
+        # live visits on one exact device.  A mere missing candidate or bad OCR
+        # remains pending.  No guessed task or order number is attached.
+        neutral = asana_client.neutral_name_for_ambiguous_visit(ocr, job_type)
+        if neutral:
+            if dry_run:
+                proof = selection_audit.receipt(
+                    local, task_gid="DEVICE_ONLY", filename=neutral,
+                )
+                local.unlink(missing_ok=True)
+                return {
+                    "status": "預覽：設備已確認，工作未唯一確認；撞名時會加類型後綴",
+                    "planned": neutral, "selection_receipt": proof,
+                    "device_only": True,
+                    "ocr_preview": _dry_run_ocr_preview(ocr),
+                    "ocr_metrics": ocr.get("ocr_metrics", {}),
+                }
+            result = _finalize_neutral_device(local, neutral, job_type, filename)
+            result["ocr_metrics"] = ocr.get("ocr_metrics", {})
+            # Continue through the shared durable-state/cleanup path below.
         else:
-            pending_name = _move_to_pending_unique(local, remote, filename)
-        result = {
-            "status": "等待人工核對", "state": "pending", "pending": pending_name,
-        }
-        manifest = _manifest_for_job(work_dir, filename)
-        _save_result(
-            work_dir, manifest, filename, "pending", reason="Asana 配對證據不足",
-            pending=pending_name, ocr_metrics=ocr.get("ocr_metrics", {}),
-        )
-        local.unlink(missing_ok=True)
-        return result
+            # 名稱未確認時絕不把猜測結果送到正式 OneDrive。保留完整 PDF 在私人
+            # Google Drive，之後可人工核對或用改良後的 matcher 重試。
+            log.warning("  ⚠ 多輪核對仍不確定 → 留在 Google Drive _PENDING")
+            if dry_run:
+                local.unlink(missing_ok=True)
+                return {
+                    "status": "預覽：證據不足，會留待人工核對",
+                    "ocr_preview": _dry_run_ocr_preview(ocr),
+                    "ocr_metrics": ocr.get("ocr_metrics", {}),
+                }
+            if source_folder == config.GDRIVE_PENDING:
+                pending_name = filename
+            else:
+                pending_name = _move_to_pending_unique(local, remote, filename)
+            result = {
+                "status": "等待人工核對", "state": "pending", "pending": pending_name,
+            }
+            manifest = _manifest_for_job(work_dir, filename)
+            _save_result(
+                work_dir, manifest, filename, "pending", reason="Asana 配對證據不足",
+                pending=pending_name, ocr_metrics=ocr.get("ocr_metrics", {}),
+            )
+            local.unlink(missing_ok=True)
+            return result
 
     manifest = _manifest_for_job(work_dir, filename)
     _save_result(
@@ -655,42 +1251,62 @@ def main() -> int:
         source_folder = (
             config.GDRIVE_PENDING if source_queue == "pending" else config.GDRIVE_SPLIT
         )
-        splits = rclone_helper.list_pdfs(source_folder, exclude_subdirs=True)
-        log.info(f"{source_queue.upper()} 待處理 job 數：{len(splits)}")
         target = os.environ.get(TARGET_FILE_ENV, "").strip()
         dry_run = os.environ.get(DRY_RUN_ENV, "").strip().lower() in {"1", "true", "yes"}
         confirmed_filename = os.environ.get(CONFIRMED_FILENAME_ENV, "").strip()
+        review_action_date = os.environ.get(REVIEW_ACTION_DATE_ENV, "").strip()
+        review_task = os.environ.get(REVIEW_TASK_ENV, "").strip()
+        if review_action_date or review_task:
+            if not review_action_date or not target or not dry_run or confirmed_filename \
+                    or source_queue != "pending" or not index_path:
+                log.error("受控核對只接受 _PENDING 的指定單檔、日期及 dry_run=true；不可指定檔名")
+                return 1
+            try:
+                pending_review.parse_review_date(review_action_date)
+                pending_review.parse_task_gid(review_task)
+            except ValueError as exc:
+                log.error("受控核對輸入無效：%s", exc)
+                return 1
         if dry_run and not target:
             log.error("dry-run 必須精確指定一份 jobsheet_file，沒有處理任何檔案")
             return 1
         if confirmed_filename and not target:
             log.error("人工確認檔名必須精確指定一份 jobsheet_file")
             return 1
+        if target and (re.search(r"[\\/]", target) or Path(target).name != target
+                       or Path(target).suffix.lower() != ".pdf"):
+            log.error("指定的測試檔名不安全，只接受資料夾內的單一 PDF 檔名")
+            return 1
+        splits = rclone_helper.list_pdfs(source_folder, exclude_subdirs=True)
+        log.info(f"{source_queue.upper()} 待處理 job 數：{len(splits)}")
         if target:
             # 手動測試時必須精確指定 _SPLIT 根目錄內的一個 PDF；不接受
             # 路徑或模糊名稱，避免誤處理同一批其他工作單。
-            if Path(target).name != target or Path(target).suffix.lower() != ".pdf":
-                log.error("指定的測試檔名不安全，只接受 _SPLIT 內的單一 PDF 檔名")
-                return 1
             if target not in splits:
-                log.error("指定的測試工作單目前不在 _SPLIT，沒有處理任何檔案")
+                log.error("指定的測試工作單目前不在指定資料夾，沒有處理任何檔案")
                 return 1
             splits = [target]
-            log.info(f"單檔安全模式：本次只處理 {target}")
+            log.info("單檔安全模式：本次只處理一份" if review_action_date
+                     else f"單檔安全模式：本次只處理 {target}")
         main_report = []
         had_processing_error = False
         for filename in splits:
-            log.info(f"=== 處理 {filename} ===")
+            log.info("=== 受控核對單一工作單 ===" if review_action_date
+                     else f"=== 處理 {filename} ===")
             try:
                 main_report.append({
                     "file": filename,
                     **_process_split_file(
                         filename, work_dir, source_folder=source_folder, dry_run=dry_run,
                         confirmed_filename=confirmed_filename,
+                        review_action_date=review_action_date, review_task=review_task,
                     ),
                 })
             except Exception as e:
-                log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
+                if review_action_date:
+                    log.exception("  受控核對失敗；Google Drive 來源保持原狀")
+                else:
+                    log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
                 main_report.append({"file": filename, "status": "處理錯誤", "error": str(e)})
                 had_processing_error = True
 
@@ -709,6 +1325,9 @@ def main() -> int:
             details.append(f"預計檔名={public_planned}")
         if row.get("ocr_preview"):
             details.append(f"OCR={row['ocr_preview']}")
+        if dry_run and row.get("selection_receipt"):
+            proof = row["selection_receipt"]
+            details.append(f"核對碼：工作={proof['task']}、檔名={proof['filename']}")
         if row.get("ocr_metrics"):
             metrics = row["ocr_metrics"]
             metric_text = (
@@ -722,21 +1341,23 @@ def main() -> int:
                     f"{metrics['estimated_cost_cny_upper']:.4f}"
                 )
             details.append(metric_text)
-        log.info(f"  {row.get('file')}：{'；'.join(details)}")
+        log.info(f"  {'單份受控核對' if review_action_date else row.get('file')}：{'；'.join(details)}")
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:
         lines = [
             "## Jobsheet 處理報告", "",
-            "| 檔案 | 結果 | 預計檔名 | OCR 核對欄位 |",
-            "|---|---|---|---|",
+            "| 檔案 | 結果 | 預計檔名 | OCR 核對欄位 | 工作核對碼 | 檔名核對碼 |",
+            "|---|---|---|---|---|---|",
         ]
         for row in main_report:
             public_planned = _public_planned_filename(row, dry_run)
             cells = (
-                row.get("file") or "",
+                "單份受控核對" if review_action_date else row.get("file") or "",
                 row.get("status") or "",
                 public_planned or "-",
                 row.get("ocr_preview") or "-",
+                (row.get("selection_receipt") or {}).get("task") or "-",
+                (row.get("selection_receipt") or {}).get("filename") or "-",
             )
             cells = tuple(str(value).replace("|", "\\|").replace("\n", " ")
                           for value in cells)

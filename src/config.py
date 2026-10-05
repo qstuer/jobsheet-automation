@@ -88,6 +88,8 @@ INDEX_SERIAL_MIN_SIMILARITY = 0.50
 INDEX_SERIAL_CLOSE_GAP = 0.10
 INDEX_VISION_CANDIDATE_LIMIT = 10
 INDEX_TASK_DATE_MAX_DAYS = 31
+# Asset 只加輔助分；編輯相似率以整數百分比四捨五入後比較。
+ASSET_MIN_SIMILARITY_PERCENT = 70
 
 # === OCR 設定（訂單、設備、醫院、電話、資產編號、日期）===
 OCR_ZOOM_DEFAULT  = 3.0   # 第一張分格欄位卡；不再把半頁表格原樣交給模型
@@ -110,6 +112,12 @@ OCR_FIELD_BOXES = {
     "service_date_raw": (0.555, 0.312, 0.735, 0.365),
     "fault_symptom":   (0.055, 0.245, 0.955, 0.315),
     "action_taken":    (0.055, 0.307, 0.555, 0.500),
+    # Customer sign-off may corroborate an ambiguous ACTION DATE; the engineer
+    # may have signed earlier. Neither signature replaces ACTION DATE alone.
+    "engineer_signed_date": (0.215, 0.930, 0.500, 0.980),
+    # Keep the handwritten date while excluding most of the hospital stamp;
+    # its high-contrast seal previously dominated this tiny OCR card.
+    "customer_signed_date": (0.760, 0.947, 0.960, 0.979),
 }
 # 單格複核只保留手寫值附近，避免印刷標籤與表格線佔去大部分像素。
 # 外層欄位卡仍會顯示可靠的欄位名稱，因此模型毋須靠原表格標籤猜欄位。
@@ -121,7 +129,9 @@ OCR_FOCUSED_FIELD_BOXES = {
     "contact_person_raw": (0.670, 0.166, 0.955, 0.207),
     "department_room_raw": (0.180, 0.198, 0.575, 0.242),
     "phone_candidates":  (0.670, 0.198, 0.955, 0.242),
-    "service_date_raw":   (0.555, 0.323, 0.735, 0.365),
+    # Handwritten dates can rise into the printed DATE heading. Starting at
+    # 0.323 clipped their upper loops; B08's ambiguous month must be retested.
+    "service_date_raw":   (0.555, 0.312, 0.735, 0.365),
 }
 OCR_PRIMARY_CARD_FIELDS = (
     "order_no", "product_raw", "serial_candidates", "hospital_raw",

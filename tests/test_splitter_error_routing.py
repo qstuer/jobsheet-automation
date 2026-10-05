@@ -289,6 +289,9 @@ class ProcessorPendingTests(unittest.TestCase):
                 patch.object(processor.rclone_helper, "download"), \
                 patch.object(processor.fitz, "open", fake_open), \
                 patch.object(processor, "_ocr_and_match", return_value=(task, 1, ocr)), \
+                patch.object(processor.selection_audit, "receipt", return_value={
+                    "task": "private-task-tag", "filename": "private-name-tag",
+                }), \
                 patch.object(processor.rclone_helper, "upload_unique") as upload, \
                 patch.object(processor.rclone_helper, "moveto") as move, \
                 patch.object(processor.rclone_helper, "delete") as delete, \
@@ -298,6 +301,7 @@ class ProcessorPendingTests(unittest.TestCase):
             )
         self.assertEqual("預覽：可以可靠配對", result["status"])
         self.assertEqual("SR#61932685.pdf", result["planned"])
+        self.assertEqual("private-name-tag", result["selection_receipt"]["filename"])
         self.assertIn("serial", result["ocr_preview"])
         self.assertIn("phone", result["ocr_preview"])
         self.assertNotIn("US123", result["ocr_preview"])

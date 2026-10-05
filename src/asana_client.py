@@ -32,6 +32,9 @@ KNOWN_PRODUCTS = [
 
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
+PRODUCT_GROUP_NAMES = {"EPIQ", "Affiniti", "CX"}
+# Confirmed spelling variant, not permission to invent a missing suffix.
+OCR_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G", *sorted(PRODUCT_GROUP_NAMES)]
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -41,41 +44,37 @@ _task_cache: dict = {}
 _device_index: Optional[dict] = None
 _INDEX_SCORE_EPSILON = 1e-9
 
-# 短大寫字串很容易由手寫 OCR 幻覺產生。只有已核對的醫院簡寫才可作搜尋
-# 與配對證據；完整的私人機構名稱仍可保留使用。
-HOSPITAL_ALIASES = {
-    **config.HOSPITAL_SHORT_ALIASES,
-    "QUEENMARYHOSPITAL": "QMH",
-    "QUEENELIZABETHHOSPITAL": "QEH",
-    "KWONGWAHHOSPITAL": "KWH",
-    "KOWLOONHOSPITAL": "KH",
-    "PAMELAYOUDENETHERSOLEEASTERNHOSPITAL": "PYNEH",
-    "PRINCESSMARGARETHOSPITAL": "PMH",
-    "HONGKONGCHILDRENSHOSPITAL": "HKCH",
-    "PRINCEOFWALESHOSPITAL": "PWH",
-    "UNITEDCHRISTIANHOSPITAL": "UCH",
-    "TUENMUNHOSPITAL": "TMH",
-    "NORTHDISTRICTHOSPITAL": "NDH",
-    "GRANTHAMHOSPITAL": "GH",
-    # 保留空格供 Asana typeahead 作真正的子字串搜尋；比較時仍會經 _norm。
-    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
-}
+# Only confirmed short codes are public configuration. Full customer/site names
+# come from the private Drive index at runtime, never from repository literals.
+HOSPITAL_ALIASES = dict(config.HOSPITAL_SHORT_ALIASES)
 
-HOSPITAL_OFFICIAL_NAMES = {
-    "QMH": "Queen Mary Hospital",
-    "QEH": "Queen Elizabeth Hospital",
-    "KWH": "Kwong Wah Hospital",
-    "KH": "Kowloon Hospital",
-    "PYNEH": "Pamela Youde Nethersole Eastern Hospital",
-    "PMH": "Princess Margaret Hospital",
-    "HKCH": "Hong Kong Children's Hospital",
-    "PWH": "Prince of Wales Hospital",
-    "UCH": "United Christian Hospital",
-    "TMH": "Tuen Mun Hospital",
-    "NDH": "North District Hospital",
-    "GH": "Grantham Hospital",
-    "TUNGWAHHOSPITAL": "Tung Wah Hospital",
-}
+
+def indexed_short_site_code(value: str) -> bool:
+    """A repeated private code is plausible text, not a confirmed hospital.
+
+    The location directory deliberately keeps unconfirmed abbreviations apart
+    from verified aliases.  Seeing a code on two distinct serials is enough
+    to retain the OCR transcription for cross-checking, never enough to merge
+    it with a full hospital name or grant hospital-match points.
+    """
+    code = _norm(value)
+    if not re.fullmatch(r"[A-Z]{2,6}", code):
+        return False
+    if code in {"PN", "KWM", "PYTV"}:
+        # Previously observed OCR inventions are never promoted by frequency.
+        return False
+    for group in (_device_index or {}).get("location_directory") or []:
+        if int(group.get("device_count") or 0) < 2:
+            continue
+        names = [
+            group.get("canonical_hospital") or "",
+            *(group.get("confirmed_aliases") or []),
+            *(group.get("learned_aliases") or []),
+            *(group.get("unconfirmed_aliases") or []),
+        ]
+        if code in {_norm(name) for name in names if name}:
+            return True
+    return False
 
 
 class AsanaError(RuntimeError):
@@ -121,16 +120,30 @@ def _lev(a: str, b: str) -> int:
 
 
 def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
-    """把 OCR 型號對照已知清單校正（EPLQ 5G → EPIQ 5G）。太離譜則原樣回傳。"""
+    """Only normalize unambiguous spellings; never invent model digits/suffixes."""
     if not ocr_product:
         return None
-    target = _norm(ocr_product)
-    best, best_d = None, 99
-    for p in KNOWN_PRODUCTS:
-        d = _lev(target, _norm(p))
-        if d < best_d:
-            best_d, best = d, p
-    return best if best_d <= MAX_PRODUCT_DIST else ocr_product
+    # Keep '+' meaningful (the general evidence normalizer drops punctuation).
+    def key(value):
+        return re.sub(r"[^A-Z0-9+]", "", value.upper())
+    target = key(ocr_product)
+    if target == "EPIQ7PLUS":
+        return "EPIQ 7+"
+    exact = [p for p in OCR_PRODUCT_NAMES if key(p) == target]
+    if exact:
+        return exact[0]
+    # A broad family is useful evidence in its own right, not a blank model.
+    # Typo correction must preserve all observed model numbers and '+' signs.
+    candidates = [p for p in OCR_PRODUCT_NAMES
+                  if re.findall(r"\d+", key(p)) == re.findall(r"\d+", target)
+                  and ("+" in key(p)) == ("+" in target)
+                  and (not re.search(r"\d", target)
+                       or re.split(r"\d+", key(p))[-1] == re.split(r"\d+", target)[-1])]
+    distances = [(p, _lev(target, key(p))) for p in candidates]
+    best_d = min((d for _, d in distances), default=99)
+    best = [p for p, d in distances if d == best_d]
+    # Very short tokens are too ambiguous to correct by edit distance.
+    return best[0] if len(target) >= 4 and best_d <= MAX_PRODUCT_DIST and len(best) == 1 else ocr_product
 
 
 def product_family(value: Optional[str]) -> Optional[str]:
@@ -142,26 +155,8 @@ def product_family(value: Optional[str]) -> Optional[str]:
     """
     if not value:
         return None
-    def family_key(raw: str) -> str:
-        normalized = _norm(raw)
-        if normalized.startswith("AFFINITI"):
-            normalized = re.sub(r"G$", "", normalized)
-        # Engineers use both the printed ``EPIQ 7+`` and the written
-        # ``EPIQ 7 Plus``.  They are one product family; raw spellings remain
-        # in the private index for audit.
-        if normalized.startswith("EPIQ"):
-            normalized = re.sub(r"PLUS$", "", normalized)
-        return normalized
-
-    normalized = family_key(value)
-    best = None
-    best_distance = 99
-    for known in KNOWN_PRODUCTS:
-        family_norm = family_key(known)
-        distance = _lev(normalized, family_norm)
-        if distance < best_distance:
-            best, best_distance = known, distance
-    return best if best_distance <= MAX_PRODUCT_DIST else normalize_product(value)
+    canonical = normalize_product(value)
+    return "Affiniti 70" if canonical == "Affiniti 70G" else canonical
 
 
 def product_group(value: Optional[str]) -> Optional[str]:
@@ -200,6 +195,46 @@ def hospital_acronym(value: Optional[str]) -> Optional[str]:
     return acronym if 2 <= len(acronym) <= 8 else None
 
 
+def _private_hospital_aliases() -> dict[str, str]:
+    """Return verified aliases from the in-memory private location directory.
+
+    An unconfirmed short code or a mere shared-device history must not become
+    an alias. Do not cache this mapping: tests and one-shot runs replace the
+    private index in the same Python process.
+    """
+    mapping = {}
+    ambiguous = set()
+    if not _device_index:
+        return mapping
+    for group in _device_index.get("location_directory") or []:
+        if not group.get("match_enabled"):
+            continue
+        names = [
+            group.get("canonical_hospital") or "",
+            *(group.get("confirmed_aliases") or []),
+            *(group.get("learned_aliases") or []),
+        ]
+        short_codes = {
+            config.HOSPITAL_SHORT_ALIASES[name.upper()]
+            for name in names
+            if name.upper() in config.HOSPITAL_SHORT_ALIASES
+        }
+        canonical = (sorted(short_codes)[0] if len(short_codes) == 1
+                     else group.get("canonical_hospital") or "")
+        if not canonical:
+            continue
+        for name in names:
+            if name:
+                key = _norm(name)
+                if key in mapping and mapping[key] != canonical:
+                    ambiguous.add(key)
+                else:
+                    mapping[key] = canonical
+    for key in ambiguous:
+        mapping.pop(key, None)
+    return mapping
+
+
 def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
     """Separate hospital identity from status tags and floor/room suffixes.
 
@@ -223,8 +258,8 @@ def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
         detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
         core = match.group("hospital").strip()
     else:
-        # ``QMH K3``, ``TKO MB-G-A`` and ``HKAH(Stubbs Road)`` are a short
-        # hospital code followed by in-hospital detail.  Requiring the code to
+        # An uppercase site code followed by room detail is a different field.
+        # Requiring the code to
         # be uppercase avoids splitting ordinary full names at their first word.
         match = re.match(
             r"^(?P<hospital>[A-Z]{2,8})(?:(?:\s+)|(?=\())(?P<detail>.+)$",
@@ -242,7 +277,7 @@ def hospital_aliases(value: Optional[str]) -> List[str]:
     if not core:
         return []
     canonical = hospital_core(core)
-    # Unknown short codes are the most common OCR hallucination (PN/KWM/PYTV).
+    # Unknown short codes are a common OCR hallucination.
     # They must not pass the 33% fuzzy hospital gate.
     if re.fullmatch(r"[A-Za-z]{2,6}", core) and not canonical:
         return []
@@ -262,6 +297,7 @@ def _index_hospital_aliases(value: Optional[str]) -> List[str]:
     observed = _norm(core)
     if not observed or _device_index is None:
         return aliases
+    matching_groups = []
     for group in _device_index.get("location_directory") or []:
         if not group.get("match_enabled"):
             continue
@@ -271,7 +307,9 @@ def _index_hospital_aliases(value: Optional[str]) -> List[str]:
             *(group.get("learned_aliases") or []),
         ]
         if observed in {_norm(item) for item in known if item}:
-            return list(dict.fromkeys([*aliases, *known]))
+            matching_groups.append(known)
+    if len(matching_groups) == 1:
+        return list(dict.fromkeys([*aliases, *matching_groups[0]]))
     return aliases
 
 
@@ -280,19 +318,24 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     if not customer:
         return None
     core = re.split(r"[,/\-]", customer.strip(), 1)[0].strip()
-    canonical = HOSPITAL_ALIASES.get(_norm(core))
+    normalized = _norm(core)
+    canonical = HOSPITAL_ALIASES.get(normalized)
     if canonical:
         return canonical
-    # KWM / PYTV 這類未知短碼不得成為候選搜尋或加分依據。
+    private_aliases = _private_hospital_aliases()
+    if normalized in private_aliases:
+        return private_aliases[normalized]
+    # 未確認的短碼不得成為候選搜尋或加分依據。
     if re.fullmatch(r"[A-Za-z]{2,6}", core):
         return None
 
-    # 完整醫院名可能有極少量抄寫誤差，例如 Tong Nah Hospital。只在它與
-    # 已確認清單中的某一個完整名稱相差最多兩字、而且最近答案唯一時校正。
-    # 這一步只在程式內做；候選名不會交給視覺模型，避免模型迎合答案。
-    normalized = _norm(core)
+    # A complete name can imply a known acronym without a hardcoded name.
+    # Fuzzy correction, however, requires the private confirmed directory.
+    acronym = hospital_acronym(core)
+    if acronym in config.HOSPITAL_SHORT_ALIASES.values():
+        return acronym
     full_names = {
-        raw: value for raw, value in HOSPITAL_ALIASES.items()
+        raw: value for raw, value in private_aliases.items()
         if len(raw) >= 10
     }
     distances = sorted(
@@ -315,7 +358,20 @@ def hospital_search_terms(canonical: Optional[str]) -> List[str]:
         raw for raw, value in config.HOSPITAL_SHORT_ALIASES.items()
         if value == canonical
     ]
-    return list(dict.fromkeys([canonical, *aliases]))
+    # Full spellings are only supplied by the private index. They are useful
+    # for Asana typeahead when the task title uses a full name instead of code.
+    private = [
+        name for group in (_device_index or {}).get("location_directory") or []
+        if group.get("match_enabled")
+        and _norm(canonical) in {
+            _norm(group.get("canonical_hospital") or ""),
+            *(_norm(value) for value in group.get("confirmed_aliases") or []),
+            *(_norm(value) for value in group.get("learned_aliases") or []),
+        }
+        for name in [group.get("canonical_hospital") or ""]
+        if name
+    ]
+    return list(dict.fromkeys([canonical, *aliases, *private]))
 
 
 def extract_serial(name: str) -> Optional[str]:
@@ -539,6 +595,36 @@ def _digit_distance(left: str, right: str) -> int:
     return _lev(re.sub(r"\D", "", left), re.sub(r"\D", "", right))
 
 
+def _asset_similarity_percent(left: str, right: str) -> int:
+    """Digit edit similarity, rounded half-up; absent/short IDs add nothing."""
+    left = re.sub(r"\D", "", str(left or ""))
+    right = re.sub(r"\D", "", str(right or ""))
+    if min(len(left), len(right)) < 4:
+        return 0
+    length = max(len(left), len(right))
+    matched = length - _lev(left, right)
+    # Integer arithmetic avoids float boundaries and Python's bankers' round.
+    return (200 * matched + length) // (2 * length)
+
+
+def _asset_match_level(wanted, stored) -> int:
+    """0=no bonus, 1=fuzzy bonus, 2=exact bonus; never a negative score.
+
+    Use the best pair once, not one bonus per repeated/historical value.
+    Rounded 100% is not necessarily an exact identifier.
+    """
+    lefts = {re.sub(r"\D", "", str(value or "")) for value in (wanted or [])}
+    rights = {re.sub(r"\D", "", str(value or "")) for value in (stored or [])}
+    lefts = {value for value in lefts if len(value) >= 4}
+    rights = {value for value in rights if len(value) >= 4}
+    if lefts & rights:
+        return 2
+    if any(_asset_similarity_percent(left, right) >= config.ASSET_MIN_SIMILARITY_PERCENT
+           for left in lefts for right in rights):
+        return 1
+    return 0
+
+
 def _key_similarity(left: Optional[str], right: Optional[str]) -> float:
     left_key, right_key = _norm(left), _norm(right)
     if not left_key or not right_key:
@@ -637,11 +723,8 @@ def _score_index_device(row: dict, ocr_data: dict,
         (_digit_distance(left, right) for left in wanted_phones for right in row_phones
          if 7 <= len(left) <= 9 and 7 <= len(right) <= 9), default=99,
     )
-    wanted_assets = [re.sub(r"\D", "", value) for value in ocr_data.get("asset_candidates") or []]
-    row_assets = [re.sub(r"\D", "", value) for value in row.get("assets") or []]
-    asset_dist = min(
-        (_digit_distance(left, right) for left in wanted_assets for right in row_assets
-         if len(left) >= 4 and len(right) >= 4), default=99,
+    asset_level = _asset_match_level(
+        ocr_data.get("asset_candidates"), row.get("assets"),
     )
     contact_similarity = max(
         (_similarity(ocr_data.get("contact_person_raw"), value)
@@ -658,9 +741,9 @@ def _score_index_device(row: dict, ocr_data: dict,
         support.add("phone_exact")
     elif phone_dist == 1:
         support.add("phone_fuzzy")
-    if asset_dist == 0:
+    if asset_level == 2:
         support.add("asset_exact")
-    elif asset_dist == 1:
+    elif asset_level == 1:
         support.add("asset_fuzzy")
     if contact_similarity >= 0.75:
         support.add("contact")
@@ -670,12 +753,28 @@ def _score_index_device(row: dict, ocr_data: dict,
         and hospital_similarity >= config.INDEX_HOSPITAL_MIN_SIMILARITY
         and (not serials or serial_similarity >= config.INDEX_SERIAL_MIN_SIMILARITY)
     )
+    # A blank or unconfirmed hospital transcription must not erase an otherwise
+    # identifiable device.  This *retrieves a candidate*, not permission to
+    # upload: the live task must still pass type, date and visit-specific
+    # contact/phone checks below.  Without hospital evidence we use a much
+    # narrower serial/product/phone gate than the ordinary fuzzy search.
+    eligible_without_hospital = (
+        not row.get("weak_identity")
+        and not wanted_hospitals
+        and bool(serials)
+        and product_similarity == 1.0
+        and serial_dist <= 1
+        and phone_dist == 0
+        and (serial_dist == 0 or contact_similarity >= 0.75 or asset_level == 2)
+    )
     auxiliary = (
-        (1 if phone_dist == 0 else 0), (1 if asset_dist == 0 else 0),
+        (1 if phone_dist == 0 else 0), asset_level,
         hospital_similarity, product_similarity, contact_similarity,
     )
     return {
-        "row": row, "eligible": eligible, "serial_similarity": serial_similarity,
+        "row": row, "eligible": eligible,
+        "eligible_without_hospital": eligible_without_hospital,
+        "serial_similarity": serial_similarity,
         "serial_dist": serial_dist, "product_similarity": product_similarity,
         "hospital_similarity": hospital_similarity, "support": support,
         "auxiliary": auxiliary,
@@ -692,7 +791,7 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
     if job_type and ref_type == job_type:
         score += 20
     service_date = (
-        _parse_date(ocr_data.get("service_date_raw"))
+        _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
         if ocr_data.get("date_source") == "ACTION_DATE" else None
     )
     dates = _index_dates(ref)
@@ -701,8 +800,11 @@ def _score_index_task_ref(ref: dict, ocr_data: dict,
         if delta > config.INDEX_TASK_DATE_MAX_DAYS:
             return -1000
         score += 30 if delta <= 3 else 20 if delta <= 14 else 10
-    for field, points in (("phones", 25), ("assets", 20)):
-        wanted_key = "phone_candidates" if field == "phones" else "asset_candidates"
+    # Asset is a bonus only and uses the same 70% rule at all three layers.
+    asset_level = _asset_match_level(ocr_data.get("asset_candidates"), ref.get("assets"))
+    score += 20 if asset_level == 2 else 10 if asset_level == 1 else 0
+    for field, points in (("phones", 25),):
+        wanted_key = "phone_candidates"
         wanted = [re.sub(r"\D", "", value) for value in ocr_data.get(wanted_key) or []]
         stored = [re.sub(r"\D", "", value) for value in ref.get(field) or []]
         if any(left and left == right for left in wanted for right in stored):
@@ -751,7 +853,7 @@ def _select_date_joint_device(scored: List[dict], ocr_data: dict,
     """
     if job_type not in {"PM", "CM"} or ocr_data.get("date_source") != "ACTION_DATE":
         return None, False
-    service_date = _parse_date(ocr_data.get("service_date_raw"))
+    service_date = _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
     serials = ocr_data.get("_index_serials") or _clean_candidates(
         ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
     )
@@ -823,7 +925,9 @@ def _select_date_joint_device(scored: List[dict], ocr_data: dict,
 
 def _filter_ranked_device_scores(scored: List[dict], serials_visible: bool) -> List[dict]:
     """Apply shared safety gates and ordering to a pre-scored device table."""
-    scored = [item for item in scored if item["eligible"]]
+    scored = [item for item in scored if (
+        item["eligible"] or item.get("eligible_without_hospital")
+    )]
     if not serials_visible:
         # Without serial, all four independent facts must be exact and unique.
         scored = [item for item in scored if (
@@ -892,14 +996,16 @@ def get_close_index_candidates(ocr_data: dict, job_type: Optional[str] = None) -
 
 
 def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
-                       selected_device_key: Optional[str] = None) -> tuple[List[dict], bool]:
+                       selected_device_key: Optional[str] = None) -> tuple[List[dict], bool, bool]:
     """Choose one device, then hydrate its historical tasks from live Asana.
 
-    The boolean distinguishes a genuine index miss (safe to use typeahead) from
-    ambiguous indexed candidates (must stay pending instead of broadening).
+    The first boolean distinguishes a genuine index miss from ambiguous indexed
+    candidates. The second records repeated same-type visits *before* date
+    filtering, so a wrong OCR date cannot hide an older visit from the final
+    safety check.
     """
     if _device_index is None:
-        return [], False
+        return [], False, False
     prepared = _prepare_index_query(ocr_data)
     raw_scores = [
         _score_index_device(row, prepared, job_type)
@@ -909,10 +1015,11 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         raw_scores, prepared, job_type
     )
     if joint_ambiguous:
-        return [], True
+        return [], True, False
     had_prefilter = any(
-        item["product_similarity"] >= config.INDEX_PRODUCT_MIN_SIMILARITY
-        and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY
+        (item["product_similarity"] >= config.INDEX_PRODUCT_MIN_SIMILARITY
+         and item["hospital_similarity"] >= config.INDEX_HOSPITAL_MIN_SIMILARITY)
+        or item.get("eligible_without_hospital")
         for item in raw_scores
     )
     # Reuse the same safety filter as public candidate inspection without
@@ -921,7 +1028,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         raw_scores, bool(prepared.get("_index_serials"))
     )
     if not scored:
-        return [], had_prefilter
+        return [], had_prefilter, False
     for rank, item in enumerate(scored[:3], 1):
         log.info(
             "  設備候選 #%s：serial相似=%s%%、產品=%s%%、醫院=%s%%、證據=%s",
@@ -943,10 +1050,12 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
         )
         if selected is None:
             log.warning("  視覺複核選擇不在安全候選內，停止配對")
-            return [], True
+            return [], True, False
         best = selected
     else:
         best = scored[0]
+    if best.get("eligible_without_hospital") and not best["eligible"]:
+        ocr_data["_index_missing_hospital_fallback"] = True
     serials_visible = bool(
         ocr_data.get("serial_candidates") or ocr_data.get("serial_visual_candidates")
         or ocr_data.get("serial_no")
@@ -963,9 +1072,26 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
             "  設備索引前兩名只相差 %s 個百分點，需要一次候選複核",
             round(gap * 100),
         )
-        return [], True
+        return [], True, False
 
     refs = list(best["row"].get("task_refs") or [])
+    service_date = (
+        _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
+        if ocr_data.get("date_source") == "ACTION_DATE" else None
+    )
+
+    def plausible_repeat(ref: dict) -> bool:
+        if job_type and ref.get("job_type") not in (None, job_type):
+            return False
+        formal_dates = _formal_index_ref_dates(ref)
+        return not service_date or not formal_dates or min(
+            abs((day - service_date).days) for day in formal_dates
+        ) <= 93
+
+    repeated_same_type = len({
+        str(ref.get("gid")) for ref in refs
+        if ref.get("gid") and plausible_repeat(ref)
+    }) > 1
     refs.sort(key=lambda ref: _score_index_task_ref(ref, ocr_data, job_type), reverse=True)
     gids = []
     for ref in refs:
@@ -977,7 +1103,7 @@ def _gather_index_pool(ocr_data: dict, job_type: Optional[str],
     gids = gids[:config.ASANA_MAX_HYDRATED_CANDIDATES]
     hydrated = [_fetch_task(gid) for gid in gids]
     log.info("  已鎖定一部設備，並即時讀取 %s 個歷史 Asana task", len(hydrated))
-    return hydrated, True
+    return hydrated, True, repeated_same_type
 
 
 def _clean_candidates(values, fallback=None) -> List[str]:
@@ -1026,9 +1152,14 @@ def _task_dates(task: dict) -> List[date]:
     """只回傳可能代表實際服務日的日期。
 
     modified_at 會因改名、留言或欄位更新而變，不可用來證明服務日期；
-    created/completed 只在另一個 helper 作很弱的排序，不算交叉證據。
+    正式到期／完成日優先；描述中的舊保養日期只在兩者皆無時後備。
     """
-    values = [task.get("due_on"), task.get("start_on")]
+    formal = [task.get("due_on"), task.get("completed_at")]
+    parsed_formal = [_parse_date(value) for value in formal if value]
+    parsed_formal = list(dict.fromkeys(value for value in parsed_formal if value))
+    if parsed_formal:
+        return parsed_formal
+    values = [task.get("start_on")]
     notes = task.get("notes") or ""
     values.extend(re.findall(r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|"
                              r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b", notes))
@@ -1120,7 +1251,7 @@ def _task_contacts(task: dict) -> List[str]:
                          flags=re.IGNORECASE)[0].strip(" .,:;-")
         if sum(char.isalpha() for char in value) >= 2:
             contacts.append(value)
-    # PM 工作常直接寫成 ``25956917 Ms.Yan``，沒有 Contact 標籤。
+    # A task may contain an unlabeled phone followed by a contact name.
     # 電話只用來定位同一行；人名仍獨立保存和低權重比較。
     for value in re.findall(
         r"(?im)(?:\+?852[ -]?)?\d{4}[ -]?\d{4}\s+"
@@ -1189,6 +1320,22 @@ def _task_work_orders(task: dict) -> List[str]:
     return list(dict.fromkeys(values))
 
 
+def _action_id_key(value: str) -> str:
+    if "?" in value:
+        return ""
+    token = re.sub(r"[^A-Z0-9]", "", value.upper())
+    return token if (5 <= len(token) <= 18
+                     and any(ch.isalpha() for ch in token)
+                     and any(ch.isdigit() for ch in token)) else ""
+
+
+def _task_action_ids(task: dict) -> set[str]:
+    # Notes are read live from Asana; task titles and indexed aggregate fields
+    # are not used as evidence of what happened on this particular visit.
+    tokens = re.findall(r"[A-Z0-9][A-Z0-9./_-]*", (task.get("notes") or "").upper())
+    return {key for value in tokens if (key := _action_id_key(value))}
+
+
 def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                      hosp: Optional[str], product: Optional[str],
                      job_type: Optional[str] = None) -> dict:
@@ -1240,21 +1387,15 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         support.add("phone_fuzzy")
         reasons.append("phone differs by 1")
 
-    assets = [re.sub(r"\D", "", value)
-              for value in ocr_data.get("asset_candidates", [])]
-    task_assets = _task_assets(task)
-    if any(len(value) >= 4 and value == candidate
-           for value in assets for candidate in task_assets):
+    asset_level = _asset_match_level(ocr_data.get("asset_candidates"), _task_assets(task))
+    if asset_level == 2:
         score += 35
         support.add("asset_exact")
         reasons.append("asset")
-    elif any(
-        len(value) >= 4 and len(candidate) >= 4 and _lev(value, candidate) == 1
-        for value in assets for candidate in task_assets
-    ):
+    elif asset_level == 1:
         score += 15
         support.add("asset_fuzzy")
-        reasons.append("asset differs by 1")
+        reasons.append("asset similarity bonus")
 
     work_orders = [re.sub(r"\D", "", value)
                    for value in ocr_data.get("work_order_candidates", [])]
@@ -1264,6 +1405,18 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
         score += 60
         support.add("work_order")
         reasons.append("HAWO/WO")
+
+    # Only the isolated backtest supplies these two-pass ACTION TAKEN codes.
+    # Require two distinct exact tokens from this specific task's live notes;
+    # a shared machine identifier or a lone OCR mistake cannot decide a visit.
+    action_ids = {_action_id_key(value)
+                  for value in (ocr_data.get("action_identifiers") or [])}
+    action_ids.discard("")
+    action_ids -= {_action_id_key(value) for value in serials}
+    if len(action_ids & _task_action_ids(task)) >= 2:
+        score += 50
+        support.add("action_codes")
+        reasons.append("ACTION TAKEN identifiers")
 
     hospital_ok = bool(
         hosp and _norm(hospital_core(name)) == _norm(hosp)
@@ -1308,7 +1461,7 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
 
     service_date = None
     if ocr_data.get("date_source") == "ACTION_DATE":
-        service_date = _parse_date(ocr_data.get("service_date_raw"))
+        service_date = _parse_date(ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw"))
     task_dates = _task_dates(task)
     date_delta = None
     date_year_corrected = False
@@ -1323,7 +1476,11 @@ def _candidate_score(task: dict, ocr_data: dict, serials: List[str],
                 "date_delta": date_delta, "job_type": candidate_type,
             }
         if date_delta <= 3:
-            score += 50
+            # In the isolated backtest, a customer sign-off date and an
+            # independent ACTION DATE reading must agree before this extra
+            # visit-specific weight is available. A shared phone
+            # from an older PM must not cancel an exact formal visit date.
+            score += 90 if ocr_data.get("date_corrob") else 50
             support.add("date")
             reasons.append(
                 "date within 3 days (year corrected)"
@@ -1369,6 +1526,7 @@ def find_task(ocr_data: dict, job_type: str = None,
     回傳 (matched_task_or_None, tier_used)
       tier: 1=OrderNo精確, 2=醫院+型號撈池→serial唯一最近, 0=未找到
     """
+    ocr_data.pop("_index_missing_hospital_fallback", None)
     order_raw = (ocr_data.get("order_no") or "").strip()
     order_digits = re.sub(r"\D", "", order_raw)
     order_no = order_digits if re.fullmatch(config.ORDER_NO_REGEX, order_digits) else ""
@@ -1381,11 +1539,16 @@ def find_task(ocr_data: dict, job_type: str = None,
     product  = normalize_product(
         ocr_data.get("product") or ocr_data.get("product_raw")
     )
-    hosp     = hospital_core(
+    raw_hospital = (
         ocr_data.get("hospital_raw")
         or ocr_data.get("customer")
         or ocr_data.get("customer_raw")
     )
+    hosp = hospital_core(raw_hospital)
+    if _device_index is not None and raw_hospital and not hosp:
+        # A plausible but unconfirmed site code is not a hospital match, even
+        # when a new device forces a live typeahead fallback.
+        ocr_data["_index_missing_hospital_fallback"] = True
     phones = _clean_candidates(ocr_data.get("phone_candidates"))
     assets = _clean_candidates(ocr_data.get("asset_candidates"))
     work_orders = _clean_candidates(ocr_data.get("work_order_candidates"))
@@ -1394,8 +1557,9 @@ def find_task(ocr_data: dict, job_type: str = None,
     # row, retain the existing live typeahead search for newly-created tasks;
     # once rows are found, do not broaden the search and risk a false match.
     used_index = False
+    repeated_index_visit = False
     if _device_index is not None:
-        pool, index_had_candidates = _gather_index_pool(
+        pool, index_had_candidates, repeated_index_visit = _gather_index_pool(
             ocr_data, job_type, selected_device_key=selected_device_key
         )
         used_index = bool(pool)
@@ -1449,7 +1613,78 @@ def find_task(ocr_data: dict, job_type: str = None,
     runner_score = scored[1]["score"] if len(scored) > 1 else -1
     gap = best["score"] - runner_score
 
+    if ocr_data.get("_index_missing_hospital_fallback"):
+        # The aggregate device row may contain phones and people from several
+        # years.  Only this *live Asana task* can confirm the particular PM/CM
+        # visit. Apply the same guard to live typeahead fallback when the
+        # private index has not yet learned a new device. A title prefix such
+        # as (CM) is not the task type; its project or section is authoritative.
+        visit_support = best["support"]
+        visit_contact = "phone_exact" in visit_support or (
+            "contact" in visit_support and "asset_exact" in visit_support
+        )
+        safe_visit = (
+            best["serial_dist"] <= 1
+            and {"product", "job_type", "date"}.issubset(visit_support)
+            and best.get("date_delta") is not None
+            and best["date_delta"] <= 14
+            and visit_contact
+            and (len(scored) == 1 or gap >= 15)
+        )
+        if not safe_visit:
+            log.info("  無醫院證據的設備候選未通過當次工作核對，保留待核對")
+            return None, 0
+
+    # A date read from handwriting can be wrong even when two OCR passes agree.
+    # For repeated visits on the same device, a task 4–31 days away must not
+    # win solely because it falls into a better date-scoring bucket. Require a
+    # near-exact formal date or an independent task-specific identifier which
+    # distinguishes it from the runner-up. Order-number matches were already
+    # handled above and do not need this guard.
+    if (len(scored) > 1 or repeated_index_visit) \
+            and best.get("date_delta") is not None \
+            and best["date_delta"] > 3:
+        independent = (
+            (best["support"] - scored[1]["support"])
+            if len(scored) > 1 else set()
+        ) & {"phone_exact", "asset_exact", "work_order", "action_codes"}
+        if not independent:
+            log.info("  多次歷史工作只靠相差超過三日的日期分開，保留待核對")
+            return None, 0
+
     if not serials:
+        # Test-only date corroboration can safely rescue a one-character raw
+        # serial when the index has already identified the device. Do not
+        # require Asset: it is optional and may be blank on genuine visits.
+        # A shared phone or hospital does not distinguish repeat PM tasks;
+        # their *formal* dates must leave exactly one visit within three days.
+        device_separated = False
+        if used_index and ocr_data.get("date_corrob") and visual_serials:
+            ranked_devices = _rank_index_devices(ocr_data, job_type)
+            device_separated = bool(ranked_devices) and (
+                len(ranked_devices) == 1 or
+                ranked_devices[0]["serial_similarity"] -
+                ranked_devices[1]["serial_similarity"] >
+                config.INDEX_SERIAL_CLOSE_GAP + _INDEX_SCORE_EPSILON
+            ) and _norm(ranked_devices[0]["row"].get("serial")) in {
+                _norm(value) for value in _task_serials(best["task"])
+            }
+        if used_index and ocr_data.get("date_corrob") and visual_serials \
+                and best["serial_dist"] <= 1 and gap >= 30 \
+                and best.get("date_delta") is not None \
+                and best["date_delta"] <= 3 \
+                and {"date", "hospital", "product", "job_type"}.issubset(
+                    best["support"]
+                ) and ("phone_exact" in best["support"] or device_separated) \
+                and all(
+                    # A historical task without a formal date does not
+                    # compete with this independently corroborated exact
+                    # visit date. A second task within three days still does.
+                    row.get("date_delta") is None or row["date_delta"] > 3
+                    for row in scored[1:]
+                ):
+            log.info("  ✅ 交叉核對日期與單字 Serial 誤差唯一鎖定當次工作")
+            return best["task"], 2
         # serial 仍是首選設備身分證；但手寫 serial 可能每輪都讀得不同。
         # 此時只接受唯一候選，而且完整 task 必須同時精確包含電話、asset
         # 及最近 ACTION DATE。三項來自不同欄位，不能只靠醫院/型號猜。
@@ -1524,6 +1759,101 @@ def find_task(ocr_data: dict, job_type: str = None,
         f"額外證據={sorted(strong)}, 分差={gap}）→ 不敢猜"
     )
     return None, 0
+
+
+def neutral_name_for_ambiguous_visit(ocr_data: dict, job_type: str) -> Optional[str]:
+    """Name a *device*, never a guessed visit, when two visits truly remain tied.
+
+    This deliberately does not rescue a missing serial, a weak site reading, or
+    one task that failed validation.  It requires two live, same-type Asana
+    visits on the same exact device, both near the sheet's ACTION DATE and
+    neither separable by its full telephone number.  The caller may then use a
+    neutral equipment name, without claiming either task or order number.
+    """
+    if _device_index is None or job_type not in {"PM", "CM"}:
+        return None
+    if ocr_data.get("_date_recheck_blocked"):
+        return None
+    serials = {_norm(value) for value in _clean_candidates(
+        ocr_data.get("serial_candidates"), ocr_data.get("serial_no")
+    )}
+    if len(serials) != 1 or ocr_data.get("date_source") != "ACTION_DATE":
+        return None
+    service_day = _parse_date(
+        ocr_data.get("service_date_iso") or ocr_data.get("service_date_raw")
+    )
+    if not service_day:
+        return None
+    product = product_group(ocr_data.get("product") or ocr_data.get("product_raw"))
+    hospital = _norm(ocr_data.get("hospital_raw"))
+    phones = {re.sub(r"\D", "", value) for value in ocr_data.get("phone_candidates") or []}
+    if not product or not hospital or not phones:
+        return None
+
+    eligible = []
+    for row in _device_index.get("devices", []):
+        if row.get("weak_identity") or _norm(row.get("serial")) not in serials:
+            continue
+        families = row.get("product_families") or [
+            product_group(value) for value in row.get("product_variants") or []
+        ]
+        if not any(_family_similarity(product, family) == 1.0 for family in families):
+            continue
+        raw_product = ocr_data.get("product_raw") or ocr_data.get("product") or ""
+        if _norm(raw_product) not in {
+                _norm(value) for value in row.get("product_variants") or []}:
+            # A family match is enough to *find* the device, but not to put a
+            # possibly wrong model number into a task-free filename.
+            continue
+        places = [*(row.get("hospitals") or []), *(row.get("hospital_aliases") or []),
+                  *(row.get("locations") or [])]
+        if hospital not in {_norm(value) for value in places}:
+            continue
+        if not phones.intersection(
+                re.sub(r"\D", "", value) for value in row.get("phones") or []):
+            continue
+        eligible.append(row)
+    if len(eligible) != 1:
+        return None
+    row = eligible[0]
+    competing = []
+    for ref in row.get("task_refs") or []:
+        if ref.get("job_type") != job_type:
+            continue
+        dates = _formal_index_ref_dates(ref)
+        if not dates or min(abs((day - service_day).days) for day in dates) > 14:
+            continue
+        ref_phones = {re.sub(r"\D", "", value) for value in ref.get("phones") or []}
+        if not phones.intersection(ref_phones):
+            continue
+        gid = str(ref.get("gid") or "")
+        if gid and gid not in competing:
+            competing.append(gid)
+    if len(competing) < 2:
+        return None
+    # A stale index cannot authorize a generic upload. Both competing visits
+    # still have to exist in the correct live Asana project.
+    live = [_fetch_task(gid) for gid in competing[:config.ASANA_MAX_HYDRATED_CANDIDATES]]
+    def corroborates(task: dict) -> bool:
+        formal = _formal_index_ref_dates(task)
+        return (
+            _task_job_type(task) == job_type
+            and _norm(row["serial"]) in {_norm(value) for value in _task_serials(task)}
+            and any(
+                _norm(value) in _norm(task.get("name"))
+                for value in row.get("product_variants") or [] if _norm(value)
+            )
+            and bool(phones.intersection(_task_phones(task)))
+            and bool(formal)
+            and min(abs((day - service_day).days) for day in formal) <= 14
+        )
+    if len(live) < 2 or not all(corroborates(task) for task in live):
+        return None
+    raw_product = ocr_data.get("product_raw") or ocr_data.get("product") or ""
+    neutral = get_safe_title({
+        "name": f"{ocr_data['hospital_raw']} - {raw_product} - {row['serial']}"
+    })
+    return f"{neutral}.pdf" if neutral != "Unknown" else None
 
 
 # ── 命名輔助（沿用舊版）────────────────────────────────────────
