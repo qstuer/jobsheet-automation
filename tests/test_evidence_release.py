@@ -141,6 +141,23 @@ class ReleaseWiringTests(unittest.TestCase):
         self.assertEqual(events, ["retryable"])
         self.assertEqual((uploads, deletes, moves, neutral), (0, 0, 0, 0))
 
+    def test_formal_public_report_redacts_real_filename(self):
+        with patch.dict(os.environ, {processor.MATCHING_RULES_ENV: matching_rules.RULESET_VERSION}):
+            value = processor._public_planned_filename({"planned":"private-device.pdf"}, False)
+        self.assertNotIn("private-device", value)
+
+    def test_formal_error_log_does_not_print_customer_exception_text(self):
+        with patch.dict(os.environ, {processor.MATCHING_RULES_ENV: matching_rules.RULESET_VERSION,
+                                    processor.TARGET_FILE_ENV:"", processor.DRY_RUN_ENV:"0",
+                                    processor.ASANA_INDEX_FILE_ENV:"",
+                                    processor.REVIEW_ACTION_DATE_ENV:"", processor.REVIEW_TASK_ENV:""}), \
+                patch.object(rclone_helper, "list_pdfs", return_value=[self.filename]), \
+                patch.object(processor, "_process_split_file", side_effect=RuntimeError("private-customer-text")), \
+                patch.object(batch_state, "finalize_ready_manifests", return_value=0), \
+                self.assertLogs("processor", level="INFO") as logs:
+            self.assertEqual(processor.main(), 1)
+        self.assertNotIn("private-customer-text", str(logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()

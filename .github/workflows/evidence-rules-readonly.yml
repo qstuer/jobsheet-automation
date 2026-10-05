@@ -1,7 +1,7 @@
 name: Jobsheet - Integrated Evidence Rules Read-only
 on:
   push:
-    branches: [codex/evidence-rules-20261005, codex/release-evidence-20261005]
+    branches: [codex/evidence-rules-20261005]
     paths:
       - .github/workflows/evidence-rules-readonly.yml
       - scripts/check_evidence_rules_readonly.py

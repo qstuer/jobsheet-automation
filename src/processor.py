@@ -106,7 +106,7 @@ def _public_planned_filename(row: dict, dry_run: bool) -> str:
     planned = row.get("planned")
     if not planned:
         return ""
-    if dry_run:
+    if dry_run or os.environ.get(MATCHING_RULES_ENV, "").strip():
         return "已產生（隱藏客戶資料）"
     return str(planned)
 
@@ -1318,7 +1318,9 @@ def main() -> int:
                     ),
                 })
             except Exception as e:
-                if review_action_date:
+                if os.environ.get(MATCHING_RULES_ENV, "").strip():
+                    log.error("  處理失敗；保留來源，錯誤類型=%s", type(e).__name__)
+                elif review_action_date:
                     log.exception("  受控核對失敗；Google Drive 來源保持原狀")
                 else:
                     log.exception(f"  處理 {filename} 失敗（保留 _SPLIT 等重試）：{e}")
