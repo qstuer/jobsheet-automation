@@ -64,6 +64,7 @@ class SplitterErrorRoutingTests(unittest.TestCase):
                 patch.object(splitter.rclone_helper, "download"), \
                 patch.object(splitter.pdf_utils, "split_jobs", return_value=jobs), \
                 patch.object(splitter.pdf_utils, "extract_pages"), \
+                patch.object(splitter.rclone_helper, "remote_created_at", return_value="2026-09-14T04:00:00+00:00"), \
                 patch.object(splitter.rclone_helper, "upload") as upload, \
                 patch.object(splitter.batch_state, "save"), \
                 patch.object(splitter.rclone_helper, "moveto") as moveto, \

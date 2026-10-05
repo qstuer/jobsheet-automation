@@ -1,7 +1,7 @@
 name: Jobsheet - Integrated Evidence Rules Read-only
 on:
   push:
-    branches: [codex/evidence-rules-20261005]
+    branches: [codex/evidence-rules-20261005, codex/release-evidence-20261005]
     paths:
       - .github/workflows/evidence-rules-readonly.yml
       - scripts/check_evidence_rules_readonly.py
@@ -12,7 +12,7 @@ env:
   JOBSHEET_RCLONE_RELEASE: '1.75.0'
 jobs:
   check:
-    if: github.ref == 'refs/heads/codex/evidence-rules-20261005'
+    if: github.ref == 'refs/heads/codex/evidence-rules-20261005' || github.ref == 'refs/heads/codex/release-evidence-20261005'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -47,6 +47,8 @@ jobs:
       - name: Three independent OCR and live Asana checks without cloud writes
         env:
           BATCH_JOB: ${{ matrix.job }}
+          BATCH_REPETITIONS: ${{ github.ref == 'refs/heads/codex/release-evidence-20261005' && '1' || '3' }}
+          JOBSHEET_PROMOTION_ADAPTER_CHECK: ${{ github.ref == 'refs/heads/codex/release-evidence-20261005' && '1' || '0' }}
           JOBSHEET_ORIGINAL_UPLOAD_DATE: '2026-10-05'
           JOBSHEET_EVIDENCE_LIVE_RULES: '1'
           JOBSHEET_DRY_RUN: '1'

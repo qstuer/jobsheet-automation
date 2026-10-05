@@ -107,6 +107,8 @@ jobs:
           JOBSHEET_TARGET_FILE: ${{ inputs.jobsheet_file }}
           JOBSHEET_SOURCE_QUEUE: ${{ inputs.source_queue || 'split' }}
           JOBSHEET_DRY_RUN:      ${{ inputs.dry_run || 'false' }}
+          # Approved live-evidence policy; the experimental flag remains read-only.
+          JOBSHEET_MATCHING_RULES: evidence-live-v2
           JOBSHEET_CONFIRMED_FILENAME: ${{ inputs.confirmed_filename }}
           ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
           ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json

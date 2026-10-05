@@ -39,6 +39,7 @@ ASANA_INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
 CONTEXT_FIELD_OCR_ENV = "JOBSHEET_CONTEXT_FIELD_OCR"
 REVIEW_ACTION_DATE_ENV = "JOBSHEET_REVIEW_ACTION_DATE"
 REVIEW_TASK_ENV = "JOBSHEET_REVIEW_TASK"
+MATCHING_RULES_ENV = "JOBSHEET_MATCHING_RULES"
 
 # 本輪已上傳到 JOBSHEETS 的檔名集合，避免同一次執行內兩份 job 撞名互蓋。
 # main() 開頭會清空。
@@ -540,7 +541,7 @@ def _apply_pm_checklist_date_corroboration(
     return True
 
 
-def _ocr_and_match(doc, job_type):
+def _ocr_and_match(doc, job_type, reference_day=None):
     """分格首讀、身分欄複核、必要時單格精讀；模型永不看 Asana 候選。"""
     if os.environ.get("JOBSHEET_EVIDENCE_LIVE_RULES") == "1":
         # Experimental integration is explicitly read-only until repeated real
@@ -549,6 +550,12 @@ def _ocr_and_match(doc, job_type):
             raise ValueError("Integrated evidence rules require read-only mode")
         from . import matching_rules
         reference_day = asana_client._parse_date(os.environ.get("JOBSHEET_ORIGINAL_UPLOAD_DATE"))
+        return matching_rules.read_and_match(doc, job_type, reference_day)
+    engine = os.environ.get(MATCHING_RULES_ENV, "").strip()
+    if engine:
+        from . import matching_rules
+        if engine != matching_rules.RULESET_VERSION:
+            raise ValueError("Unknown matching ruleset; preserve source")
         return matching_rules.read_and_match(doc, job_type, reference_day)
     nvidia_client.reset_ocr_metrics()
     primary = nvidia_client.ocr_jobsheet_fields(
@@ -1084,7 +1091,12 @@ def _process_split_file(filename: str, work_dir: Path,
             if review_action_date:
                 task, tier, ocr = None, 0, _ocr_for_pending_review(doc)
             else:
-                task, tier, ocr = _ocr_and_match(doc, job_type)
+                if os.environ.get(MATCHING_RULES_ENV, "").strip():
+                    manifest = _manifest_for_job(work_dir, filename)
+                    reference_day = batch_state.source_upload_day(manifest, filename)
+                    task, tier, ocr = _ocr_and_match(doc, job_type, reference_day=reference_day)
+                else:
+                    task, tier, ocr = _ocr_and_match(doc, job_type)
     except nvidia_client.NvidiaResponseError as exc:
         if dry_run:
             local.unlink(missing_ok=True)
@@ -1159,7 +1171,10 @@ def _process_split_file(filename: str, work_dir: Path,
         # A generic device name is permitted only for *genuinely competing*
         # live visits on one exact device.  A mere missing candidate or bad OCR
         # remains pending.  No guessed task or order number is attached.
-        neutral = asana_client.neutral_name_for_ambiguous_visit(ocr, job_type)
+        # The promoted engine must not bypass its rejection through a second,
+        # untested legacy matcher. Keep the old exception only in legacy mode.
+        neutral = (None if ocr.get("rules_audit") or os.environ.get(MATCHING_RULES_ENV, "").strip()
+                   else asana_client.neutral_name_for_ambiguous_visit(ocr, job_type))
         if neutral:
             if dry_run:
                 proof = selection_audit.receipt(

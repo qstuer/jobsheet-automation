@@ -118,6 +118,27 @@ def remote_exists(remote_file: str) -> bool:
     return remote_stat(remote_file) is not None
 
 
+def remote_created_at(remote_file: str) -> Optional[str]:
+    """Read Drive birth time, not modification/split/retry time. Never mutate."""
+    args = ("lsjson", "--stat", "--metadata", remote_file,
+            "--drive-metadata-owner", "off",
+            "--drive-metadata-permissions", "off",
+            "--drive-metadata-labels", "off")
+    result = run_result(*args)
+    _raise_for_result(args, result)
+    try:
+        data = json.loads(result.stdout)
+        value = (data.get("Metadata") or {}).get("btime")
+        if not value:
+            return None  # Unknown upload time is not the current run time.
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("Birth time has no timezone")
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RcloneError("Invalid source creation metadata; preserve source") from exc
+
+
 def _sha256_local(local_path: Path) -> str:
     digest = hashlib.sha256()
     with local_path.open("rb") as stream:

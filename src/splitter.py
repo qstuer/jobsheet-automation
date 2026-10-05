@@ -51,6 +51,10 @@ def _split_one(filename: str, work_dir: Path) -> dict:
         f"{[(j['type'], j['input_pages'], len(j['keep_pages'])) for j in jobs]}"
     )
 
+    # Save actual Drive creation time before deleting the raw source. This
+    # does not change page boundaries, extraction, or completeness checks.
+    source_uploaded_at = rclone_helper.remote_created_at(src_remote)
+
     # ── 逐 job 抽頁；完整才進 _SPLIT，缺頁直接隔離 ──
     stem = Path(filename).stem
     uploaded = []
@@ -75,7 +79,9 @@ def _split_one(filename: str, work_dir: Path) -> dict:
 
     # 狀態檔是之後重試、防重複及通知的唯一依據。寫入成功後才處理原檔。
     source_pages = max((job["end"] for job in jobs), default=0)
-    manifest = batch_state.new_manifest(filename, source_pages, jobs)
+    manifest = batch_state.new_manifest(
+        filename, source_pages, jobs, source_uploaded_at=source_uploaded_at,
+    )
     batch_state.save(work_dir, manifest)
 
     # 有任何缺頁時保留原始整批掃描作查證，但移離入口，避免每五分鐘重跑。

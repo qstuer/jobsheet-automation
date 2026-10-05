@@ -18,6 +18,10 @@ from src import asana_client, asana_index, config, matching_rules, nvidia_client
 
 def main():
     job = int(os.environ["BATCH_JOB"])
+    repetitions = int(os.environ.get("BATCH_REPETITIONS", "3"))
+    adapter_check = os.environ.get("JOBSHEET_PROMOTION_ADAPTER_CHECK") == "1"
+    if repetitions not in (1, 2, 3):
+        raise ValueError("Repetition limit exceeded")
     if job not in (1, 2, 3, 4):
         raise ValueError("PDF outside authorized batch")
     reference_day = date.fromisoformat(os.environ["JOBSHEET_ORIGINAL_UPLOAD_DATE"])
@@ -34,7 +38,11 @@ def main():
         return original_run(*args)
     rclone_helper.run_result = readonly
     os.environ[processor.DRY_RUN_ENV] = "1"
-    os.environ["JOBSHEET_EVIDENCE_LIVE_RULES"] = "1"
+    if adapter_check:
+        os.environ.pop("JOBSHEET_EVIDENCE_LIVE_RULES", None)
+        os.environ[processor.MATCHING_RULES_ENV] = matching_rules.RULESET_VERSION
+    else:
+        os.environ["JOBSHEET_EVIDENCE_LIVE_RULES"] = "1"
     output = Path("anonymous-results")
     output.mkdir(exist_ok=True)
     index = asana_index.load_index(Path("/tmp/asana-device-index.json"),
@@ -61,9 +69,10 @@ def main():
                 attempts.append({"model": model, "response": False})
                 raise
         nvidia_client._call_vision_once = audited_call
-        for repetition in range(1, 4):
+        for repetition in range(1, repetitions + 1):
             report = {"job": job, "round": repetition, "read_only": True,
                 "cloud_writes": 0, "ruleset": matching_rules.RULESET_VERSION,
+                "production_adapter_check": adapter_check,
                 "commit": os.environ.get("GITHUB_SHA"), "provider": config.OCR_PROVIDER,
                 "reference_date_source": "original_batch_upload",
                 "reference_date": reference_day.isoformat(),
@@ -80,7 +89,10 @@ def main():
             try:
                 with fitz.open(local) as doc:
                     report["page_count"] = len(doc)
-                    task, tier, ocr = processor._ocr_and_match(doc, "PM")
+                    if adapter_check:
+                        task, tier, ocr = processor._ocr_and_match(doc, "PM", reference_day=reference_day)
+                    else:
+                        task, tier, ocr = processor._ocr_and_match(doc, "PM")
                 report["matched"] = task is not None
                 report["audit"] = ocr.get("rules_audit")
                 report["field_receipts"] = {}

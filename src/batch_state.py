@@ -5,7 +5,7 @@
 """
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,11 +38,13 @@ def report_remote(source_file_or_stem: str) -> str:
     return f"{config.GDRIVE_REPORTS}/{report_name(source_file_or_stem)}"
 
 
-def new_manifest(source_file: str, source_pages: int, jobs: list) -> dict:
+def new_manifest(source_file: str, source_pages: int, jobs: list,
+                 source_uploaded_at: Optional[str] = None) -> dict:
     return {
         "schema": SCHEMA_VERSION,
         "source_file": source_file,
         "source_pages": source_pages,
+        "source_uploaded_at": source_uploaded_at,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "final": False,
@@ -95,6 +97,23 @@ def save(work_dir: Path, manifest: dict) -> None:
 
 def find_job(manifest: dict, filename: str) -> Optional[dict]:
     return next((job for job in manifest.get("jobs", []) if job.get("file") == filename), None)
+
+
+def source_upload_day(manifest: dict, filename: str):
+    """Only use the original source's saved Drive birth time, in Hong Kong."""
+    stem = source_stem_from_job(filename)
+    if not stem or manifest.get("source_file") != stem + ".pdf" or not find_job(manifest, filename):
+        return None
+    value = manifest.get("source_uploaded_at")
+    if not isinstance(value, str) or not value:
+        return None  # Legacy created_at is processing time, NOT upload time.
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone(timedelta(hours=8))).date()
+    except ValueError:
+        return None
 
 
 def record_result(manifest: dict, filename: str, state: str, **details) -> dict:

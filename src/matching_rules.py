@@ -366,6 +366,10 @@ def read_and_match(doc, job_type, reference_day=None):
     read(lambda: vision.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_DEFAULT), "cover")
     read(lambda: vision.ocr_jobsheet_identity_fields(doc, 0, zoom=config.OCR_IDENTITY_ZOOM), "cover_identity")
     read(lambda: vision.ocr_jobsheet_support_fields(doc, 0, zoom=config.OCR_SUPPORT_ZOOM), "cover_support")
+    if not readings:
+        # A complete service outage is infrastructure failure, not evidence
+        # that the paper is wrong. Let the existing durable retry path handle it.
+        raise vision.NvidiaResponseError("No usable vision response; preserve source for retry")
     def attempt(*, allow_upload_prior=False):
         nonlocal last_diagnostic
         ev = evidence(readings)
