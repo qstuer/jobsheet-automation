@@ -64,6 +64,28 @@ class MatchingRulesTests(unittest.TestCase):
     def test_missing_hospital_serial_product_phone(self):
         self.assertIsNotNone(self.choose([task()], [reading(hospital=None)]*2)[0])
 
+    def test_missing_hospital_single_character_serial_with_date(self):
+        self.assertIsNotNone(self.choose([task()],
+            [reading(hospital=None, serial="ABC12X3450")]*2)[0])
+
+    def test_missing_hospital_fuzzy_serial_cannot_use_upload_prior(self):
+        self.assertIsNone(self.choose([task()],
+            [reading(hospital=None, serial="ABC12X3450", day=None)]*2)[0])
+
+    def test_missing_hospital_two_character_serial_is_not_relaxed(self):
+        self.assertIsNone(self.choose([task()],
+            [reading(hospital=None, serial="ABC12X3400")]*2)[0])
+
+    def test_missing_hospital_single_character_needs_full_phone(self):
+        self.assertIsNone(self.choose([task()],
+            [reading(hospital=None, serial="ABC12X3450", phone="23456780")]*2)[0])
+
+    def test_anonymous_identity_diagnostic_excludes_values(self):
+        diagnostic = rules.diagnostic_pool([task()], rules.evidence([reading()]*2), "PM")
+        self.assertNotIn("ABC12X3456", str(diagnostic))
+        self.assertNotIn("Test Hospital", str(diagnostic))
+        self.assertNotIn("23456789", str(diagnostic))
+
     def test_unknown_hospital_not_a_positive_vote(self):
         ev = rules.evidence([reading(hospital="PN")]*2)
         self.assertFalse(ev["hospital_raw"])

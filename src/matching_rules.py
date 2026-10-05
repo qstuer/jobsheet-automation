@@ -16,7 +16,7 @@ from PIL import Image, ImageOps
 
 from . import asana_client as ac, asana_index, config, nvidia_client as vision
 
-RULESET_VERSION = "evidence-live-v1"
+RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
 MAX_LIVE_TASKS = 80
 VISIT_WINDOW_DAYS = 14
@@ -193,6 +193,7 @@ def assess_task(task, ev, job_type):
     serials = _serials(ev)
     distance = min((ac._lev(s, facts["serial"]) for s in serials), default=99)
     serial_repeated = facts["serial"] in _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+    missing_hospital_fuzzy = False
     if serials:
         if distance > 3:
             return None
@@ -202,6 +203,16 @@ def assess_task(task, ev, job_type):
                 and (serial_repeated or "hospital" in support))
         elif distance == 1:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
+            # Complete the already agreed missing-hospital fallback. A
+            # one-character serial transcription error is not a veto when
+            # product and full phone identify the equipment. This branch
+            # additionally requires a readable date and a unique live visit;
+            # it must never use the upload-date prior to fill that gap.
+            missing_hospital_fuzzy = (
+                not _stable(ev, "hospital_raw")
+                and {"product", "phone"} <= support
+            )
+            safe = safe or missing_hospital_fuzzy
         else:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
         if not safe:
@@ -214,7 +225,8 @@ def assess_task(task, ev, job_type):
              + 30 * ("phone" in support) + 5 * ("contact" in support)
              + (10 if asset == 2 else 5 if asset == 1 else 0))
     return {"task": task, "facts": facts, "score": score, "support": support,
-            "serial_distance": distance}
+            "serial_distance": distance,
+            "requires_reliable_date": missing_hospital_fuzzy}
 
 
 def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
@@ -266,6 +278,8 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         if len(dated) > 1 and dated[1][0] == best_delta and dated[1][1]["score"] >= best["score"] - 15:
             return None, "live_visits_tied"
         return best["task"], "action_date_live_visit_confirmed"
+    if any(row.get("requires_reliable_date") for row in visits):
+        return None, "missing_hospital_fuzzy_needs_action_date"
     if reference_day is None:
         return None, "upload_date_unknown"
     if not allow_upload_prior:
@@ -282,6 +296,32 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     if not dated or (len(dated) > 1 and dated[0][0] == dated[1][0]):
         return None, "upload_prior_not_unique"
     return dated[0][1]["task"], "upload_prior_live_visit_confirmed"
+
+
+def diagnostic_pool(tasks, ev, job_type):
+    """Anonymous rejection evidence, not raw OCR/Asana data or task IDs."""
+    rows = []
+    for task in tasks:
+        facts = _live_facts(task)
+        if not facts:
+            continue
+        serials = _serials(ev)
+        rows.append({
+            "serial_distance": min((ac._lev(v, facts["serial"]) for v in serials), default=99),
+            "product_supported": bool(_stable(ev, "product_raw") & facts["product"]),
+            "product_conflict": _strong_conflict(ev, "product_raw", facts["product"]),
+            "hospital_supported": bool(_stable(ev, "hospital_raw") & facts["hospital"]),
+            "hospital_conflict": _strong_conflict(ev, "hospital_raw", facts["hospital"]),
+            "phone_exact": bool(set(ev["phone_candidates"]) & facts["phones"]),
+            "asset_level": ac._asset_match_level(list(ev["asset_candidates"]), list(facts["assets"])),
+            "type_matches": facts["type"] == job_type,
+            "passes_identity": assess_task(task, ev, job_type) is not None,
+        })
+    rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
+    return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
+            "repeated_product_count": len(_stable(ev, "product_raw")),
+            "repeated_hospital_count": len(_stable(ev, "hospital_raw")),
+            "repeated_date_count": len(_stable(ev, "service_date_raw"))}
 
 
 def _checklist_read(doc, zoom):
@@ -317,6 +357,7 @@ def read_and_match(doc, job_type, reference_day=None):
     vision.reset_ocr_metrics()
     readings = []
     trace = []
+    last_diagnostic = {}
     def read(call, source):
         try:
             readings.append({**call(), "_page": 0, "_source": source})
@@ -326,6 +367,7 @@ def read_and_match(doc, job_type, reference_day=None):
     read(lambda: vision.ocr_jobsheet_identity_fields(doc, 0, zoom=config.OCR_IDENTITY_ZOOM), "cover_identity")
     read(lambda: vision.ocr_jobsheet_support_fields(doc, 0, zoom=config.OCR_SUPPORT_ZOOM), "cover_support")
     def attempt(*, allow_upload_prior=False):
+        nonlocal last_diagnostic
         ev = evidence(readings)
         rows, reason = retrieve_rows(ac._device_index, ev)
         trace.append(reason)
@@ -333,6 +375,7 @@ def read_and_match(doc, job_type, reference_day=None):
             return None
         pool, reason = live_pool(rows, ev, reference_day)
         trace.append(reason)
+        last_diagnostic = diagnostic_pool(pool, ev, job_type)
         task, reason = select_task(pool, ev, job_type, reference_day,
                                   allow_upload_prior=allow_upload_prior)
         trace.append(reason)
@@ -366,5 +409,6 @@ def read_and_match(doc, job_type, reference_day=None):
     ocr["ocr_metrics"] = vision.get_ocr_metrics()
     ocr["rules_audit"] = {"version": RULESET_VERSION, "trace": trace,
         "reference_date_known": reference_day is not None,
-        "read_count": len(readings), "crosspage_used": any(r.get("_page") == 1 for r in readings)}
+        "read_count": len(readings), "crosspage_used": any(r.get("_page") == 1 for r in readings),
+        "last_live_diagnostic": last_diagnostic}
     return task, 2 if task else 0, ocr
