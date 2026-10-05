@@ -1,0 +1,65 @@
+name: Jobsheet - Four New PDFs Read-only Check
+on:
+  push:
+    branches: [codex/new-batch-check-20261005]
+    paths:
+      - .github/workflows/new-batch-readonly.yml
+      - scripts/check_new_batch_readonly.py
+permissions:
+  contents: read
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+jobs:
+  check:
+    if: github.ref == 'refs/heads/codex/new-batch-check-20261005'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        job: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/rclone
+      - name: Restore private credentials and read-only index
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone copyto "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" /tmp/asana-device-index.json
+          rclone copyto "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" /tmp/asana-device-index-manifest.json
+      - name: Read the new PM PDF without cloud writes
+        env:
+          BATCH_JOB: ${{ matrix.job }}
+          OCR_PROVIDER: ${{ vars.OCR_PROVIDER }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+        run: python -m scripts.check_new_batch_readonly
+      - name: Save anonymous measurements, not customer documents
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: new-batch-anonymous-job${{ matrix.job }}
+          path: anonymous-results/*.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove runner credentials
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
