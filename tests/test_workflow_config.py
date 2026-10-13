@@ -91,6 +91,18 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertNotIn("onedrive:", text.lower())
         self.assertNotIn("rclone move", text.lower())
 
+    def test_split_trial_is_readonly_and_exclusive_to_the_test_branch(self):
+        text = (ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml").read_text(encoding="utf-8")
+        self.assertIn("if: github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'", text)
+        self.assertIn("if: github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'", text)
+        self.assertIn("JOBSHEET_TARGET_FILE: ${{ inputs.raw_file }}", text)
+        self.assertIn("JOBSHEET_SOURCE_QUEUE: split", text)
+        self.assertIn("JOBSHEET_DRY_RUN: '1'", text)
+        self.assertIn("JOBSHEET_EVIDENCE_LIVE_RULES: '1'", text)
+        self.assertIn("JOBSHEET_CONFIRMED_FILENAME: ''", text)
+        self.assertIn("python -m src.processor", text)
+        self.assertNotIn("repository_dispatch", text)
+
     def test_asana_workspace_id_is_not_treated_as_a_secret(self):
         for workflow_name in (
             "jobsheet-process.yml", "jobsheet-order-lookup.yml",

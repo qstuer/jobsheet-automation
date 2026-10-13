@@ -57,6 +57,7 @@ jobs:
             /tmp/asana-device-index-manifest.json
       - run: pip install -r requirements.txt
       - name: Inspect one raw scan without cloud writes
+        if: github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'
         env:
           JOBSHEET_RAW_FILE:    ${{ inputs.raw_file }}
           OCR_PROVIDER:         ${{ inputs.ocr_provider }}
@@ -69,6 +70,27 @@ jobs:
           ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
           ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
         run: python -m src.dry_run
+      # Test branch only: raw_file is the exact existing _SPLIT PDF name.
+      # Keep the production upload workflow disabled throughout this trial.
+      - name: Inspect one prepared jobsheet without cloud writes
+        if: github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'
+        env:
+          JOBSHEET_TARGET_FILE: ${{ inputs.raw_file }}
+          JOBSHEET_SOURCE_QUEUE: split
+          JOBSHEET_DRY_RUN: '1'
+          JOBSHEET_EVIDENCE_LIVE_RULES: '1'
+          JOBSHEET_MATCHING_RULES: evidence-live-v2
+          JOBSHEET_CONFIRMED_FILENAME: ''
+          OCR_PROVIDER: ${{ inputs.ocr_provider }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
+        run: python -m src.processor
       - name: Cleanup rclone config
         if: always()
         run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
