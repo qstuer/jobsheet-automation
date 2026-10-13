@@ -262,7 +262,7 @@ def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
         raw = tagged.group("rest").strip()
     core = re.split(r"[,/]", raw, 1)[0].strip()
     detail = raw[len(core):].lstrip(" ,/").strip()
-    match = re.match(r"^(?P<hospital>[A-Za-z]{2,8})\s*-\s*(?P<detail>.+)$", core)
+    match = re.match(r"^(?P<hospital>[A-Za-z0-9]{2,8})\s*-\s*(?P<detail>.+)$", core)
     if match:
         detail = " - ".join(filter(None, [match.group("detail").strip(), detail]))
         core = match.group("hospital").strip()
@@ -271,7 +271,7 @@ def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
         # Requiring the code to
         # be uppercase avoids splitting ordinary full names at their first word.
         match = re.match(
-            r"^(?P<hospital>[A-Z]{2,8})(?:(?:\s+)|(?=\())(?P<detail>.+)$",
+            r"^(?P<hospital>[A-Z0-9]{2,8})(?:(?:\s+)|(?=\())(?P<detail>.+)$",
             core,
         )
         if match:
@@ -280,15 +280,31 @@ def split_hospital_location(value: Optional[str]) -> tuple[str, str]:
     return core, detail
 
 
+def hospital_code_token(core: str) -> Optional[str]:
+    """Recognize code-shaped text, not its validity as a hospital alias.
+
+    A single ASCII letter/digit token is not a full name merely because it
+    contains five characters. Mixed codes require an exact confirmed alias;
+    never send them through full-name fuzzy correction. Full multiword names,
+    including names containing a number, retain their existing handling.
+    """
+    if re.fullmatch(r"[A-Za-z]{2,6}", core) or (
+        re.fullmatch(r"[A-Za-z0-9]+", core)
+        and any(char.isalpha() for char in core)
+        and any(char.isdigit() for char in core)
+    ):
+        return _norm(core)
+    return None
+
+
 def hospital_aliases(value: Optional[str]) -> List[str]:
     """Return safe comparison forms without turning room detail into a hospital."""
     core, _ = split_hospital_location(value)
     if not core:
         return []
     canonical = hospital_core(core)
-    # Unknown short codes are a common OCR hallucination.
-    # They must not pass the 33% fuzzy hospital gate.
-    if re.fullmatch(r"[A-Za-z]{2,6}", core) and not canonical:
+    # Without an identity, no raw code/detail may pass the fuzzy hospital gate.
+    if not canonical:
         return []
     result = [core]
     if canonical:
@@ -326,7 +342,8 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     """取醫院核心碼：切掉地址尾段（HKCH-02-Xray → HKCH；保留 'Trinity Medical'）"""
     if not customer:
         return None
-    core = re.split(r"[,/\-]", customer.strip(), 1)[0].strip()
+    core, _ = split_hospital_location(customer)
+    core = re.split(r"-", core, 1)[0].strip()
     normalized = _norm(core)
     canonical = HOSPITAL_ALIASES.get(normalized)
     if canonical:
@@ -335,7 +352,7 @@ def hospital_core(customer: Optional[str]) -> Optional[str]:
     if normalized in private_aliases:
         return private_aliases[normalized]
     # 未確認的短碼不得成為候選搜尋或加分依據。
-    if re.fullmatch(r"[A-Za-z]{2,6}", core):
+    if hospital_code_token(core):
         return None
 
     # A complete name can imply a known acronym without a hardcoded name.

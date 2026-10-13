@@ -575,14 +575,22 @@ def _hospital_is_plausible(value: Optional[str]) -> bool:
         return False
     if re.search(r"\bASSET\b", value, re.IGNORECASE):
         return False
-    core = re.split(r"[,/\-]", value.strip(), 1)[0].strip()
+    from . import asana_client
+    core, _ = asana_client.split_hospital_location(value)
     normalized = re.sub(r"[^A-Z0-9]", "", core.upper())
-    if re.fullmatch(r"[A-Z]{2,6}", normalized):
+    if (normalized in asana_client.HOSPITAL_ALIASES
+            or normalized in asana_client._private_hospital_aliases()):
+        # Exact verified aliases keep existing space/punctuation tolerance.
+        return True
+    if asana_client.hospital_code_token(core):
+        if any(char.isdigit() for char in normalized):
+            # Keep the literal even when unconfirmed. hospital_core/evidence
+            # must not turn repeated mixed codes into hospital-match votes.
+            return True
         # Plausible text is not the same as a verified hospital alias.  Keep a
         # private-index code observed on several devices as transcription, but
         # do not resurrect a one-off hallucination such as PN.
-        from . import asana_client
-        return (normalized in config.HOSPITAL_SHORT_ALIASES
+        return (asana_client.hospital_core(core) is not None
                 or asana_client.indexed_short_site_code(normalized))
     return len(normalized) >= 5 and not normalized.isdigit()
 

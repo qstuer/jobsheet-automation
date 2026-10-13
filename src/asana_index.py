@@ -494,7 +494,9 @@ def _learn_hospital_alias_groups(rows: list[dict]) -> list[dict]:
             if re.fullmatch(r"[A-Za-z]{2,8}", value)
             and not asana_client.hospital_core(value)
         ]
-        fulls = [value for value in cores if len(re.findall(r"[A-Za-z]+", value)) >= 2]
+        fulls = [value for value in cores
+                 if not asana_client.hospital_code_token(value)
+                 and len(re.findall(r"[A-Za-z]+", value)) >= 2]
         for short in shorts:
             for full in fulls:
                 short_key, full_key = _norm(short), _norm(full)
@@ -571,7 +573,8 @@ def _build_location_directory(rows: list[dict], learned_groups: list[dict]) -> l
             confirmed = [official]
             learned_aliases = list(learned.get("aliases") or [])
             unconfirmed, enabled = [], True
-        elif len(re.findall(r"[A-Za-z]+", core)) >= 2:
+        elif not asana_client.hospital_code_token(core) \
+                and len(re.findall(r"[A-Za-z]+", core)) >= 2:
             key, official = normalized, core
             confirmed, learned_aliases, unconfirmed, enabled = [core], [], [], True
         else:
