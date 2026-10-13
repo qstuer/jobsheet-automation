@@ -15,6 +15,10 @@ from src import matching_rules, nvidia_client as vision, private_ocr_trace as tr
 
 class PrivateOCRTraceTests(unittest.TestCase):
     def setUp(self):
+        # These tests use synthetic local fixtures, including on a CI runner.
+        # The explicit cloud-plaintext refusal test overrides this to true.
+        self.environment = patch.dict("os.environ", {"GITHUB_ACTIONS": "false"})
+        self.environment.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "private"
         self.output = self.root / "run1"
@@ -26,6 +30,7 @@ class PrivateOCRTraceTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+        self.environment.stop()
 
     def capture(self):
         return trace.Capture(self.output, root=self.root)
