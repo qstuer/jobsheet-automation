@@ -14,7 +14,9 @@ from pathlib import Path
 
 from . import asana_client
 
-PARSER_VERSION = 1
+# Version covers the Product/Serial title boundary used to build this table.
+# A changed boundary requires a full rebuild, not a mixed incremental index.
+PARSER_VERSION = 2
 _REFERENCE = re.compile(r"\b(?:HAWO|WO|SR|ORDER|ASSET|PHONE|TEL|CONTACT)\b", re.I)
 _JOB_TYPE = re.compile(r"^(?:CM|PM|FCO|INS|REPAIR|MAINTENANCE)$", re.I)
 _SERIAL = re.compile(r"\b[A-Z]{2,3}[A-Z0-9]{5,9}\b", re.I)

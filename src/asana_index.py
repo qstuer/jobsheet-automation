@@ -229,6 +229,18 @@ def _name_parts_with_review(name: str) -> tuple:
                 break
         if serial:
             break
+    if serial is None:
+        from . import ocr_reference
+        # Legacy short identifiers are recognised only as an entire separate
+        # Serial segment immediately after a plausible Product segment. Do
+        # not treat phones, references, names or model tokens as a serial.
+        compact_candidates = []
+        for index in range(2, len(parts)):
+            candidate = ocr_reference.compact_serial_token(parts[index])
+            if candidate and ocr_reference.model_like(parts[index - 1]):
+                compact_candidates.append((candidate, index))
+        if len(compact_candidates) == 1:
+            serial, serial_part_index = compact_candidates[0]
     candidates = []
     # Never scan the tail after Serial for a product: it commonly contains
     # CM, an engineer, Order Number or HAWO. Location remains a separate slot.

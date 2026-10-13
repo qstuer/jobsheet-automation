@@ -564,7 +564,10 @@ def _visible_serial_token(value: str) -> Optional[str]:
     token = re.sub(r"[^A-Z0-9]", "", (value or "").upper())
     if 8 <= len(token) <= 12 and sum(char.isdigit() for char in token) >= 4:
         return token
-    return None
+    from . import ocr_reference
+    # Keep a short literal as visual evidence only. It is NOT added to the
+    # normal valid-serial list and cannot initiate unguarded live search.
+    return ocr_reference.compact_serial_token(value)
 
 
 def _hospital_is_plausible(value: Optional[str]) -> bool:
@@ -699,11 +702,16 @@ def _normalize_ocr_data(candidate: dict) -> dict:
     if any(not _valid_serial_token(value) for value in raw_serials):
         mark_unreadable("serial_candidates", "invalid_serial_format")
 
-    # 型號只可校正到已確認的 Philips 清單；離清單太遠便不作配對證據。
+    # A model outside the old fixed list may already belong to a private-index
+    # product family. Preserve its visible suffix/digits; do not replace it
+    # with a more familiar model. Raw rejected strings remain in private audit.
+    product_reference_source = None
     if data.get("product_raw"):
-        from . import asana_client
+        from . import asana_client, ocr_reference
         canonical = asana_client.normalize_product(data["product_raw"])
-        data["product"] = canonical if canonical in asana_client.OCR_PRODUCT_NAMES else None
+        product_reference_source = ocr_reference.product_support(
+            asana_client._device_index, data["product_raw"])
+        data["product"] = canonical if product_reference_source else None
         if data["product"] is None:
             mark_unreadable("product_raw", "unconfirmed_product")
             data["product_raw"] = None
@@ -794,6 +802,7 @@ def _normalize_ocr_data(candidate: dict) -> dict:
         "raw": raw_transcription,
         "normalized": deepcopy(data),
         "rejections": rejections,
+        "product_reference_source": product_reference_source,
     }
     return data
 
@@ -1229,6 +1238,8 @@ def _context_field_prompt(field: str, vocabulary: dict) -> str:
             "This is spelling context, NOT a multiple-choice test. "
             "Copy only the model variant actually supported by the handwriting; "
             "if only the family is visible, return only the family. "
+            "The spelling context is incomplete: transcribe a clearly visible "
+            "unlisted variant without replacing its numbers or suffix. "
         )
         label = "PRODUCT"
     elif field == "hospital_raw":

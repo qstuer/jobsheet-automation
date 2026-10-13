@@ -413,7 +413,18 @@ python -m compileall -q src tests
 11. PM 不足四張內容頁不得進 Stage B；CM 成品固定一張。
 12. dry-run 不得移動／刪除 Google Drive、更新報告或寫入 OneDrive。
 
-## 13. 官方參考
+## 13. 2026-10-13 本機修正，尚未部署
+
+- 從正式 `c750f6b` 建立獨立本機分支 `codex/parser-ingress-fix-20261013`；原有未提交的實驗 checkout 保持原狀。尚未 commit、push 或更新 `main`。
+- 修正 OCR 的舊產品白名單：私人索引中安全的產品寫法／大類可作比較證據，但不代表型号已獲人工確認，也不會補造數字或後綴。弱設備列只能提供詞彙，不能確認設備身分。
+- 6–7 字元的完整混合 Serial 只保留為視覺證據；不更改一般 Serial 格式閘。短 Serial 的即時查詢需重複產品及醫院證據與完整電話；接受時還需重複且完全相同的 Serial、正確產品大類／醫院／完整電話、PM／CM 與唯一日期工作。不能模糊改字或補成長 Serial。
+- Asana 的短 Serial 只從獨立 Product／Serial 標題欄解析；多個合理短號不選第一個。產品／標題解析版本升至 2，後續更新索引必須完整重建，不能增量混用舊欄位。本次未更新雲端索引。
+- 只讀結果增加白名單化的配對原因、數量及吻合布林值，不輸出電話、客戶、Serial、Asset、task GID 或原始 OCR。原有工作／檔名核對碼保留。
+- 本機完整 `unittest`：287 項通過（基線 253，加 34 項），`compileall` 通過。沒有真實模型呼叫或 OneDrive 寫入。
+- 五份新單的舊正式版本基線是全部待核對；修正版尚未進行模型回測。人工正確抄錄的 parser-only 檢查不是 OCR／配對準確率，不能當作五份通過。
+- 下一關：展示完整 diff，取得獨立測試分支 commit／push 同意後，逐份只讀回測。同時核對具體 task、正式檔名、CM／PM 及頁面；維持 Stage B 上傳停用，不更改供應商、不移動來源、不上線 `main`。
+
+## 14. 官方參考
 
 - 現用 NVIDIA 模型：<https://build.nvidia.com/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning>
 - 舊 NVIDIA 模型：<https://build.nvidia.com/nvidia/llama-3.1-nemotron-nano-vl-8b-v1>

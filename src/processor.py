@@ -14,6 +14,7 @@
 
 手動模式可指定 _SPLIT 或 _PENDING 的一份 PDF；dry-run 全程不寫雲端。
 """
+import json
 import logging
 import os
 import re
@@ -91,6 +92,8 @@ def _dry_run_ocr_preview(ocr: dict) -> str:
     readable = []
     for label, key in labels:
         value = ocr.get(key)
+        if key == "serial_candidates" and not value:
+            value = ocr.get("serial_visual_candidates")
         if isinstance(value, list):
             value = any(item for item in value)
         if value:
@@ -99,6 +102,11 @@ def _dry_run_ocr_preview(ocr: dict) -> str:
         "已讀欄位=" + ",".join(readable)
         if readable else "未讀到可用欄位"
     )
+
+
+def _public_matching_diagnostic(ocr: dict) -> dict:
+    from . import matching_rules
+    return matching_rules.public_diagnostic(ocr.get("rules_audit"))
 
 
 def _public_planned_filename(row: dict, dry_run: bool) -> str:
@@ -1164,6 +1172,7 @@ def _process_split_file(filename: str, work_dir: Path,
                 "tier": tier,
                 "ocr_preview": _dry_run_ocr_preview(ocr),
                 "ocr_metrics": ocr.get("ocr_metrics", {}),
+                "matching_diagnostic": _public_matching_diagnostic(ocr),
             }
         result = _finalize_match(local, task, tier, filename)
         result["ocr_metrics"] = ocr.get("ocr_metrics", {})
@@ -1201,6 +1210,7 @@ def _process_split_file(filename: str, work_dir: Path,
                     "status": "預覽：證據不足，會留待人工核對",
                     "ocr_preview": _dry_run_ocr_preview(ocr),
                     "ocr_metrics": ocr.get("ocr_metrics", {}),
+                    "matching_diagnostic": _public_matching_diagnostic(ocr),
                 }
             if source_folder == config.GDRIVE_PENDING:
                 pending_name = filename
@@ -1342,6 +1352,9 @@ def main() -> int:
             details.append(f"預計檔名={public_planned}")
         if row.get("ocr_preview"):
             details.append(f"OCR={row['ocr_preview']}")
+        if dry_run and row.get("matching_diagnostic"):
+            details.append("配對診斷=" + json.dumps(
+                row["matching_diagnostic"], separators=(",", ":"), sort_keys=True))
         if dry_run and row.get("selection_receipt"):
             proof = row["selection_receipt"]
             details.append(f"核對碼：工作={proof['task']}、檔名={proof['filename']}")

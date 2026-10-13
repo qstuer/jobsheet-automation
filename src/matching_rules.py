@@ -14,7 +14,7 @@ from datetime import date, timedelta
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, nvidia_client as vision
+from . import asana_client as ac, asana_index, config, nvidia_client as vision, ocr_reference
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
@@ -143,7 +143,14 @@ def live_pool(rows, ev, reference_day):
         # unbounded phone/asset workspace searches are deliberately avoided.
         gids = set()
         for serial in _serials(ev)[:3]:
-            if not vision._valid_serial_token(serial):
+            compact_guard = (
+                ocr_reference.compact_serial_token(serial) is not None
+                and bool(_stable(ev, "product_raw"))
+                and bool(_stable(ev, "hospital_raw"))
+                and any(len(v) == 8 and v.isascii() and v.isdigit()
+                        for v in ev["phone_candidates"])
+            )
+            if not vision._valid_serial_token(serial) and not compact_guard:
                 continue
             gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
         if len(gids) > MAX_LIVE_TASKS:
@@ -197,6 +204,17 @@ def assess_task(task, ev, job_type):
     if serials:
         if distance > 3:
             return None
+        compact_nearest = any(ocr_reference.compact_serial_token(s)
+                              and ac._lev(s, facts["serial"]) == distance for s in serials)
+        if ocr_reference.compact_serial_token(facts["serial"]) or compact_nearest:
+            # Short serials carry less distinctiveness. Require a literal exact
+            # reading and independent product, hospital and full-phone support;
+            # no fuzzy one/two/three-character rescue for compact identifiers.
+            if (distance != 0 or not serial_repeated
+                    or not {"hospital", "product", "phone"} <= support
+                    or not any(len(v) == 8 and v.isascii() and v.isdigit()
+                               for v in set(ev["phone_candidates"]) & facts["phones"])):
+                return None
         if distance == 0:
             safe = (serial_repeated and {"hospital", "product"} <= support) or (
                 "product" in support and "phone" in support
@@ -322,6 +340,56 @@ def diagnostic_pool(tasks, ev, job_type):
             "repeated_product_count": len(_stable(ev, "product_raw")),
             "repeated_hospital_count": len(_stable(ev, "hospital_raw")),
             "repeated_date_count": len(_stable(ev, "service_date_raw"))}
+
+
+def public_diagnostic(audit):
+    """Project a private audit onto fixed categories, counts and booleans only.
+
+    Never serialize the audit wholesale: future private fields, exception
+    messages and task/OCR values must not enter public Actions logs.
+    """
+    if not isinstance(audit, dict) or audit.get("version") != RULESET_VERSION:
+        return {}
+    allowed_reasons = {
+        "vision_read_unavailable", "checklist_read_unavailable", "pm_crosspage_read",
+        "device_candidate_limit", "missing_serial_not_unique", "index_miss",
+        "serial_first_retrieval", "task_candidate_limit", "live_tasks_read",
+        "live_identity_not_confirmed", "crosspage_identity_conflict",
+        "repeated_order_conflict", "live_order_conflict", "live_devices_tied",
+        "repeated_dates_conflict", "live_visit_date_conflict", "live_visits_tied",
+        "action_date_live_visit_confirmed", "missing_hospital_fuzzy_needs_action_date",
+        "upload_date_unknown", "need_crosspage_before_upload_prior",
+        "upload_prior_not_unique", "upload_prior_live_visit_confirmed",
+    }
+    def count(value, ceiling):
+        return min(max(value, 0), ceiling) if type(value) is int else 0
+    result = {
+        "version": RULESET_VERSION,
+        "trace": [v for v in (audit.get("trace") or [])
+                  if isinstance(v, str) and v in allowed_reasons][:30],
+        "reference_date_known": audit.get("reference_date_known") is True,
+        "read_count": count(audit.get("read_count"), 100),
+        "crosspage_used": audit.get("crosspage_used") is True,
+    }
+    diagnostic = audit.get("last_live_diagnostic")
+    if not isinstance(diagnostic, dict):
+        return result
+    result["live"] = {k: count(diagnostic.get(k), MAX_LIVE_TASKS)
+                      for k in ("live_task_count", "repeated_product_count",
+                                "repeated_hospital_count", "repeated_date_count")}
+    rows = []
+    source_rows = diagnostic.get("nearest_live_facts")
+    for row in (source_rows if isinstance(source_rows, list) else [])[:MAX_DEVICE_ROWS]:
+        if not isinstance(row, dict):
+            continue
+        clean = {k: row.get(k) is True for k in (
+            "product_supported", "product_conflict", "hospital_supported",
+            "hospital_conflict", "phone_exact", "type_matches", "passes_identity")}
+        clean["serial_distance"] = count(row.get("serial_distance"), 99)
+        clean["asset_level"] = count(row.get("asset_level"), 2)
+        rows.append(clean)
+    result["live"]["nearest_live_facts"] = rows
+    return result
 
 
 def _checklist_read(doc, zoom):
