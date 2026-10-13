@@ -71,6 +71,22 @@ class ReleaseWiringTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 processor._ocr_and_match(None, "PM")
 
+    def test_experiment_flag_does_not_discard_original_upload_day(self):
+        with patch.dict(os.environ, {processor.MATCHING_RULES_ENV: matching_rules.RULESET_VERSION,
+                "JOBSHEET_EVIDENCE_LIVE_RULES": "1", processor.DRY_RUN_ENV: "1",
+                "JOBSHEET_ORIGINAL_UPLOAD_DATE": "2025-01-01"}), \
+             patch.object(matching_rules, "read_and_match", return_value=(None, 0, {})) as run:
+            processor._ocr_and_match("doc", "CM", reference_day=date(2026, 10, 5))
+        run.assert_called_once_with("doc", "CM", date(2026, 10, 5))
+
+    def test_experiment_legacy_date_is_only_used_when_manifest_date_is_unknown(self):
+        for supplied, expected in (("2026-10-05", date(2026, 10, 5)), ("", None)):
+            with patch.dict(os.environ, {"JOBSHEET_EVIDENCE_LIVE_RULES": "1",
+                    processor.DRY_RUN_ENV: "1", "JOBSHEET_ORIGINAL_UPLOAD_DATE": supplied}), \
+                 patch.object(matching_rules, "read_and_match", return_value=(None, 0, {})) as run:
+                processor._ocr_and_match("doc", "CM")
+            run.assert_called_once_with("doc", "CM", expected)
+
     def test_readonly_experimental_flag_cannot_enable_upload(self):
         with patch.dict(os.environ, {"JOBSHEET_EVIDENCE_LIVE_RULES": "1",
                                     processor.MATCHING_RULES_ENV: matching_rules.RULESET_VERSION,

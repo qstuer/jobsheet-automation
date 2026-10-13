@@ -557,7 +557,10 @@ def _ocr_and_match(doc, job_type, reference_day=None):
         if os.environ.get(DRY_RUN_ENV) != "1":
             raise ValueError("Integrated evidence rules require read-only mode")
         from . import matching_rules
-        reference_day = asana_client._parse_date(os.environ.get("JOBSHEET_ORIGINAL_UPLOAD_DATE"))
+        # An explicitly supplied source-manifest date is authoritative. The
+        # legacy experiment environment is only a fallback, not an override.
+        reference_day = reference_day or asana_client._parse_date(
+            os.environ.get("JOBSHEET_ORIGINAL_UPLOAD_DATE"))
         return matching_rules.read_and_match(doc, job_type, reference_day)
     engine = os.environ.get(MATCHING_RULES_ENV, "").strip()
     if engine:

@@ -137,11 +137,21 @@ def live_pool(rows, ev, reference_day):
     if len(refs) > MAX_LIVE_TASKS:
         return [], "task_candidate_limit"
     # NO indexed type/date filtering: both may have changed since the snapshot.
-    tasks = [ac._fetch_task(gid) for gid in refs]
-    if not rows:
+    gids = set(refs)
+    if rows:
+        # The index narrows equipment, not the set of visits forever. A new
+        # service task may have been created after this snapshot. Refresh only
+        # exact literal device serials from retrieved non-weak rows, never a
+        # workspace-wide phone/asset query or fuzzy serial expansion.
+        for serial in sorted({ac._norm(row.get("serial")) for row in rows})[:MAX_DEVICE_ROWS]:
+            compact_guard = (ocr_reference.compact_serial_token(serial) is not None
+                and bool(_stable(ev, "product_raw")) and bool(_stable(ev, "hospital_raw"))
+                and any(len(v) == 8 and v.isascii() and v.isdigit() for v in ev["phone_candidates"]))
+            if vision._valid_serial_token(serial) or compact_guard:
+                gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
+    else:
         # New equipment may not be indexed. Only transcribed serials are used;
         # unbounded phone/asset workspace searches are deliberately avoided.
-        gids = set()
         for serial in _serials(ev)[:3]:
             compact_guard = (
                 ocr_reference.compact_serial_token(serial) is not None
@@ -153,9 +163,9 @@ def live_pool(rows, ev, reference_day):
             if not vision._valid_serial_token(serial) and not compact_guard:
                 continue
             gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
-        if len(gids) > MAX_LIVE_TASKS:
-            return [], "task_candidate_limit"
-        tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
+    if len(gids) > MAX_LIVE_TASKS:
+        return [], "task_candidate_limit"
+    tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
     return tasks, "live_tasks_read"
 
 

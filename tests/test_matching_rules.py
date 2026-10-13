@@ -151,6 +151,38 @@ class MatchingRulesTests(unittest.TestCase):
         fetch.assert_called_once_with("101")
         self.assertIsNotNone(self.choose(pool)[0])
 
+    def test_indexed_device_also_reads_new_visits_missing_from_old_snapshot(self):
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        tasks = {"101": task("101", due="2026-08-28"), "102": task("102")}
+        with patch.object(ac, "_typeahead", return_value=[{"gid": "101"}, {"gid": "102"}]) as search, \
+             patch.object(ac, "_fetch_task", side_effect=lambda gid: tasks[gid]) as fetch:
+            pool, _ = rules.live_pool(rows, rules.evidence([reading()] * 2), self.upload)
+        search.assert_called_once_with("ABC12X3456")
+        self.assertEqual(2, fetch.call_count)
+        self.assertEqual("102", self.choose(pool)[0]["gid"])
+
+    def test_live_refresh_keeps_full_candidate_limit_and_never_drops_rivals(self):
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        with patch.object(ac, "_typeahead", return_value=[{"gid": str(i)} for i in range(81)]), \
+             patch.object(ac, "_fetch_task") as fetch:
+            pool, reason = rules.live_pool(rows, rules.evidence([reading()] * 2), self.upload)
+        self.assertEqual(([], "task_candidate_limit"), (pool, reason))
+        fetch.assert_not_called()
+
+    def test_live_refresh_failure_does_not_silently_choose_old_index_work(self):
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        with patch.object(ac, "_typeahead", side_effect=ac.AsanaError("offline")), \
+             patch.object(ac, "_fetch_task") as fetch:
+            with self.assertRaises(ac.AsanaError):
+                rules.live_pool(rows, rules.evidence([reading()] * 2), self.upload)
+        fetch.assert_not_called()
+
+    def test_official_hospital_abbreviation_is_not_an_unknown_code(self):
+        self.assertEqual("HKBH", ac.hospital_core("HKBH"))
+        self.assertEqual("HKBH", ac.hospital_core("Hong Kong Baptist Hospital"))
+        for code in ("PN", "KWM", "PYTV"):
+            self.assertIsNone(ac.hospital_core(code))
+
     def test_candidate_limit_does_not_drop_rivals(self):
         index = {"devices": [{"serial": "ABC12X3456", "task_refs": []} for _ in range(11)]}
         rows, reason = rules.retrieve_rows(index, rules.evidence([reading()]*2))

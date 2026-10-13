@@ -160,6 +160,9 @@ HOSPITAL_SHORT_ALIASES = {
     "PYN": "PYNEH", "PYNEH": "PYNEH", "PMH": "PMH",
     "HKCH": "HKCH", "PWH": "PWH", "UCH": "UCH", "TMH": "TMH",
     "NDH": "NDH", "GH": "GH",
+    # Official abbreviation, not learned from a sample/device co-location:
+    # https://www.hkbh.org.hk/about-us/about-hkbh/?lang=en
+    "HKBH": "HKBH", "HONGKONGBAPTISTHOSPITAL": "HKBH",
 }
 
 # === OCR 多輪交叉核對 ===
