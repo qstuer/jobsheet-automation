@@ -17,6 +17,34 @@ on:
         options:
           - deepseek
           - nvidia
+      trace_source_id:
+        description: 'Optional: exact private PDF ID for encrypted test-branch diagnosis'
+        required: false
+        type: string
+      trace_source_sha256:
+        description: 'Required for diagnosis: independently verified PDF fingerprint'
+        required: false
+        type: string
+      trace_recipient_key:
+        description: 'Required for diagnosis: base64 public RSA key; NEVER a private key'
+        required: false
+        type: string
+      trace_job_type:
+        description: 'Required for diagnosis: known CM or PM packet type'
+        required: false
+        type: string
+      trace_reference_date:
+        description: 'Required for diagnosis: real original upload date, YYYY-MM-DD'
+        required: false
+        type: string
+      trace_index_id:
+        description: 'Required for diagnosis: private device index file ID'
+        required: false
+        type: string
+      trace_manifest_id:
+        description: 'Required for diagnosis: private index manifest file ID'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -48,6 +76,7 @@ jobs:
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
       - name: Restore private Asana device index
+        if: inputs.trace_source_id == ''
         run: |
           rclone copyto \
             "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
@@ -56,8 +85,41 @@ jobs:
             "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
             /tmp/asana-device-index-manifest.json
       - run: pip install -r requirements.txt
+      - name: Install encrypted diagnostic dependencies
+        if: inputs.trace_source_id != ''
+        run: pip install -r requirements-ocr-trace.txt
+      - name: Verify encrypted diagnostic gates
+        if: inputs.trace_source_id != ''
+        run: python -m unittest tests.test_private_ocr_trace tests.test_private_trace_crypto tests.test_ocr_trace_cloud -q
+      - name: Record encrypted OCR evidence without cloud writes
+        if: inputs.trace_source_id != ''
+        env:
+          JOBSHEET_DRY_RUN: '1'
+          OCR_PROVIDER: nvidia
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          OCR_TRACE_SOURCE_ID: ${{ inputs.trace_source_id }}
+          OCR_TRACE_SOURCE_SHA256: ${{ inputs.trace_source_sha256 }}
+          OCR_TRACE_RECIPIENT_KEY: ${{ inputs.trace_recipient_key }}
+          OCR_TRACE_JOB_TYPE: ${{ inputs.trace_job_type }}
+          OCR_TRACE_REFERENCE_DATE: ${{ inputs.trace_reference_date }}
+          OCR_TRACE_INDEX_ID: ${{ inputs.trace_index_id }}
+          OCR_TRACE_MANIFEST_ID: ${{ inputs.trace_manifest_id }}
+        run: python -m src.ocr_trace_cloud
+      - name: Preserve only encrypted diagnostic evidence
+        if: always() && inputs.trace_source_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-ocr-evidence
+          path: |
+            tmp/ocr-traces/cloud/events.encrypted.jsonl
+            tmp/ocr-traces/cloud/*.enc
+          retention-days: 1
+          if-no-files-found: error
       - name: Inspect one raw scan without cloud writes
-        if: github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'
+        if: inputs.trace_source_id == '' && github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'
         env:
           JOBSHEET_RAW_FILE:    ${{ inputs.raw_file }}
           OCR_PROVIDER:         ${{ inputs.ocr_provider }}
@@ -73,7 +135,7 @@ jobs:
       # Test branch only: raw_file is the exact existing _SPLIT PDF name.
       # Keep the production upload workflow disabled throughout this trial.
       - name: Inspect one prepared jobsheet without cloud writes
-        if: github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'
+        if: inputs.trace_source_id == '' && github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'
         env:
           JOBSHEET_TARGET_FILE: ${{ inputs.raw_file }}
           JOBSHEET_SOURCE_QUEUE: split

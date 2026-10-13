@@ -1,0 +1,4 @@
+# Diagnostic-only dependencies; not used by the production workflows.
+cryptography==46.0.5
+cffi==2.1.1
+pycparser==3.11

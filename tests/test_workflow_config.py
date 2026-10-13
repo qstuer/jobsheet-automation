@@ -93,8 +93,8 @@ class WorkflowConfigTests(unittest.TestCase):
 
     def test_split_trial_is_readonly_and_exclusive_to_the_test_branch(self):
         text = (ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml").read_text(encoding="utf-8")
-        self.assertIn("if: github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'", text)
-        self.assertIn("if: github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'", text)
+        self.assertIn("if: inputs.trace_source_id == '' && github.ref != 'refs/heads/codex/parser-ingress-fix-20261013'", text)
+        self.assertIn("if: inputs.trace_source_id == '' && github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'", text)
         self.assertIn("JOBSHEET_TARGET_FILE: ${{ inputs.raw_file }}", text)
         self.assertIn("JOBSHEET_SOURCE_QUEUE: split", text)
         self.assertIn("JOBSHEET_DRY_RUN: '1'", text)
@@ -102,6 +102,17 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertIn("JOBSHEET_CONFIRMED_FILENAME: ''", text)
         self.assertIn("python -m src.processor", text)
         self.assertNotIn("repository_dispatch", text)
+
+    def test_ocr_diagnosis_artifact_is_ciphertext_only(self):
+        text = (ROOT / ".github" / "workflows" / "jobsheet-dry-run.yml").read_text(encoding="utf-8")
+        self.assertIn("python -m src.ocr_trace_cloud", text)
+        self.assertIn("events.encrypted.jsonl", text)
+        self.assertIn("tmp/ocr-traces/cloud/*.enc", text)
+        self.assertNotIn("path: tmp/ocr-traces", text)
+        self.assertNotIn("recipient.private", text)
+        self.assertNotIn("onedrive:", text.lower())
+        self.assertNotIn("rclone move", text.lower())
+        self.assertNotIn("contents: write", text)
 
     def test_asana_workspace_id_is_not_treated_as_a_secret(self):
         for workflow_name in (
