@@ -64,15 +64,24 @@ def evidence(readings):
     result = {field: {} for field in fields}
     for reading in readings:
         for field in fields:
+            if field in (reading.get("_evidence_exclusions") or {}):
+                continue
             for key in {_key(field, v) for v in _values(reading, field)} - {""}:
-                item = result[field].setdefault(key, {"votes": 0, "pages": Counter()})
-                item["votes"] += 1
-                item["pages"][reading.get("_page", 0)] += 1
+                item = result[field].setdefault(key, {"votes": 0, "pages": Counter(), "auxiliary_votes": 0})
+                if ocr_reference.field_can_vote(reading, field):
+                    item["votes"] += 1
+                    item["pages"][reading.get("_page", 0)] += 1
+                else:
+                    item["auxiliary_votes"] += 1
     return result
 
 
 def _stable(ev, field):
     return {key for key, item in ev[field].items() if item["votes"] >= 2}
+
+
+def _auxiliary_repeated(ev, field):
+    return {key for key, item in ev[field].items() if item.get("auxiliary_votes", 0) >= 2}
 
 
 def _strong_conflict(ev, field, actual):
@@ -85,6 +94,55 @@ def _serials(ev):
     return sorted(set(ev["serial_candidates"]) | set(ev["serial_visual_candidates"]))
 
 
+def _serial_distance(observed, actual):
+    if ocr_reference.compact_serial_hint(observed) or ocr_reference.compact_serial_hint(actual):
+        return ocr_reference.compact_ocr_distance(observed, actual)
+    return ac._lev(observed, actual)
+
+
+def _full_phones(values):
+    return {v for v in values if len(v) == 8 and v.isascii() and v.isdigit()}
+
+
+def _weak_compact_hints(index, ev):
+    """Read old weak-row task references, never treat the row as a device.
+
+    All retrieval fields must co-occur on one historical task. Do not combine
+    another visit's phone/product/location. A live parsed compact serial,
+    repeated OCR and a reliable service date are still required later.
+    """
+    observed = _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+    if not any(ocr_reference.compact_serial_hint(v) for v in observed):
+        return []
+    products, hospitals = _stable(ev, "product_raw"), _stable(ev, "hospital_raw")
+    phones = _full_phones(_stable(ev, "phone_candidates"))
+    assets = _stable(ev, "asset_candidates")
+    if not products or not hospitals or not phones:
+        return []
+    hints = []
+    for row in index["devices"]:
+        if not row.get("weak_identity"):
+            continue
+        refs = []
+        for ref in row.get("task_refs") or []:
+            product = ac._norm(ac.product_group(ref.get("product_variant") or ref.get("product")))
+            phone = bool(_full_phones({ac._norm(v) for v in ref.get("phones") or []}) & phones)
+            exact_asset = bool({ac._norm(v) for v in ref.get("assets") or []} & assets)
+            # A legacy whitelist sometimes erased the entire product field.
+            # In that narrow case require both same-task phone and exact Asset
+            # for retrieval only. Never borrow product from a different visit.
+            product_hint = product in products or (not product and exact_asset)
+            if not (ref.get("gid") and phone and product_hint):
+                continue
+            hospital = {_key("hospital_raw", v) for v in (
+                ref.get("hospital"), *(ref.get("hospital_aliases") or [])) if v} - {""}
+            if hospital & hospitals:
+                refs.append(ref)
+        if refs:
+            hints.append({**row, "task_refs": refs, "_retrieval_hint_only": True})
+    return hints
+
+
 def retrieve_rows(index, ev):
     """Serial-first retrieval; stale product/date fields cannot veto an exact ID."""
     if not isinstance(index, dict) or not isinstance(index.get("devices"), list):
@@ -95,6 +153,11 @@ def retrieve_rows(index, ev):
         serial = ac._norm(row.get("serial"))
         if not serial or row.get("weak_identity"):
             continue
+        if serials:
+            distance = min(_serial_distance(s, serial) for s in serials)
+            similarity = max(ac._key_similarity(s, serial) for s in serials)
+            if distance > 3 or similarity < 0.5:
+                continue
         families = {ac._norm(ac.product_group(v)) for v in (
             *(row.get("product_variants") or []), *(row.get("product_families") or []))} - {""}
         hospitals = {ac._norm(ac.hospital_core(v)) for v in (
@@ -103,10 +166,6 @@ def retrieve_rows(index, ev):
         hospital = bool(hospitals & set(ev["hospital_raw"]))
         phone = bool({ac._norm(v) for v in row.get("phones") or []} & set(ev["phone_candidates"]))
         if serials:
-            distance = min(ac._lev(s, serial) for s in serials)
-            similarity = max(ac._key_similarity(s, serial) for s in serials)
-            if distance > 3 or similarity < 0.5:
-                continue
             # Loose retrieval only. Final acceptance uses the live task below.
             if distance >= 2 and not (product and hospital):
                 continue
@@ -120,15 +179,18 @@ def retrieve_rows(index, ev):
     ranked.sort(key=lambda item: item[0])
     if not serials and len(ranked) != 1:
         return [], "missing_serial_not_unique"
-    if not ranked:
+    # An old parser may leave a compact device under a weak row. Retrieve its
+    # bounded historical task references only; identity is established live.
+    hints = _weak_compact_hints(index, ev)
+    if not ranked and not hints:
         return [], "index_miss"
     # Retain a near neighbour to allow live corroboration of a handwriting
     # error, even when the erroneous spelling happens to be another device.
-    closest = ranked[0][0][0]
-    close = [row for rank, row in ranked if rank[0] <= closest + 1]
+    closest = ranked[0][0][0] if ranked else 0
+    close = [row for rank, row in ranked if rank[0] <= closest + 1] + hints
     if len(close) > MAX_DEVICE_ROWS:
         return [], "device_candidate_limit"  # Never silently exclude a rival.
-    return close, "serial_first_retrieval"
+    return close, "weak_compact_task_hints" if hints else "serial_first_retrieval"
 
 
 def live_pool(rows, ev, reference_day):
@@ -143,7 +205,8 @@ def live_pool(rows, ev, reference_day):
         # service task may have been created after this snapshot. Refresh only
         # exact literal device serials from retrieved non-weak rows, never a
         # workspace-wide phone/asset query or fuzzy serial expansion.
-        for serial in sorted({ac._norm(row.get("serial")) for row in rows})[:MAX_DEVICE_ROWS]:
+        for serial in sorted({ac._norm(row.get("serial")) for row in rows
+                              if not row.get("weak_identity") and not row.get("_retrieval_hint_only")})[:MAX_DEVICE_ROWS]:
             compact_guard = (ocr_reference.compact_serial_token(serial) is not None
                 and bool(_stable(ev, "product_raw")) and bool(_stable(ev, "hospital_raw"))
                 and any(len(v) == 8 and v.isascii() and v.isdigit() for v in ev["phone_candidates"]))
@@ -166,6 +229,28 @@ def live_pool(rows, ev, reference_day):
     if len(gids) > MAX_LIVE_TASKS:
         return [], "task_candidate_limit"
     tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
+    if any(row.get("_retrieval_hint_only") for row in rows):
+        # A legacy hint must not freeze the visit list at the old snapshot.
+        # Only serials actually read from corroborated live task fields can
+        # refresh visits. The ambiguous OCR token itself is never expanded.
+        repeated = _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+        serials = set()
+        for task in tasks:
+            facts = _live_facts(task)
+            if (facts and ocr_reference.compact_serial_token(facts["serial"])
+                    and any(ocr_reference.compact_ocr_distance(v, facts["serial"]) <= 1 for v in repeated)
+                    and _stable(ev, "product_raw") & facts["product"]
+                    and _stable(ev, "hospital_raw") & facts["hospital"]
+                    and _full_phones(_stable(ev, "phone_candidates") & facts["phones"])):
+                serials.add(facts["serial"])
+        if len(serials) > MAX_DEVICE_ROWS:
+            return [], "device_candidate_limit"
+        for serial in sorted(serials):
+            gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
+            if len(gids) > MAX_LIVE_TASKS:
+                return [], "task_candidate_limit"
+        loaded = {str(task["gid"]) for task in tasks}
+        tasks.extend(ac._fetch_task(gid) for gid in sorted(gids - loaded))
     return tasks, "live_tasks_read"
 
 
@@ -208,22 +293,39 @@ def assess_task(task, ev, job_type):
            for name in ev["contact_person_raw"] for other in facts["contacts"]):
         support.add("contact")
     serials = _serials(ev)
-    distance = min((ac._lev(s, facts["serial"]) for s in serials), default=99)
+    distance = min((_serial_distance(s, facts["serial"]) for s in serials), default=99)
     serial_repeated = facts["serial"] in _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
     missing_hospital_fuzzy = False
+    compact_ambiguity = False
+    format_corroborated = False
+    # Recovered prose does not vote itself into certainty. On a normal exact
+    # repeated serial ONLY, live fields plus the opposite strong identity
+    # field, repeated full phone, type and reliable date can corroborate it.
+    # Two auxiliary fields cannot bootstrap each other into an identity.
+    if (distance == 0 and serial_repeated and vision._valid_serial_token(facts["serial"])
+            and _full_phones(_stable(ev, "phone_candidates") & facts["phones"])):
+        if ("hospital" in support and "product" not in support
+                and _auxiliary_repeated(ev, "product_raw") & facts["product"]):
+            support.add("product")
+            format_corroborated = True
+        elif ("product" in support and "hospital" not in support
+                and _auxiliary_repeated(ev, "hospital_raw") & facts["hospital"]):
+            support.add("hospital")
+            format_corroborated = True
     if serials:
         if distance > 3:
             return None
-        compact_nearest = any(ocr_reference.compact_serial_token(s)
-                              and ac._lev(s, facts["serial"]) == distance for s in serials)
+        compact_nearest = any(ocr_reference.compact_serial_hint(s)
+                              and _serial_distance(s, facts["serial"]) == distance for s in serials)
         if ocr_reference.compact_serial_token(facts["serial"]) or compact_nearest:
-            # Short serials carry less distinctiveness. Require a literal exact
-            # reading and independent product, hospital and full-phone support;
-            # no fuzzy one/two/three-character rescue for compact identifiers.
-            if (distance != 0 or not serial_repeated
+            repeated = _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+            compact_ambiguity = (distance == 1
+                and any(ocr_reference.compact_ocr_distance(v, facts["serial"]) == 1 for v in repeated))
+            if ((not (distance == 0 and serial_repeated) and not compact_ambiguity)
                     or not {"hospital", "product", "phone"} <= support
-                    or not any(len(v) == 8 and v.isascii() and v.isdigit()
-                               for v in set(ev["phone_candidates"]) & facts["phones"])):
+                    or not _full_phones(set(ev["phone_candidates"]) & facts["phones"])):
+                return None
+            if compact_ambiguity and not _full_phones(_stable(ev, "phone_candidates") & facts["phones"]):
                 return None
         if distance == 0:
             safe = (serial_repeated and {"hospital", "product"} <= support) or (
@@ -254,7 +356,8 @@ def assess_task(task, ev, job_type):
              + (10 if asset == 2 else 5 if asset == 1 else 0))
     return {"task": task, "facts": facts, "score": score, "support": support,
             "serial_distance": distance,
-            "requires_reliable_date": missing_hospital_fuzzy}
+            "requires_reliable_date": missing_hospital_fuzzy or compact_ambiguity or format_corroborated,
+            "compact_ambiguity": compact_ambiguity, "format_corroborated": format_corroborated}
 
 
 def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
@@ -283,6 +386,10 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     devices = defaultdict(list)
     for row in candidates:
         devices[row["facts"]["serial"]].append(row)
+    if len(devices) > MAX_DEVICE_ROWS:
+        return None, "device_candidate_limit"
+    if any(row.get("compact_ambiguity") for row in candidates) and len(devices) != 1:
+        return None, "compact_serial_not_unique"
     ranking = sorted(devices, key=lambda s: max(r["score"] for r in devices[s]), reverse=True)
     if len(ranking) > 1 and (max(r["score"] for r in devices[ranking[0]])
                             - max(r["score"] for r in devices[ranking[1]])) < 15:
@@ -307,7 +414,9 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
             return None, "live_visits_tied"
         return best["task"], "action_date_live_visit_confirmed"
     if any(row.get("requires_reliable_date") for row in visits):
-        return None, "missing_hospital_fuzzy_needs_action_date"
+        return None, ("compact_serial_needs_action_date" if any(row.get("compact_ambiguity") for row in visits)
+                      else "format_recovery_needs_action_date" if any(row.get("format_corroborated") for row in visits)
+                      else "missing_hospital_fuzzy_needs_action_date")
     if reference_day is None:
         return None, "upload_date_unknown"
     if not allow_upload_prior:
@@ -335,7 +444,7 @@ def diagnostic_pool(tasks, ev, job_type):
             continue
         serials = _serials(ev)
         rows.append({
-            "serial_distance": min((ac._lev(v, facts["serial"]) for v in serials), default=99),
+            "serial_distance": min((_serial_distance(v, facts["serial"]) for v in serials), default=99),
             "product_supported": bool(_stable(ev, "product_raw") & facts["product"]),
             "product_conflict": _strong_conflict(ev, "product_raw", facts["product"]),
             "hospital_supported": bool(_stable(ev, "hospital_raw") & facts["hospital"]),
@@ -370,6 +479,9 @@ def public_diagnostic(audit):
         "action_date_live_visit_confirmed", "missing_hospital_fuzzy_needs_action_date",
         "upload_date_unknown", "need_crosspage_before_upload_prior",
         "upload_prior_not_unique", "upload_prior_live_visit_confirmed",
+        "product_reread_drift",
+        "weak_compact_task_hints", "compact_serial_not_unique", "compact_serial_needs_action_date",
+        "format_recovery_needs_action_date",
     }
     def count(value, ceiling):
         return min(max(value, 0), ceiling) if type(value) is int else 0
@@ -436,9 +548,15 @@ def read_and_match(doc, job_type, reference_day=None):
     readings = []
     trace = []
     last_diagnostic = {}
-    def read(call, source):
+    def read(call, source, field=None):
         try:
-            readings.append({**call(), "_page": 0, "_source": source})
+            result = {**call(), "_page": 0, "_source": source,
+                      "_read_context": {"stage": source, "field": field}}
+            if field == "product_raw" and ocr_reference.product_focus_conflicts(readings, result):
+                result["_evidence_exclusions"] = {"product_raw": "product_reread_drift"}
+                result.setdefault("_ocr_audit", {})["evidence_exclusions"] = dict(result["_evidence_exclusions"])
+                trace.append("product_reread_drift")
+            readings.append(result)
         except vision.NvidiaResponseError:
             trace.append("vision_read_unavailable")
     read(lambda: vision.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_DEFAULT), "cover")
@@ -473,9 +591,9 @@ def read_and_match(doc, job_type, reference_day=None):
                 continue
             for zoom in (5.0, 6.0):
                 if field in {"product_raw", "hospital_raw"}:
-                    read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus")
+                    read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus", field)
                 else:
-                    read(lambda f=field, z=zoom: vision.ocr_jobsheet_focused_field(doc, 0, f, zoom=z), "cover_focus")
+                    read(lambda f=field, z=zoom: vision.ocr_jobsheet_focused_field(doc, 0, f, zoom=z), "cover_focus", field)
         task = attempt()
     if task is None and job_type == "PM":
         for zoom in (5.0, 6.0):

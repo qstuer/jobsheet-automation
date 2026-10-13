@@ -34,7 +34,12 @@ MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
 PRODUCT_GROUP_NAMES = {"EPIQ", "Affiniti", "CX"}
 # Confirmed spelling variant, not permission to invent a missing suffix.
-OCR_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G", *sorted(PRODUCT_GROUP_NAMES)]
+# Verified literal product spellings from independently checked service records.
+# This is lexical knowledge only, not an assertion about any device or visit.
+# Keep legacy models even when an old index could not parse their serials.
+VERIFIED_SERVICE_PRODUCT_NAMES = ["Affiniti 50W", "EPIQ 5W", "IU22", "TC20"]
+OCR_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G",
+                     *VERIFIED_SERVICE_PRODUCT_NAMES, *sorted(PRODUCT_GROUP_NAMES)]
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -143,7 +148,11 @@ def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
     best_d = min((d for _, d in distances), default=99)
     best = [p for p, d in distances if d == best_d]
     # Very short tokens are too ambiguous to correct by edit distance.
-    return best[0] if len(target) >= 4 and best_d <= MAX_PRODUCT_DIST and len(best) == 1 else ocr_product
+    # Four-character legacy model labels carry little alphabetic evidence.
+    # One letter slip is recoverable; two wrong letters must not be certified
+    # just because the small vocabulary contains only one matching number.
+    limit = 1 if len(target) == 4 else MAX_PRODUCT_DIST
+    return best[0] if len(target) >= 4 and best_d <= limit and len(best) == 1 else ocr_product
 
 
 def product_family(value: Optional[str]) -> Optional[str]:

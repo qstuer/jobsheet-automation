@@ -567,7 +567,7 @@ def _visible_serial_token(value: str) -> Optional[str]:
     from . import ocr_reference
     # Keep a short literal as visual evidence only. It is NOT added to the
     # normal valid-serial list and cannot initiate unguarded live search.
-    return ocr_reference.compact_serial_token(value)
+    return ocr_reference.compact_serial_hint(value)
 
 
 def _hospital_is_plausible(value: Optional[str]) -> bool:
@@ -807,7 +807,30 @@ def _normalize_ocr_data(candidate: dict) -> dict:
     return data
 
 
-def _read_card(image_b64: str, prompt: str, required_keys: set) -> dict:
+def _recover_context_literal(raw: str, field: str) -> Optional[dict]:
+    """Recover one quoted value from a narrow single-field reply grammar.
+
+    This is auxiliary evidence, not an independently confirmed JSON vote.
+    Do not extract arbitrary prose, instructions, multiple answers or a value
+    from a multi-field response. The general JSON parser remains strict.
+    """
+    if field not in {"product_raw", "hospital_raw"} or not isinstance(raw, str):
+        return None
+    match = re.fullmatch(
+        r"\s*The visible (?:string|value) is ([\"'])([^\"'\r\n]{1,80})\1\.?\s*", raw)
+    if not match:
+        return None
+    normalized = _normalize_ocr_data({field: match.group(2)})
+    if not normalized.get(field):
+        return None
+    normalized["_auxiliary_fields"] = [field]
+    normalized["_ocr_audit"]["format_recovery"] = {
+        "reason": "quoted_single_field_literal", "field": field,
+        "raw_reply": raw, "evidence_strength": "auxiliary_only"}
+    return normalized
+
+
+def _read_card(image_b64: str, prompt: str, required_keys: set, *, literal_field=None) -> dict:
     """同一張卡格式錯誤時只重試一次；內容看不清由後續單格複核。"""
     last_error = None
     for _ in range(2):
@@ -819,6 +842,10 @@ def _read_card(image_b64: str, prompt: str, required_keys: set) -> dict:
             return _normalize_ocr_data(candidate)
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
+            if required_keys == {literal_field}:
+                recovered = _recover_context_literal(raw, literal_field)
+                if recovered is not None:
+                    return recovered
     raise NvidiaResponseError("圖片 OCR 連續兩次回覆格式不正確") from last_error
 
 
@@ -1233,7 +1260,7 @@ def _context_field_prompt(field: str, vocabulary: dict) -> str:
         families = ", ".join(vocabulary["product_families"])
         models = ", ".join(vocabulary["product_models"])
         guidance = (
-            f"Confirmed product families in the private index include {families}. "
+            f"Verified product spelling reference includes families {families}. "
             f"Confirmed model spellings include {models}. "
             "This is spelling context, NOT a multiple-choice test. "
             "Copy only the model variant actually supported by the handwriting; "
@@ -1285,7 +1312,7 @@ def ocr_jobsheet_context_field(
     image_b64 = crop_jobsheet_field_card(
         pdf_doc, page_idx, (field,), zoom=zoom, focused=True,
     )
-    return _read_card(image_b64, prompt, {field})
+    return _read_card(image_b64, prompt, {field}, literal_field=field)
 
 
 def ocr_jobsheet_serial_candidates(

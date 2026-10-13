@@ -25,7 +25,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, asana_index, batch_state, config, nvidia_client, pending_review, private_ocr_context, rclone_helper, selection_audit
+from . import asana_client, asana_index, batch_state, config, nvidia_client, ocr_reference, pending_review, private_ocr_context, rclone_helper, selection_audit
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -285,6 +285,8 @@ def _consensus_ocr(readings: list) -> dict:
     for field in scalar_fields:
         buckets = {}
         for reading in readings:
+            if not ocr_reference.field_can_vote(reading, field):
+                continue
             value = reading.get(field)
             if field == "hospital_raw":
                 # Keep identical raw short-code readings even when that code

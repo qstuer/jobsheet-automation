@@ -11,6 +11,8 @@ from collections import Counter
 
 from . import asana_client, product_catalog
 
+MAX_PRODUCT_MODELS = 32
+
 
 def build_vocabulary(index: dict) -> dict:
     if (not isinstance(index, dict) or index.get("schema_version") != 3
@@ -18,24 +20,23 @@ def build_vocabulary(index: dict) -> dict:
             or not isinstance(index.get("location_directory"), list)):
         raise ValueError("A validated private device index is required")
 
-    models: Counter[str] = Counter()
-    families: Counter[str] = Counter()
+    # Device identity quality must not decide whether a verified word exists.
+    # The small verified lexicon also retains rare models absent from this
+    # snapshot. Frequency never certifies a previously unknown spelling.
+    models = {name for name in asana_client.OCR_PRODUCT_NAMES
+              if product_catalog.inspect_product(name)["status"] == "confirmed"}
     for device in index["devices"]:
-        if not isinstance(device, dict) or device.get("weak_identity") or not device.get("serial"):
+        if not isinstance(device, dict):
             continue
-        seen = set()
         for variant in device.get("product_variants") or []:
             assessment = product_catalog.inspect_product(variant)
             if assessment["status"] != "confirmed":
                 continue
-            model = assessment["canonical"]
-            if model not in seen:
-                seen.add(model)
-                models[model] += 1
-        for model in seen:
-            family = asana_client.product_group(model)
-            if family:
-                families[family] += 1
+            models.add(assessment["canonical"])
+    if len(models) > MAX_PRODUCT_MODELS:
+        # Never silently drop the less frequent alternatives from a prompt.
+        raise ValueError("Verified product vocabulary exceeds its review limit")
+    families = {asana_client.product_group(model) for model in models} - {None}
 
     codes: Counter[str] = Counter()
     groups = []
@@ -54,8 +55,8 @@ def build_vocabulary(index: dict) -> dict:
             groups.append((count, aliases))
 
     result = {
-        "product_families": [name for name, _ in families.most_common(4)],
-        "product_models": [name for name, _ in models.most_common(12)],
+        "product_families": sorted(families),
+        "product_models": sorted(models),
         "hospital_codes": [name for name, _ in codes.most_common(20)],
         "same_hospital_codes": [aliases for _, aliases in
                                 sorted(groups, key=lambda row: (-row[0], row[1]))[:4]],
