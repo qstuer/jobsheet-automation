@@ -1153,7 +1153,12 @@ def _process_split_file(filename: str, work_dir: Path,
             message = pending_review.REASON_MESSAGES.get(reviewed["reason"], "證據不足")
             return {"status": f"受控核對：{message}；仍待確認", "reason": reviewed["reason"],
                     "candidate_count": reviewed.get("candidate_count")}
-        planned, _ = _planned_filename(reviewed["task"])
+        try:
+            planned, _ = _planned_filename(reviewed["task"])
+        except asana_client.AmbiguousOrderNumberError:
+            local.unlink(missing_ok=True)
+            return {'status': '受控核對：訂單號有歧義；仍待確認',
+                    'reason': 'ambiguous_order_numbers'}
         proof = selection_audit.receipt(
             local, task_gid=str(reviewed["task"].get("gid") or ""), filename=planned,
         )
@@ -1162,6 +1167,10 @@ def _process_split_file(filename: str, work_dir: Path,
                 "selection_receipt": proof,
                 "ocr_metrics": ocr.get("ocr_metrics", {})}
 
+    naming_blocked = task is not None and asana_client.resolve_order_number(task)['status'] == 'ambiguous'
+    if naming_blocked:
+        task, tier = None, 0
+        log.info('  訂單號有歧義，保持待核對')
     if task is not None:
         log.info(f"  Asana 第 {tier} 層命中")
         planned, order_no = _planned_filename(task)
@@ -1187,7 +1196,7 @@ def _process_split_file(filename: str, work_dir: Path,
         # remains pending.  No guessed task or order number is attached.
         # The promoted engine must not bypass its rejection through a second,
         # untested legacy matcher. Keep the old exception only in legacy mode.
-        neutral = (None if ocr.get("rules_audit") or os.environ.get(MATCHING_RULES_ENV, "").strip()
+        neutral = (None if naming_blocked or ocr.get("rules_audit") or os.environ.get(MATCHING_RULES_ENV, "").strip()
                    else asana_client.neutral_name_for_ambiguous_visit(ocr, job_type))
         if neutral:
             if dry_run:

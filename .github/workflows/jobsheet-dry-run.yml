@@ -45,6 +45,12 @@ on:
         description: 'Required for diagnosis: private index manifest file ID'
         required: false
         type: string
+      trace_index_mode:
+        description: 'Diagnostic only: runner-local rebuild never replaces Drive index'
+        required: false
+        default: download
+        type: choice
+        options: [download, local_rebuild]
 
 permissions:
   contents: read
@@ -95,6 +101,8 @@ jobs:
         if: inputs.trace_source_id != ''
         env:
           JOBSHEET_DRY_RUN: '1'
+          JOBSHEET_DEVICE_SEARCH_AGENT: '1'
+          JOBSHEET_DATE_CORROBORATION: '1'
           OCR_PROVIDER: nvidia
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
@@ -107,6 +115,7 @@ jobs:
           OCR_TRACE_REFERENCE_DATE: ${{ inputs.trace_reference_date }}
           OCR_TRACE_INDEX_ID: ${{ inputs.trace_index_id }}
           OCR_TRACE_MANIFEST_ID: ${{ inputs.trace_manifest_id }}
+          OCR_TRACE_INDEX_MODE: ${{ inputs.trace_index_mode || 'download' }}
         run: python -m src.ocr_trace_cloud
       - name: Preserve only encrypted diagnostic evidence
         if: always() && inputs.trace_source_id != ''
@@ -116,6 +125,7 @@ jobs:
           path: |
             tmp/ocr-traces/cloud/events.encrypted.jsonl
             tmp/ocr-traces/cloud/*.enc
+            tmp/ocr-traces/test-index/*.enc
           retention-days: 1
           if-no-files-found: error
       - name: Inspect one raw scan without cloud writes

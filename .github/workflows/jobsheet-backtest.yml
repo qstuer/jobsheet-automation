@@ -6,11 +6,19 @@ on:
       ocr_provider:
         description: '本次回测使用的图片服务'
         required: true
-        default: deepseek
+        default: nvidia
         type: choice
         options:
           - deepseek
           - nvidia
+      sample_ids:
+        description: 'Optional anonymous subset, e.g. B01,B02; empty runs all 20'
+        required: false
+        type: string
+      recipient_key:
+        description: 'Base64 PUBLIC RSA key for encrypted evidence; never a private key'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,6 +32,7 @@ env:
 
 jobs:
   backtest:
+    if: github.ref == 'refs/heads/codex/parser-ingress-fix-20261013'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -45,23 +54,37 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-      - name: Download private fixtures and current index
+      - name: Download private fixtures only
         run: |
           mkdir -p /tmp/jobsheet-backtest
-          rclone copy \
-            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20" \
-            /tmp/jobsheet-backtest
+          for n in $(seq -w 1 20); do
+            rclone copyto \
+              "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/B${n}.pdf" \
+              "/tmp/jobsheet-backtest/B${n}.pdf"
+          done
           rclone copyto \
-            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index.json" \
-            /tmp/asana-device-index.json
-          rclone copyto \
-            "googledrive:From_BrotherDevice/.jobsheet-control/asana-device-index-manifest.json" \
-            /tmp/asana-device-index-manifest.json
-      - run: pip install -r requirements.txt
+            "googledrive:From_BrotherDevice/.jobsheet-control/backtest-20/manifest-reviewed-20260925.json" \
+            /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          echo "81db79beb6ec5e8ec037486a1bded33b0a07d7a2b35093bc39f88b5987a4355e  /tmp/jobsheet-backtest/manifest-reviewed-20260925.json" | sha256sum -c -
+      - run: pip install -r requirements.txt -r requirements-ocr-trace.txt
+      - name: Rebuild disposable test index without publishing to Drive
+        env:
+          JOBSHEET_DRY_RUN: '1'
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          OCR_TRACE_RECIPIENT_KEY: ${{ inputs.recipient_key }}
+        run: python -m src.readonly_test_index
       - name: Run 20 private samples without cloud writes
         env:
           JOBSHEET_BACKTEST_DIR: /tmp/jobsheet-backtest
-          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest.json
+          JOBSHEET_BACKTEST_MANIFEST: /tmp/jobsheet-backtest/manifest-reviewed-20260925.json
+          JOBSHEET_BACKTEST_SAMPLE_IDS: ${{ inputs.sample_ids }}
+          JOBSHEET_BACKTEST_REPORT: anonymous-results/backtest-results.json
+          JOBSHEET_BACKTEST_RECIPIENT_KEY: ${{ inputs.recipient_key }}
+          JOBSHEET_DRY_RUN: '1'
+          JOBSHEET_MATCHING_RULES: evidence-live-v2
+          JOBSHEET_DEVICE_SEARCH_AGENT: '1'
+          JOBSHEET_DATE_CORROBORATION: '1'
           OCR_PROVIDER: ${{ inputs.ocr_provider }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
@@ -69,9 +92,23 @@ jobs:
           NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
           ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
           ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
-          ASANA_INDEX_LOCAL_FILE: /tmp/asana-device-index.json
-          ASANA_INDEX_MANIFEST_LOCAL_FILE: /tmp/asana-device-index-manifest.json
-        run: python -m src.backtest
+          ASANA_INDEX_LOCAL_FILE: tmp/ocr-traces/test-index/asana-device-index.json
+          ASANA_INDEX_MANIFEST_LOCAL_FILE: tmp/ocr-traces/test-index/asana-device-index-manifest.json
+        run: |
+          mkdir -p anonymous-results
+          python -m src.backtest
+      - name: Preserve anonymous results and encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-only-regression-evidence
+          path: |
+            anonymous-results/*.json
+            tmp/ocr-traces/backtest/**/events.encrypted.jsonl
+            tmp/ocr-traces/backtest/**/*.enc
+            tmp/ocr-traces/test-index/*.enc
+          retention-days: 1
+          if-no-files-found: error
       - name: Cleanup private files and rclone config
         if: always()
         run: |

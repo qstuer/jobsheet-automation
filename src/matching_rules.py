@@ -8,18 +8,23 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, nvidia_client as vision, ocr_reference
+from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
 MAX_LIVE_TASKS = 80
 VISIT_WINDOW_DAYS = 14
+SEARCH_HARD_STOPS = {"device_candidate_limit", "task_candidate_limit", "live_devices_tied",
+                    "live_visits_tied", "compact_serial_not_unique", "crosspage_identity_conflict",
+                    "repeated_order_conflict", "live_order_conflict", "repeated_dates_conflict",
+                    "ambiguous_order_numbers", "signature_date_conflict", "signature_date_protocol_rejected"}
 CHECKLIST_HEADER = (0.05, 0.125, 0.95, 0.225)
 CHECKLIST_PROMPT = (
     "This is the top of Philips Ultrasound System PM Checklist page 1 of 3, "
@@ -84,6 +89,27 @@ def _auxiliary_repeated(ev, field):
     return {key for key, item in ev[field].items() if item.get("auxiliary_votes", 0) >= 2}
 
 
+def _should_recheck_stable_phone(ev, diagnostic, trace):
+    """A stable phone is not verified merely because two readings agree.
+
+    Only schedule the existing bounded focus pass, never weaken acceptance.
+    Require repeated identity clues; do not retry a phone already corroborated
+    on a plausible live task, or reinterpret known ties/conflicts as OCR faults.
+    """
+    if SEARCH_HARD_STOPS.intersection(trace):
+        return False
+    if (not _full_phones(_stable(ev, "phone_candidates"))
+            or len(_stable(ev, "product_raw")) != 1
+            or len(_stable(ev, "hospital_raw")) != 1
+            or not (_stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates"))):
+        return False
+    corroborated = any(row.get("phone_exact") and row.get("product_supported")
+        and row.get("hospital_supported") and row.get("type_matches")
+        and row.get("serial_distance", 99) <= 3
+        for row in diagnostic.get("nearest_live_facts", []))
+    return not corroborated
+
+
 def _strong_conflict(ev, field, actual):
     """A known repeated disagreement is different from an unknown short code."""
     stable = _stable(ev, field)
@@ -143,54 +169,20 @@ def _weak_compact_hints(index, ev):
     return hints
 
 
-def retrieve_rows(index, ev):
-    """Serial-first retrieval; stale product/date fields cannot veto an exact ID."""
-    if not isinstance(index, dict) or not isinstance(index.get("devices"), list):
-        raise asana_index.AsanaIndexError("Validated private index is required")
-    serials = _serials(ev)
-    ranked = []
-    for row in index["devices"]:
-        serial = ac._norm(row.get("serial"))
-        if not serial or row.get("weak_identity"):
-            continue
-        if serials:
-            distance = min(_serial_distance(s, serial) for s in serials)
-            similarity = max(ac._key_similarity(s, serial) for s in serials)
-            if distance > 3 or similarity < 0.5:
-                continue
-        families = {ac._norm(ac.product_group(v)) for v in (
-            *(row.get("product_variants") or []), *(row.get("product_families") or []))} - {""}
-        hospitals = {ac._norm(ac.hospital_core(v)) for v in (
-            *(row.get("hospitals") or []), *(row.get("hospital_aliases") or []))} - {""}
-        product = bool(families & set(ev["product_raw"]))
-        hospital = bool(hospitals & set(ev["hospital_raw"]))
-        phone = bool({ac._norm(v) for v in row.get("phones") or []} & set(ev["phone_candidates"]))
-        if serials:
-            # Loose retrieval only. Final acceptance uses the live task below.
-            if distance >= 2 and not (product and hospital):
-                continue
-            rank = (distance, -int(hospital), -int(product), -int(phone))
-        else:
-            exact_asset = bool({ac._norm(v) for v in row.get("assets") or []} & set(ev["asset_candidates"]))
-            if not (product and hospital and phone and exact_asset):
-                continue
-            rank = (0, -1, -1, -1)
-        ranked.append((rank, row))
-    ranked.sort(key=lambda item: item[0])
-    if not serials and len(ranked) != 1:
-        return [], "missing_serial_not_unique"
+def retrieve_rows(index, ev, readings=()):
+    """Search equipment history first; a retrieved row does not certify a visit."""
+    rows, reason = device_table_search.retrieve_table_rows(index, ev, readings)
+    if reason == "device_candidate_limit":
+        return [], reason
     # An old parser may leave a compact device under a weak row. Retrieve its
     # bounded historical task references only; identity is established live.
     hints = _weak_compact_hints(index, ev)
-    if not ranked and not hints:
-        return [], "index_miss"
-    # Retain a near neighbour to allow live corroboration of a handwriting
-    # error, even when the erroneous spelling happens to be another device.
-    closest = ranked[0][0][0] if ranked else 0
-    close = [row for rank, row in ranked if rank[0] <= closest + 1] + hints
+    if not rows and not hints:
+        return [], "index_miss" if _serials(ev) else "missing_serial_not_unique"
+    close = rows + hints
     if len(close) > MAX_DEVICE_ROWS:
         return [], "device_candidate_limit"  # Never silently exclude a rival.
-    return close, "weak_compact_task_hints" if hints else "serial_first_retrieval"
+    return close, "weak_compact_task_hints" if hints else reason
 
 
 def live_pool(rows, ev, reference_day):
@@ -360,7 +352,7 @@ def assess_task(task, ev, job_type):
             "compact_ambiguity": compact_ambiguity, "format_corroborated": format_corroborated}
 
 
-def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
+def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, date_support=()):
     """Confirm device first, then a unique dated visit. No best-of-run selection."""
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
     if not candidates:
@@ -379,8 +371,12 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     if len(orders) > 1:
         return None, "repeated_order_conflict"
     if orders:
+        if any(ac.resolve_order_number(row['task'])['status'] == 'ambiguous'
+               and orders.intersection(ac.resolve_order_number(row['task'])['candidates'])
+               for row in candidates):
+            return None, 'ambiguous_order_numbers'
         candidates = [row for row in candidates
-                      if ac.extract_order_no_from_name(row["task"]) in orders]
+                      if ac.resolve_order_number(row['task'])['order_no'] in orders]
         if not candidates:
             return None, "live_order_conflict"
     devices = defaultdict(list)
@@ -399,6 +395,16 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     if len(stable_dates) > 1:
         return None, "repeated_dates_conflict"
     action_day = date.fromisoformat(next(iter(stable_dates))) if stable_dates else None
+    proof = date_corroboration.summarize(date_support)
+    if (proof["status"] == "invalid" or (job_type != "PM" and
+            any(r.get("page") == 3 for r in date_support if isinstance(r, dict)))):
+        return None, "signature_date_protocol_rejected"
+    if proof["status"] == "conflict" or (action_day and proof["status"] == "confirmed"
+                                           and action_day != proof["date"]):
+        return None, "signature_date_conflict"
+    supplemented = not action_day and proof["status"] == "confirmed"
+    if supplemented:
+        action_day = proof["date"]
     if action_day:
         dated = []
         for row in visits:
@@ -412,7 +418,10 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         best_delta, best = dated[0]
         if len(dated) > 1 and dated[1][0] == best_delta and dated[1][1]["score"] >= best["score"] - 15:
             return None, "live_visits_tied"
-        return best["task"], "action_date_live_visit_confirmed"
+        if ac.resolve_order_number(best['task'])['status'] == 'ambiguous':
+            return None, 'ambiguous_order_numbers'
+        return best["task"], ("signature_date_live_visit_confirmed" if supplemented
+                              else "action_date_live_visit_confirmed")
     if any(row.get("requires_reliable_date") for row in visits):
         return None, ("compact_serial_needs_action_date" if any(row.get("compact_ambiguity") for row in visits)
                       else "format_recovery_needs_action_date" if any(row.get("format_corroborated") for row in visits)
@@ -432,6 +441,8 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     dated.sort(key=lambda item: item[0])
     if not dated or (len(dated) > 1 and dated[0][0] == dated[1][0]):
         return None, "upload_prior_not_unique"
+    if ac.resolve_order_number(dated[0][1]['task'])['status'] == 'ambiguous':
+        return None, 'ambiguous_order_numbers'
     return dated[0][1]["task"], "upload_prior_live_visit_confirmed"
 
 
@@ -482,6 +493,13 @@ def public_diagnostic(audit):
         "product_reread_drift",
         "weak_compact_task_hints", "compact_serial_not_unique", "compact_serial_needs_action_date",
         "format_recovery_needs_action_date",
+        "stable_phone_reread", "numeric_literal_auxiliary_retained",
+        "ambiguous_order_numbers",
+        "signature_dates_read", "signature_read_unavailable", "signature_date_conflict",
+        "signature_date_protocol_rejected", "signature_date_live_visit_confirmed",
+        "table_context_retrieval", "table_fragment_retrieval",
+        "device_search_proposal", "device_search_uncertain", "device_search_protocol_rejected",
+        "device_search_disagrees",
     }
     def count(value, ceiling):
         return min(max(value, 0), ceiling) if type(value) is int else 0
@@ -493,6 +511,18 @@ def public_diagnostic(audit):
         "read_count": count(audit.get("read_count"), 100),
         "crosspage_used": audit.get("crosspage_used") is True,
     }
+    table = audit.get("equipment_search")
+    if isinstance(table, dict):
+        result["equipment_search"] = {
+            "candidate_count": count(table.get("candidate_count"), MAX_DEVICE_ROWS),
+            "legacy_reference_count": count(table.get("legacy_reference_count"), MAX_DEVICE_ROWS),
+            "model_invoked": table.get("model_invoked") is True,
+        }
+    support = audit.get("date_support")
+    if isinstance(support, dict):
+        result["date_support"] = {key: count(support.get(key), ceiling) for key, ceiling in
+            (("read_count", 8), ("stable_panel_count", 4), ("page_count", 2))}
+        result["date_support"]["confirmed"] = support.get("status") == "confirmed"
     diagnostic = audit.get("last_live_diagnostic")
     if not isinstance(diagnostic, dict):
         return result
@@ -541,17 +571,28 @@ def _checklist_read(doc, zoom):
 
 
 def read_and_match(doc, job_type, reference_day=None):
-    from . import processor, private_ocr_context
+    from . import device_search_agent, processor, private_ocr_context
+    search_agent_enabled = os.environ.get(device_search_agent.ENABLED_ENV) == "1"
+    if search_agent_enabled:
+        device_search_agent.require_read_only()  # Fail before any OCR/network access.
+    signature_dates_enabled = os.environ.get(date_corroboration.ENABLED_ENV) == "1"
+    if signature_dates_enabled:
+        date_corroboration.require_read_only()
     if len(doc) != (4 if job_type == "PM" else 1):
         raise ValueError("Incomplete jobsheet cannot enter matching")
     vision.reset_ocr_metrics()
     readings = []
     trace = []
     last_diagnostic = {}
+    last_rows = []
+    equipment_audit = {}
+    date_support = []  # Separate physical sources, never merged into OCR vote counts.
     def read(call, source, field=None):
         try:
             result = {**call(), "_page": 0, "_source": source,
                       "_read_context": {"stage": source, "field": field}}
+            if result.get("_auxiliary_candidates"):
+                trace.append("numeric_literal_auxiliary_retained")
             if field == "product_raw" and ocr_reference.product_focus_conflicts(readings, result):
                 result["_evidence_exclusions"] = {"product_raw": "product_reread_drift"}
                 result.setdefault("_ocr_audit", {})["evidence_exclusions"] = dict(result["_evidence_exclusions"])
@@ -566,10 +607,17 @@ def read_and_match(doc, job_type, reference_day=None):
         # A complete service outage is infrastructure failure, not evidence
         # that the paper is wrong. Let the existing durable retry path handle it.
         raise vision.NvidiaResponseError("No usable vision response; preserve source for retry")
-    def attempt(*, allow_upload_prior=False):
-        nonlocal last_diagnostic
+    def attempt(*, allow_upload_prior=False, table_rows=None):
+        nonlocal last_diagnostic, last_rows
         ev = evidence(readings)
-        rows, reason = retrieve_rows(ac._device_index, ev)
+        rows, reason = (retrieve_rows(ac._device_index, ev, readings) if table_rows is None
+                        else (table_rows, "device_search_proposal"))
+        last_rows = rows
+        equipment_audit["candidates"] = [device_table_search.DeviceTable.candidate_view(
+            {"candidate_id": f"T{number}", "row": row}) for number, row in enumerate(rows, 1)
+            if not row.get("weak_identity")]
+        equipment_audit["candidate_count"] = len(equipment_audit["candidates"])
+        equipment_audit["legacy_reference_count"] = sum(bool(row.get("weak_identity")) for row in rows)
         trace.append(reason)
         if reason in {"device_candidate_limit", "missing_serial_not_unique"}:
             return None
@@ -577,7 +625,7 @@ def read_and_match(doc, job_type, reference_day=None):
         trace.append(reason)
         last_diagnostic = diagnostic_pool(pool, ev, job_type)
         task, reason = select_task(pool, ev, job_type, reference_day,
-                                  allow_upload_prior=allow_upload_prior)
+                                  allow_upload_prior=allow_upload_prior, date_support=date_support)
         trace.append(reason)
         return task
     task = attempt()
@@ -588,7 +636,9 @@ def read_and_match(doc, job_type, reference_day=None):
         for field in ("product_raw", "hospital_raw", "serial_candidates", "phone_candidates", "service_date_raw"):
             ev = evidence(readings)
             if _stable(ev, field):
-                continue
+                if field != "phone_candidates" or not _should_recheck_stable_phone(ev, last_diagnostic, trace):
+                    continue
+                trace.append("stable_phone_reread")
             for zoom in (5.0, 6.0):
                 if field in {"product_raw", "hospital_raw"}:
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus", field)
@@ -603,12 +653,61 @@ def read_and_match(doc, job_type, reference_day=None):
                 trace.append("checklist_read_unavailable")
         trace.append("pm_crosspage_read")
         task = attempt()
+    if (task is None and signature_dates_enabled and not SEARCH_HARD_STOPS.intersection(trace)
+            and not _stable(evidence(readings), "service_date_raw")
+            and any(row.get("passes_identity") for row in last_diagnostic.get("nearest_live_facts", []))):
+        for page, fields, source in ((0, date_corroboration.COVER_FIELDS, "cover_signature"),
+                                    (3, date_corroboration.CHECKLIST_FIELDS, "pm_checklist_signature")):
+            if page == 3 and job_type != "PM":
+                break
+            for field in fields:
+                for zoom in date_corroboration.ZOOMS:
+                    try:
+                        value = vision.ocr_jobsheet_signature_date(doc, page, field, zoom=zoom)
+                    except vision.NvidiaResponseError:
+                        value = None
+                        trace.append("signature_read_unavailable")
+                    date_support.append({"page": page, "field": field, "source": source,
+                                         "zoom": zoom, "date": value})
+            trace.append("signature_dates_read")
+            proof = date_corroboration.summarize(date_support)
+            # A disagreement is a hold, not an invitation to seek a majority.
+            if proof["status"] in {"confirmed", "conflict", "invalid"}:
+                break
+        task = attempt()
     if task is None:
         task = attempt(allow_upload_prior=True)
+    if task is None and search_agent_enabled and not SEARCH_HARD_STOPS.intersection(trace):
+        equipment_audit["model_invoked"] = True
+        proposal = device_search_agent.run_search(doc, ac._device_index, evidence(readings), readings, last_rows)
+        equipment_audit["model_search"] = proposal["audit"]
+        trace.append(proposal["reason"])
+        if proposal["status"] == "proposal":
+            # A proposal cannot erase an already retrieved rival or create a
+            # second OCR vote. Validate the union with unchanged live gates.
+            combined = list(last_rows)
+            for row in proposal["rows"]:
+                if all(row is not old for old in combined):
+                    combined.append(row)
+            if len(combined) > MAX_DEVICE_ROWS:
+                trace.append("device_candidate_limit")
+            else:
+                task = attempt(allow_upload_prior=True, table_rows=combined)
+                if task is not None:
+                    facts = _live_facts(task)
+                    if not facts or facts["serial"] != proposal["proposed_serial"]:
+                        trace.append("device_search_disagrees")
+                        task = None
     ocr = processor._consensus_ocr(readings)
     ocr["ocr_metrics"] = vision.get_ocr_metrics()
     ocr["rules_audit"] = {"version": RULESET_VERSION, "trace": trace,
         "reference_date_known": reference_day is not None,
         "read_count": len(readings), "crosspage_used": any(r.get("_page") == 1 for r in readings),
-        "last_live_diagnostic": last_diagnostic}
+        "last_live_diagnostic": last_diagnostic,
+        "equipment_search": {key: equipment_audit.get(key) for key in
+            ("candidate_count", "legacy_reference_count", "model_invoked")},
+        "date_support": {key: value for key, value in date_corroboration.summarize(date_support).items()
+                         if key != "date"}}
+    ocr["_device_table_audit"] = equipment_audit  # Private, never an OCR reading.
+    ocr["_signature_date_audit"] = date_support
     return task, 2 if task else 0, ocr

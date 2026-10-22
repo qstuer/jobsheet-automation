@@ -139,6 +139,8 @@ _FIELD_DISPLAY_LABELS = {
     "action_taken": "ACTION TAKEN - REFERENCE NUMBER ONLY",
     "engineer_signed_date": "ENGINEER SIGNATURE DATE ONLY",
     "customer_signed_date": "CUSTOMER SIGNATURE DATE ONLY",
+    "checklist_engineer_signed_date": "PM CHECKLIST ENGINEER SIGNATURE DATE ONLY",
+    "checklist_customer_signed_date": "PM CHECKLIST CUSTOMER SIGNATURE DATE ONLY",
 }
 
 
@@ -838,6 +840,50 @@ def _recover_context_literal(raw: str, field: str) -> Optional[dict]:
     return normalized
 
 
+def _recover_numeric_field_literal(raw: str, field: str) -> Optional[dict]:
+    """Retain one field-bound numeric literal, never promote prose to a vote.
+
+    Recovery is allowed only by a single-field caller. Keep the candidate in
+    private auxiliary data, not compatibility fields: older matching/date
+    helpers also consume those fields and must not accidentally trust it.
+    """
+    if field not in {"phone_candidates", "service_date_raw"} or not isinstance(raw, str):
+        return None
+    if len(raw) > 300:
+        return None
+    value_pattern = (r"[0-9]{8}" if field == "phone_candidates" else
+                     r"(?:[0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|"
+                     r"[0-9]{1,2}[-/.][0-9]{1,2}[-/.](?:[0-9]{4}|[0-9]{2}))")
+    label = re.escape(_FIELD_DISPLAY_LABELS[field])
+    prefix = (rf"(?:The image contains only the panel labelled {label}\. )?"
+              r"(?:The visible (?:string|value) is |The visible value for that field is: )")
+    match = re.fullmatch(rf"(?:{prefix})?(?P<quote>[\"']?)(?P<value>{value_pattern})(?P=quote)\.?", raw.strip())
+    if not match:
+        return None
+    candidate = {field: [match["value"]] if field == "phone_candidates" else match["value"]}
+    if field == "service_date_raw":
+        candidate["date_source"] = "ACTION_DATE"
+    normalized = _normalize_ocr_data(candidate)
+    literal = normalized.get(field)
+    if not literal:
+        return None
+    # This phase preserves a clue only. Candidate retrieval and final
+    # acceptance thresholds are unchanged, including compact-serial guards.
+    normalized["_auxiliary_candidates"] = {field: deepcopy(literal)}
+    normalized["_auxiliary_fields"] = [field]
+    normalized[field] = [] if field == "phone_candidates" else None
+    normalized["_ocr_audit"]["normalized"][field] = deepcopy(normalized[field])
+    if field == "service_date_raw":
+        for key in ("service_date_iso", "date_source"):
+            normalized[key] = None
+            normalized["_ocr_audit"]["normalized"][key] = None
+    normalized["_ocr_audit"]["auxiliary_candidates"] = deepcopy(normalized["_auxiliary_candidates"])
+    normalized["_ocr_audit"]["format_recovery"] = {
+        "reason": "numeric_single_field_literal", "field": field,
+        "raw_reply": raw, "evidence_strength": "auxiliary_only_not_match_input"}
+    return normalized
+
+
 def _read_card(image_b64: str, prompt: str, required_keys: set, *, literal_field=None) -> dict:
     """同一張卡格式錯誤時只重試一次；內容看不清由後續單格複核。"""
     last_error = None
@@ -852,6 +898,8 @@ def _read_card(image_b64: str, prompt: str, required_keys: set, *, literal_field
             last_error = exc
             if required_keys == {literal_field}:
                 recovered = _recover_context_literal(raw, literal_field)
+                if recovered is None:
+                    recovered = _recover_numeric_field_literal(raw, literal_field)
                 if recovered is not None:
                     return recovered
     raise NvidiaResponseError("圖片 OCR 連續兩次回覆格式不正確") from last_error
@@ -1016,7 +1064,8 @@ def ocr_jobsheet_focused_field(
         "Return only the exact visible value for that field. Do not repair unclear characters. "
         f'Required shape: {{"{field}":{example_value},"unreadable_fields":[]}}'
     )
-    return _read_card(image_b64, prompt, {field})
+    return _read_card(image_b64, prompt, {field}, literal_field=(
+        field if field in {"phone_candidates", "service_date_raw"} else None))
 
 
 def normalize_action_identifiers(values) -> list[str]:
@@ -1065,18 +1114,21 @@ def ocr_jobsheet_signature_date(
 ) -> Optional[str]:
     """Copy one independently handwritten signature date, without Asana hints.
 
-    This is corroborating evidence only. The processor still requires at least
-    one ACTION DATE reading to agree before it may affect matching.
+    This is corroborating evidence only, never an ACTION DATE transcription.
+    The caller must apply its own source-consistency and live-task gates.
     """
-    if field not in {"engineer_signed_date", "customer_signed_date"}:
+    if field not in {"engineer_signed_date", "customer_signed_date",
+                     "checklist_engineer_signed_date", "checklist_customer_signed_date"}:
         raise ValueError("不支援的簽署日期欄位")
+    if field.startswith("checklist_") and (page_idx != 3 or len(pdf_doc) != 4):
+        raise ValueError("Checklist signature date requires the final page of a complete PM packet")
     image_b64 = crop_jobsheet_field_card(
         pdf_doc, page_idx, (field,), zoom=zoom, strong=zoom >= 6.0
     )
     prompt = _TRANSCRIPTION_RULES + (
         "Read only the handwritten date beside the signature in this one "
-        "labelled panel. Do not read a name, stamp, ACTION DATE, or another "
-        "panel. Do not infer a missing digit or use any task information. "
+        "labelled panel. Do not read a name, stamp, ACTION DATE, calibration "
+        "date, or another panel. Do not infer a missing digit or use any task information. "
         'Return JSON only: {"signed_date":null} if unreadable, otherwise '
         '{"signed_date":"DD/MM/YYYY"} using exactly the visible digits.'
     )

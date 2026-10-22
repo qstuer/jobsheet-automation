@@ -121,6 +121,18 @@ class PrivateOCRTraceTests(unittest.TestCase):
         self.assertEqual({"reader": "reader", "page_idx": 1, "field": "hospital_raw", "zoom": 6.0}, saved["context"])
         self.assertEqual(result, saved["value"])
 
+    def test_signature_date_reader_has_its_own_source_context(self):
+        with patch.object(vision, "_today", return_value=date(2026, 9, 30)), \
+             patch.object(vision, "crop_jobsheet_field_card", return_value=self.b64), \
+             patch.object(vision, "_call_vision", return_value='{"signed_date":"28/9/2026"}'):
+            with self.capture():
+                result = vision.ocr_jobsheet_signature_date(None, 0, "engineer_signed_date", zoom=6.0)
+        saved = next(row for row in self.events() if row["event"] == "reading")
+        self.assertEqual("2026-09-28", result)
+        self.assertEqual({"reader": "ocr_jobsheet_signature_date", "page_idx": 0,
+                          "field": "engineer_signed_date", "zoom": 6.0}, saved["context"])
+        self.assertEqual(result, saved["value"])
+
     def test_patches_restored_after_failure_and_existing_evidence_preserved(self):
         original = vision._normalize_ocr_data
         with self.assertRaises(RuntimeError):

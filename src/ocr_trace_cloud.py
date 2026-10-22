@@ -40,6 +40,9 @@ def main():
         key = base64.b64decode(os.environ["OCR_TRACE_RECIPIENT_KEY"], validate=True)
         from .private_trace_crypto import load_recipient
         load_recipient(key)  # Fail before downloads or model calls for bad keys.
+        mode = os.environ.get("OCR_TRACE_INDEX_MODE", "download")
+        if mode not in {"download", "local_rebuild"}:
+            raise ValueError("Unknown diagnostic index mode")
         inputs = PRIVATE_ROOT / "cloud-inputs"
         inputs.mkdir(parents=True, exist_ok=False)
         pdf, index, manifest, public = [inputs / name for name in (
@@ -47,9 +50,14 @@ def main():
         public.write_bytes(key)
         for variable, destination in (("OCR_TRACE_SOURCE_ID", pdf),
                 ("OCR_TRACE_INDEX_ID", index), ("OCR_TRACE_MANIFEST_ID", manifest)):
+            if variable != "OCR_TRACE_SOURCE_ID" and mode == "local_rebuild":
+                continue
             download_id(os.environ[variable], destination)
         if hashlib.sha256(pdf.read_bytes()).hexdigest() != expected:
             raise ValueError("Source fingerprint mismatch; no OCR call permitted")
+        if mode == "local_rebuild":
+            from .readonly_test_index import build
+            index, manifest = build(PRIVATE_ROOT / "test-index", key)
         return capture_main(["--pdf", str(pdf), "--index", str(index),
             "--index-manifest", str(manifest), "--job-type", os.environ["OCR_TRACE_JOB_TYPE"],
             "--reference-date", os.environ["OCR_TRACE_REFERENCE_DATE"],

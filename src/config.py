@@ -118,6 +118,11 @@ OCR_FIELD_BOXES = {
     # Keep the handwritten date while excluding most of the hospital stamp;
     # its high-contrast seal previously dominated this tiny OCR card.
     "customer_signed_date": (0.760, 0.947, 0.960, 0.979),
+    # Last Philips PM checklist page: signature dates below the tools table.
+    # Never include the earlier calibration-date row in that table.
+    # Keep tall handwritten year/day strokes above the printed underline.
+    "checklist_engineer_signed_date": (0.100, 0.715, 0.430, 0.795),
+    "checklist_customer_signed_date": (0.600, 0.715, 0.940, 0.795),
 }
 # 單格複核只保留手寫值附近，避免印刷標籤與表格線佔去大部分像素。
 # 外層欄位卡仍會顯示可靠的欄位名稱，因此模型毋須靠原表格標籤猜欄位。

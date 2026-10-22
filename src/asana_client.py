@@ -1884,10 +1884,57 @@ def neutral_name_for_ambiguous_visit(ocr_data: dict, job_type: str) -> Optional[
 
 # ── 命名輔助（沿用舊版）────────────────────────────────────────
 
+class AmbiguousOrderNumberError(ValueError):
+    """A title cannot safely supply a filename; never include its raw values."""
+
+
+def resolve_order_number(task: dict) -> dict:
+    """Resolve a unique title order, excluding balanced leading annotations.
+
+    A referenced order inside a leading comment is not this task's order.
+    Malformed annotations, annotation-only orders and multiple remaining
+    orders are unresolved, not permission to use the first or a title fallback.
+    No index, notes, OCR answer, date or task completion state supplies an order.
+    """
+    title = str(task.get("name") or "").strip()
+    pattern = re.compile(r"(?<![A-Za-z0-9])[56][0-9]{7}(?![A-Za-z0-9])")
+    all_numbers = set(pattern.findall(title))
+    body = title
+    while body.startswith(('(', '[')):
+        pairs = {'(': ')', '[': ']'}
+        stack = []
+        end = None
+        for i, char in enumerate(body):
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in ')]':
+                if not stack or char != stack.pop():
+                    break
+                if not stack:
+                    end = i + 1
+                    break
+        if end is None:
+            return {'status': 'ambiguous' if all_numbers else 'missing',
+                    'order_no': None, 'candidates': sorted(all_numbers)}
+        body = body[end:].lstrip()
+    numbers = set()
+    for match in pattern.finditer(body):
+        prefix = re.split(r'[/,;|\n]', body[:match.start()])[-1]
+        if re.search(r'\b(?:TEL(?:EPHONE)?|PHONE|MOBILE|ASSET|HAWO|WO)\s*(?:NO\.?\s*)?[:#=-]?\s*$', prefix, re.I):
+            continue
+        numbers.add(match.group())
+    if len(numbers) == 1:
+        return {'status': 'resolved', 'order_no': next(iter(numbers)), 'candidates': sorted(numbers)}
+    if len(numbers) > 1 or (all_numbers and not numbers and body != title):
+        return {'status': 'ambiguous', 'order_no': None, 'candidates': sorted(numbers or all_numbers)}
+    return {'status': 'missing', 'order_no': None, 'candidates': []}
+
+
 def extract_order_no_from_name(task: dict) -> Optional[str]:
-    """從 Asana task name 抓出 8 位 Order Number（5 或 6 開頭）"""
-    match = re.search(r"\b[56]\d{7}\b", task.get("name", ""))
-    return match.group(0) if match else None
+    result = resolve_order_number(task)
+    if result['status'] == 'ambiguous':
+        raise AmbiguousOrderNumberError('ambiguous_order_numbers')
+    return result['order_no']
 
 
 def get_safe_title(task: dict) -> str:

@@ -379,6 +379,14 @@ def _device_key(location: str, product: Optional[str], serial: Optional[str]) ->
 def task_to_record(task: dict, project_type: Optional[str] = None) -> Optional[dict]:
     name = str(task.get("name") or "").strip()
     location, product, product_variant, serial, product_review = _name_parts_with_review(name)
+    # Match the hospital parser's treatment of leading task-status comments.
+    # They are not a location variant and can contain another job's order.
+    # Preserve the actual site/floor/room after the comment, not the full title.
+    while True:
+        tagged = re.match(r"^\s*\([^)]{1,40}\)\s*(?P<site>.+)$", location)
+        if not tagged:
+            break
+        location = tagged["site"].strip()
     notes = str(task.get("notes") or "")
     if not location and not product and not serial:
         return None

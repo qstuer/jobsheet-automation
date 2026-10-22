@@ -9,16 +9,20 @@ Google Drive or OneDrive file.
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import logging
 import os
 import re
 import sys
+from datetime import date
 from pathlib import Path
+from contextlib import ExitStack
+from unittest.mock import patch
 
 import fitz
 
-from . import asana_client, asana_index, processor
+from . import asana_client, asana_index, nvidia_client, processor, rclone_helper
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("backtest")
@@ -27,7 +31,7 @@ BACKTEST_DIR_ENV = "JOBSHEET_BACKTEST_DIR"
 BACKTEST_MANIFEST_ENV = "JOBSHEET_BACKTEST_MANIFEST"
 INDEX_FILE_ENV = "ASANA_INDEX_LOCAL_FILE"
 INDEX_MANIFEST_ENV = "ASANA_INDEX_MANIFEST_LOCAL_FILE"
-_SAMPLE_ID_RE = re.compile(r"B\d{2}")
+_SAMPLE_ID_RE = re.compile(r"B(?:0[1-9]|1[0-9]|20)")
 
 
 class BacktestError(RuntimeError):
@@ -39,7 +43,7 @@ def _load_manifest(path: Path) -> list[dict]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BacktestError("私人回測清單無法讀取") from exc
-    if payload.get("schema_version") != 1 or not isinstance(payload.get("samples"), list):
+    if not isinstance(payload, dict) or payload.get("schema_version") not in (1, 2) or not isinstance(payload.get("samples"), list):
         raise BacktestError("私人回測清單格式不正確")
 
     samples = payload["samples"]
@@ -48,21 +52,61 @@ def _load_manifest(path: Path) -> list[dict]:
     seen_ids: set[str] = set()
     seen_files: set[str] = set()
     for sample in samples:
+        if not isinstance(sample, dict):
+            raise BacktestError("私人回測樣本格式不正確")
         sample_id = str(sample.get("sample_id") or "")
         filename = str(sample.get("filename") or "")
         expected = sample.get("expected")
         if not _SAMPLE_ID_RE.fullmatch(sample_id) or sample_id in seen_ids:
             raise BacktestError("回測 sample_id 必須是唯一的 B01–B20")
-        if Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
+        if (not filename or any(c in filename for c in '/\\:')
+                or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf"):
             raise BacktestError(f"{sample_id} 的檔名不安全")
         if filename in seen_files or sample.get("job_type") not in {"PM", "CM"}:
             raise BacktestError(f"{sample_id} 的檔名或工作類型不正確")
+        source_hash = sample.get("source_sha256")
+        if source_hash is not None and (
+            not isinstance(source_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", source_hash)
+        ):
+            raise BacktestError(f"{sample_id} 的原件指紋格式不正確")
         if not isinstance(expected, dict) or expected.get("kind") not in {
-            "order", "serial", "pending"
+            "order", "serial", "pending", "match", "unreviewed"
         }:
             raise BacktestError(f"{sample_id} 缺少可核對的私人答案")
-        if expected["kind"] != "pending" and not str(expected.get("value") or "").strip():
+        if expected["kind"] in {"order", "serial"} and not str(expected.get("value") or "").strip():
             raise BacktestError(f"{sample_id} 的私人答案為空")
+        # Old serial/order-only fixtures remain useful diagnostics, never a
+        # full pass. Do not turn the matcher's own answer into ground truth.
+        sample["_verified_answer"] = False
+        if payload["schema_version"] == 2:
+            if sample.get("review_status") not in {"confirmed", "unreviewed"}:
+                raise BacktestError(f"{sample_id} 缺少答案覆核狀態")
+            if "reference_date" not in sample:
+                raise BacktestError(f"{sample_id} 缺少原始日期欄位（未知請填 null）")
+            ref_date = sample["reference_date"]
+            if ref_date is not None:
+                try:
+                    if date.fromisoformat(ref_date).isoformat() != ref_date:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    raise BacktestError(f"{sample_id} 的原始日期格式不正確") from None
+                if sample.get("reference_date_source") not in {"original_upload", "scan_record"}:
+                    raise BacktestError(f"{sample_id} 缺少原始日期來源")
+            confirmed = sample["review_status"] == "confirmed"
+            if confirmed:
+                if not isinstance(sample.get("review_note"), str) or not sample["review_note"].strip():
+                    raise BacktestError(f"{sample_id} 缺少私人覆核依據")
+                if expected["kind"] not in {"match", "pending"}:
+                    raise BacktestError(f"{sample_id} 不能只靠 Serial 或訂單號標記已確認")
+                if expected["kind"] == "match":
+                    if not all(isinstance(expected.get(k), str) and expected[k].strip()
+                               for k in ("serial", "task_gid", "filename")):
+                        raise BacktestError(f"{sample_id} 缺少設備、工作或檔名答案")
+                    if (not expected["task_gid"].isdigit()
+                            or not expected["filename"].endswith(".pdf")
+                            or any(c in expected["filename"] for c in '/\\:*?"<>|')):
+                        raise BacktestError(f"{sample_id} 的工作或檔名答案格式不正確")
+            sample["_verified_answer"] = confirmed
         seen_ids.add(sample_id)
         seen_files.add(filename)
     return samples
@@ -76,29 +120,135 @@ def _validate_files(samples: list[dict], fixture_dir: Path) -> None:
         if not path.is_file():
             raise BacktestError(f"{sample['sample_id']} 的 PDF 不存在")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        # A reused anonymous filename can point to another scan. Bind reviewed
+        # answers to the actual PDF, not a cached preview with the same label.
+        if sample.get("source_sha256") and sample["source_sha256"] != digest:
+            raise BacktestError(f"{sample['sample_id']} 的 PDF 已變更，必須重新覆核答案")
         if digest in hashes:
             raise BacktestError("20 份回測資料含有完全重複的 PDF")
         hashes.add(digest)
 
 
 def _matches_expected(task: dict | None, expected: dict) -> bool:
+    """Exact task and filename are required; serial alone cannot prove the month."""
     kind = expected["kind"]
     if kind == "pending":
         return task is None
-    if task is None:
+    if task is None or kind != "match":
         return False
-    value = str(expected["value"])
-    if kind == "order":
-        return asana_client.extract_order_no_from_name(task) == value
-    expected_serial = asana_client._norm(value)
-    return expected_serial in {
+    expected_serial = asana_client._norm(expected["serial"])
+    return (str(task.get("gid")) == expected["task_gid"]
+            and _task_filename(task) == expected["filename"]
+            and expected_serial in {
         asana_client._norm(serial) for serial in asana_client._task_serials(task)
+    })
+
+
+def _task_filename(task):
+    try:
+        return processor._planned_filename(task)[0]
+    except asana_client.AmbiguousOrderNumberError:
+        return None  # An unsafe selected task is a failed result, not a batch crash.
+
+
+def _evaluate_result(task: dict | None, sample: dict, page_count: int,
+                     detected_type: str | None = None,
+                     device_candidate_rank: int | str = "NOT_TESTED") -> dict:
+    """Return only anonymous checks, never task data or expected answers."""
+    expected = sample["expected"]
+    serial = expected.get("serial") or (
+        expected.get("value") if expected["kind"] == "serial" else None
+    )
+    def check(value: bool) -> str:
+        return "PASS" if value else "FAIL"
+    device = "NOT_REVIEWED" if not serial else (
+        "NOT_SELECTED" if task is None else check(asana_client._norm(serial) in {
+            asana_client._norm(s) for s in asana_client._task_serials(task)
+        })
+    )
+    exact_task = "NOT_REVIEWED"
+    filename = "NOT_REVIEWED"
+    task_type = "NOT_TESTED" if task is None else check(
+        asana_client._task_job_type(task) == sample["job_type"]
+    )
+    if expected["kind"] == "match":
+        exact_task = ("NOT_SELECTED" if task is None else
+                      check(str(task.get("gid")) == expected.get("task_gid")))
+        filename = ("NOT_SELECTED" if task is None else
+                    check(_task_filename(task) == expected.get("filename")))
+    count_ok = page_count == (4 if sample["job_type"] == "PM" else 1)
+    circle = "NOT_TESTED" if detected_type is None else check(detected_type == sample["job_type"])
+    if not sample.get("_verified_answer"):
+        status = "UNVERIFIED"
+    elif circle == "FAIL" or not _matches_expected(task, expected) or (task is not None and task_type != "PASS"):
+        status = "FAIL"
+    elif not count_ok:
+        status = "DIAGNOSTIC_ONLY"
+    else:
+        status = "PASS"
+    return {
+        "status": status, "device_candidate_rank": device_candidate_rank,
+        "device_check": device, "task_check": exact_task,
+        "filename_check": filename, "task_type_check": task_type,
+        "page_count": page_count,
+        "page_check": "COUNT_ONLY" if count_ok else "INCOMPLETE_OR_UNEXPECTED",
+        # A page count does not validate the checklist or the splitter.
+        "circle_check": circle, "field_accuracy": "NOT_TESTED",
+        "full_pipeline_check": "NOT_TESTED",
     }
+
+
+def _evaluate_service_error(sample: dict, page_count: int) -> dict:
+    """A provider outage is not an OCR mismatch or an incorrect Asana match."""
+    count_ok = page_count == (4 if sample["job_type"] == "PM" else 1)
+    return {
+        "status": "SERVICE_ERROR", "device_candidate_rank": "NOT_TESTED",
+        "device_check": "NOT_TESTED",
+        "task_check": "NOT_TESTED", "filename_check": "NOT_TESTED",
+        "task_type_check": "NOT_TESTED", "page_count": page_count,
+        "page_check": "COUNT_ONLY" if count_ok else "INCOMPLETE_OR_UNEXPECTED",
+        "circle_check": "NOT_TESTED", "field_accuracy": "NOT_TESTED",
+        "full_pipeline_check": "NOT_TESTED",
+    }
+
+
+def audit_fixtures(samples: list[dict], fixture_dir: Path) -> list[dict]:
+    """Offline readiness inventory. No model, Asana or cloud calls."""
+    _validate_files(samples, fixture_dir)
+    seen_tasks: dict[str, str] = {}
+    rows = []
+    for sample in samples:
+        try:
+            with fitz.open(fixture_dir / sample["filename"]) as doc:
+                pages = doc.page_count
+        except Exception:
+            raise BacktestError(f"{sample['sample_id']} 的 PDF 無法讀取") from None
+        if pages < 1:
+            raise BacktestError(f"{sample['sample_id']} 是空白 PDF")
+        expected = sample["expected"]
+        gid = expected.get("task_gid") if sample.get("_verified_answer") else None
+        duplicate = seen_tasks.get(gid) if gid else None
+        if gid:
+            seen_tasks.setdefault(gid, sample["sample_id"])
+        rows.append({
+            "sample_id": sample["sample_id"], "pages": pages,
+            "expected_pages": 4 if sample["job_type"] == "PM" else 1,
+            "answer_ready": bool(sample.get("_verified_answer")),
+            "reference_date_known": bool(sample.get("reference_date")),
+            "same_work_as": duplicate,
+            "business_identity_known": bool(gid),
+        })
+    return rows
 
 
 def _append_summary(rows: list[dict], path: Path) -> None:
     passed = sum(row["status"] == "PASS" for row in rows)
+    service_errors = sum(row["status"] == "SERVICE_ERROR" for row in rows)
+    incomplete = sum(row["status"] == "INCOMPLETE" for row in rows)
     pending_expected = sum(row["expected_pending"] for row in rows)
+    unverified = sum(row["status"] == "UNVERIFIED" for row in rows)
+    repeated_work = sum(bool(row.get("same_work_as")) for row in rows)
+    unknown_work = sum(not row.get("business_identity_known") for row in rows)
     calls = sum(row["calls"] for row in rows)
     seconds = sum(row["seconds"] for row in rows)
     tokens = sum(row["tokens"] for row in rows)
@@ -106,15 +256,24 @@ def _append_summary(rows: list[dict], path: Path) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write("## Jobsheet 20 份私人只讀回測\n\n")
         stream.write(
-            f"结果：**{passed}/20**；预期安全待确认：{pending_expected}；"
+            f"严格配对通过：**{passed}/{len(rows)}**；圖片服務錯誤：{service_errors}；"
+            f"未核验答案：{unverified}；缺頁攔截：{incomplete}；预期安全待确认：{pending_expected}；"
             "OneDrive 写入：**0**。\n\n"
         )
-        stream.write("| 样本 | 结果 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
-        stream.write("|---|---|---:|---:|---:|---:|\n")
+        stream.write("这不是全流程通过率：圈选独立列出；逐栏准确率、checklist 内容与切页尚未验收。页数正确也不代表完整。\n\n")
+        stream.write(f"重复工作样本：{repeated_work}；工作身份未确认：{unknown_work}。不同 PDF 不等于不同工作。\n\n")
+        stream.write("| 样本 | 结果 | 设备候选排名 | 最终设备 | 工作 | 名称 | Asana类型 | 圈选 | 页数检查 | PM後頁補救 | OCR 呼叫 | 耗时 | Tokens | 费用上限 |\n")
+        stream.write("|---|---|---:|---|---|---|---|---|---|---|---:|---:|---:|---:|\n")
         for row in rows:
             cost = f"RMB {row['cost']:.4f}" if row["cost"] is not None else "-"
             stream.write(
-                f"| {row['sample_id']} | {row['status']} | {row['calls']} | "
+                f"| {row['sample_id']} | {row['status']} | "
+                f"{row.get('device_candidate_rank', 'NOT_TESTED')} | "
+                f"{row.get('device_check', 'NOT_REVIEWED')} | {row.get('task_check', 'NOT_REVIEWED')} | "
+                f"{row.get('filename_check', 'NOT_REVIEWED')} | {row.get('task_type_check', 'NOT_TESTED')} | "
+                f"{row.get('circle_check', 'NOT_TESTED')} | "
+                f"{row.get('page_check', 'NOT_TESTED')} | "
+                f"{row.get('pm_crosspage_rescue', 'not_attempted')} | {row['calls']} | "
                 f"{row['seconds']:.1f}s | {row['tokens']} | {cost} |\n"
             )
         total_cost = f"RMB {sum(costs):.4f}" if costs else "-"
@@ -124,13 +283,93 @@ def _append_summary(rows: list[dict], path: Path) -> None:
         )
 
 
+def _read_sample(doc, expected_type: str, reference_day=None) -> tuple:
+    """Expected type is an evaluation gate, never an input to vision/matching."""
+    nvidia_client.reset_ocr_metrics()
+    detected = nvidia_client.detect_cm_pm(doc, 0)
+    metrics = nvidia_client.get_ocr_metrics()
+    if detected not in {"CM", "PM"} or detected != expected_type:
+        return None, detected, metrics, None
+    if reference_day is None:
+        task, _tier, ocr = processor._ocr_and_match(doc, detected)
+    else:
+        task, _tier, ocr = processor._ocr_and_match(doc, detected, reference_day=reference_day)
+    if (task is None and detected == "PM" and getattr(doc, "page_count", 0) == 4
+            and not os.environ.get(processor.MATCHING_RULES_ENV)
+            and os.environ.get("JOBSHEET_EVIDENCE_LIVE_RULES") != "1"
+            and os.environ.get("JOBSHEET_PM_CROSSPAGE_RESCUE") == "1"):
+        # This is deliberately inside the read-only backtest, not Stage B.
+        # Original failures remain pending unless independent checklist and
+        # first-page evidence pass all gates and Asana still returns one task.
+        from . import pm_crosspage_rescue
+        task, _tier, ocr = pm_crosspage_rescue.try_rescue(doc, ocr, detected)
+        if ocr is not None:
+            ocr["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+    # The matching core resets its own metrics; include the earlier circle calls.
+    for key, value in (ocr.get("ocr_metrics") or {}).items():
+        if isinstance(value, (int, float)):
+            metrics[key] = metrics.get(key, 0) + value
+    return task, detected, metrics, ocr
+
+
+def _device_candidate_rank(ocr: dict | None, expected_serial: str | None,
+                           job_type: str) -> int | str:
+    """Score device retrieval separately from final task selection; emit no identity."""
+    if not ocr or not expected_serial or asana_client._device_index is None:
+        return "NOT_TESTED"
+    table = ocr.get("_device_table_audit")
+    if isinstance(table, dict):
+        # Measure the candidates actually used by the new matcher, not a
+        # second invocation of the legacy ranking algorithm after the run.
+        wanted = asana_client._norm(expected_serial)
+        for rank, candidate in enumerate(table.get("candidates") or [], 1):
+            if asana_client._norm(candidate.get("serial")) == wanted:
+                return rank if rank <= 10 else "OUTSIDE_TOP_10"
+        return "NOT_IN_POOL"
+    ranked = asana_client._rank_index_devices(ocr, job_type)
+    wanted = asana_client._norm(expected_serial)
+    for rank, candidate in enumerate(ranked, 1):
+        if asana_client._norm(candidate["row"].get("serial")) == wanted:
+            return rank if rank <= 10 else "OUTSIDE_TOP_10"
+    return "NOT_IN_POOL"
+
+
+def _deny_cloud_operation(*args, **kwargs):
+    # Fixtures/index are already local. There is no reason for this evaluation
+    # process to invoke rclone or a production upload/finalization entrypoint.
+    raise BacktestError("只讀回測禁止雲端檔案操作")
+
+
+def _checkpoint(rows: list[dict]) -> None:
+    """Persist only evaluation flags/usage; never OCR or task/answer objects."""
+    target = os.environ.get("JOBSHEET_BACKTEST_REPORT", "").strip()
+    if target:
+        path = Path(target)
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+
+def _select_samples(samples: list[dict], selection: str) -> list[dict]:
+    """Private test branch can run a tiny subset before the full 20-sample retry."""
+    if not selection.strip():
+        return samples
+    requested = [part.strip() for part in selection.split(",")]
+    available = {sample["sample_id"] for sample in samples}
+    if (not all(requested) or len(requested) != len(set(requested))
+            or set(requested) - available):
+        raise BacktestError("回測樣本選擇無效")
+    return [sample for sample in samples if sample["sample_id"] in requested]
+
+
 def run() -> list[dict]:
     fixture_dir = Path(os.environ.get(BACKTEST_DIR_ENV, "/tmp/jobsheet-backtest"))
     manifest_path = Path(
         os.environ.get(BACKTEST_MANIFEST_ENV, str(fixture_dir / "manifest.json"))
     )
     samples = _load_manifest(manifest_path)
-    _validate_files(samples, fixture_dir)
+    inventory = {row["sample_id"]: row for row in audit_fixtures(samples, fixture_dir)}
+    samples = _select_samples(samples, os.environ.get("JOBSHEET_BACKTEST_SAMPLE_IDS", ""))
 
     index_path = Path(os.environ.get(INDEX_FILE_ENV, "/tmp/asana-device-index.json"))
     index_manifest = Path(
@@ -142,40 +381,122 @@ def run() -> list[dict]:
     for sample in samples:
         sample_id = sample["sample_id"]
         log.info("[%s] 开始只读 OCR + Asana 核对", sample_id)
+        # These historical PDFs are independent trials. A temporary failure
+        # on one must not make every later sample a false model failure.
+        nvidia_client.reset_model_availability()
+        # Device/task caches must not make later samples reuse an earlier
+        # sample's Asana response; each document is a separately measured trial.
+        asana_client._task_cache.clear()
+        asana_client._typeahead_cache.clear()
         with fitz.open(fixture_dir / sample["filename"]) as doc:
             if doc.page_count < 1:
                 raise BacktestError(f"{sample_id} 是空白 PDF")
-            task, _tier, ocr = processor._ocr_and_match(doc, sample["job_type"])
-        metrics = ocr.get("ocr_metrics") or {}
-        passed = _matches_expected(task, sample["expected"])
-        status = "PASS" if passed else "FAIL"
+            page_count = doc.page_count
+            if page_count != (4 if sample["job_type"] == "PM" else 1):
+                # A known incomplete packet must never enter a strict matcher
+                # which requires a complete PM packet, nor abort later cases.
+                task, detected, metrics, ocr = None, None, {}, None
+                evaluation = _evaluate_result(None, sample, page_count)
+                evaluation["status"] = "INCOMPLETE"
+                evaluation["task_check"] = "NOT_TESTED"
+                evaluation["filename_check"] = "NOT_TESTED"
+            else:
+                task, detected, metrics, ocr, evaluation = _run_complete_sample(doc, sample)
+        status = evaluation["status"]
         log.info("[%s] %s（客户资料已隐藏）", sample_id, status)
         rows.append({
             "sample_id": sample_id,
-            "status": status,
-            "expected_pending": sample["expected"]["kind"] == "pending",
+            **evaluation,
+            "pm_crosspage_rescue": (
+                (ocr.get("_ocr_audit") or {}).get("pm_crosspage_rescue", "not_attempted")
+                if ocr else "not_attempted"
+            ),
+            "same_work_as": inventory[sample_id]["same_work_as"],
+            "business_identity_known": inventory[sample_id]["business_identity_known"],
+            "expected_pending": sample.get("_verified_answer", False) and sample["expected"]["kind"] == "pending",
             "calls": int(metrics.get("calls") or 0),
             "seconds": float(metrics.get("seconds") or 0),
             "tokens": int(metrics.get("total_tokens") or 0),
             "cost": metrics.get("estimated_cost_cny_upper"),
         })
+        _checkpoint(rows)
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if summary_path:
         _append_summary(rows, Path(summary_path))
     passed = sum(row["status"] == "PASS" for row in rows)
     log.info(
-        "20 份回测完成：%s/20；OneDrive 写入=0；客户资料未写入公开摘要",
-        passed,
+        "严格配对通过=%s/%s；答案未核验=%s；不是全流程验收；OneDrive 写入=0",
+        passed, len(rows), sum(row["status"] == "UNVERIFIED" for row in rows),
     )
     return rows
 
 
+def _run_complete_sample(doc, sample):
+    """Keep expected answers out of the matching call and isolate outages."""
+    from .private_ocr_trace import Capture, PRIVATE_ROOT
+    with ExitStack() as stack:
+        capture = None
+        public_key = os.environ.get("JOBSHEET_BACKTEST_RECIPIENT_KEY", "")
+        if public_key:
+            capture = stack.enter_context(Capture(PRIVATE_ROOT / "backtest" / sample["sample_id"], root=PRIVATE_ROOT,
+                recipient_public_key=base64.b64decode(public_key, validate=True)))
+            capture.emit("backtest_input", sample_id=sample["sample_id"],
+                         source_sha256=sample.get("source_sha256"),
+                         reference_date=sample.get("reference_date"),
+                         code_sha=os.environ.get("GITHUB_SHA"))
+        result = _match_complete_sample(doc, sample)
+        if capture:
+            task, detected, _metrics, ocr, evaluation = result
+            capture.emit("backtest_result", selected_task_gid=task.get("gid") if task else None,
+                         planned_filename=_task_filename(task) if task else None,
+                         detected_type=detected, ocr=ocr, evaluation=evaluation)
+        return result
+
+
+def _match_complete_sample(doc, sample):
+    try:
+        reference_day = date.fromisoformat(sample["reference_date"]) if sample.get("reference_date") else None
+        # Do not inherit another sample's original upload day or today's date.
+        with patch.dict(os.environ, {"JOBSHEET_ORIGINAL_UPLOAD_DATE": ""}):
+            task, detected, metrics, ocr = _read_sample(doc, sample["job_type"], reference_day)
+    except nvidia_client.NvidiaResponseError:
+        log.warning("[%s] 圖片服務本份暫時無法完成，繼續下一份", sample["sample_id"])
+        task, detected, ocr = None, None, None
+        metrics = nvidia_client.get_ocr_metrics()
+        evaluation = _evaluate_service_error(sample, doc.page_count)
+    else:
+        evaluation = _evaluate_result(task, sample, doc.page_count, detected,
+            _device_candidate_rank(ocr, sample["expected"].get("serial"), sample["job_type"]))
+    return task, detected, metrics, ocr, evaluation
+
+
 def main() -> int:
     try:
-        run()
+        if sys.argv[1:] == ["--audit-fixtures"]:
+            fixture_dir = Path(os.environ.get(BACKTEST_DIR_ENV, "/tmp/jobsheet-backtest"))
+            manifest = Path(os.environ.get(BACKTEST_MANIFEST_ENV, str(fixture_dir / "manifest.json")))
+            print(json.dumps(audit_fixtures(_load_manifest(manifest), fixture_dir)))
+            return 0
+        if sys.argv[1:]:
+            raise BacktestError("只支援 --audit-fixtures 或不帶參數執行回測")
+        with ExitStack() as guards:
+            guards.enter_context(patch.object(rclone_helper, "run_result", _deny_cloud_operation))
+            for name in ("_finalize_match", "_finalize_confirmed", "_process_split_file"):
+                guards.enter_context(patch.object(processor, name, _deny_cloud_operation))
+            previous_logging_level = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+            try:
+                run()
+            finally:
+                logging.disable(previous_logging_level)
     except BacktestError as exc:
         log.error("回测资料错误：%s", exc)
+        return 1
+    except Exception as exc:
+        # External exceptions can include URLs, OCR text or customer details.
+        # Keep completed rows in the anonymous checkpoint; no public traceback.
+        log.error("回測中止（%s）；已完成結果保存在匿名紀錄，沒有雲端檔案寫入", type(exc).__name__)
         return 1
     return 0
 
