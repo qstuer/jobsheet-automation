@@ -38,9 +38,10 @@ class SerialShapeTests(unittest.TestCase):
 
     def read(self, raw):
         with patch.dict('os.environ', {reference.ENABLED_ENV:'1', 'JOBSHEET_DRY_RUN':'1'}), \
-             patch.object(vision, 'crop_jobsheet_field_card', return_value='same image'), \
+             patch.object(vision, 'crop_jobsheet_field_card', return_value='same image') as crop, \
              patch.object(vision, '_call_vision', return_value=json.dumps(raw)) as call:
             result = vision.ocr_jobsheet_serial_with_shapes(None, 0, reference.project(self.index(), {'EPIQ'}))
+        self.assertEqual(('product_raw','serial_candidates'), crop.call_args.args[2])
         return result, call
 
     def test_assisted_serial_never_enters_votes_or_replaces_literal(self):

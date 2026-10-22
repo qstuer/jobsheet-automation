@@ -96,20 +96,28 @@ def _should_recheck_stable_phone(ev, diagnostic, trace):
     """A stable phone is not verified merely because two readings agree.
 
     Only schedule the existing bounded focus pass, never weaken acceptance.
-    Require repeated identity clues; do not retry a phone already corroborated
+    Require repeated product/hospital plus either repeated serials or a bounded
+    live identity rival. Do not retry a phone already corroborated
     on a plausible live task, or reinterpret known ties/conflicts as OCR faults.
     """
     if SEARCH_HARD_STOPS.intersection(trace):
         return False
+    facts = diagnostic.get("nearest_live_facts", [])
+    bounded_identity = bool(_serials(ev)) and any(
+        row.get("product_supported") and row.get("hospital_supported")
+        and row.get("type_matches") and not row.get("product_conflict")
+        and not row.get("hospital_conflict") and row.get("serial_distance", 99) <= 3
+        for row in facts)
     if (not _full_phones(_stable(ev, "phone_candidates"))
             or len(_stable(ev, "product_raw")) != 1
             or len(_stable(ev, "hospital_raw")) != 1
-            or not (_stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates"))):
+            or not (_stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+                    or bounded_identity)):
         return False
     corroborated = any(row.get("phone_exact") and row.get("product_supported")
         and row.get("hospital_supported") and row.get("type_matches")
         and row.get("serial_distance", 99) <= 3
-        for row in diagnostic.get("nearest_live_facts", []))
+        for row in facts)
     return not corroborated
 
 

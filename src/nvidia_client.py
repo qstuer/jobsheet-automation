@@ -1202,10 +1202,13 @@ def ocr_jobsheet_serial_with_shapes(pdf_doc, page_idx, shapes, zoom=6.0):
             or type(s['devices']) is not int or s['devices'] < reference.MIN_DISTINCT_DEVICES
             for s in shapes)):
         raise ValueError('Unverified serial shape reference')
-    image_b64 = crop_jobsheet_field_card(pdf_doc, page_idx, ('serial_candidates',), zoom=zoom,
+    image_b64 = crop_jobsheet_field_card(pdf_doc, page_idx, ('product_raw', 'serial_candidates'), zoom=zoom,
                                           strong=zoom>=6, focused=True)
     prompt = _TRANSCRIPTION_RULES + (
-        'Read this SERIAL NO. value character by character. The following advisory patterns '
+        'The PRODUCT and SERIAL NO. panels are from the same physical jobsheet. '
+        'Look at both to understand the printed field boundaries and visible writing, '
+        'then transcribe only SERIAL NO. character by character. The PRODUCT value is context, '
+        'not serial characters and not permission to complete a serial. The following advisory patterns '
         'describe LETTER (L) versus DIGIT (D) positions across at least three distinct devices '
         'of the transcribed product family. They are incomplete character-class hints, NOT '
         'candidate serials. They can help distinguish visually ambiguous letter/digit strokes, '
