@@ -173,7 +173,7 @@ class Capture:
             self.stack.enter_context(patch.object(vision, name, side_effect=observed))
         for name in ("ocr_jobsheet_fields", "ocr_jobsheet_identity_fields",
                      "ocr_jobsheet_support_fields", "ocr_jobsheet_context_field",
-                     "ocr_jobsheet_focused_field", "ocr_jobsheet_signature_date"):
+                     "ocr_jobsheet_focused_field", "ocr_jobsheet_signature_date", "ocr_jobsheet_serial_with_shapes"):
             self.stack.enter_context(patch.object(vision, name, self.wrap_reader(getattr(vision, name))))
         self.stack.enter_context(patch.object(matching_rules, "_checklist_read",
                                              self.wrap_reader(matching_rules._checklist_read)))

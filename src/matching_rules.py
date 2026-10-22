@@ -15,7 +15,7 @@ from datetime import date, timedelta
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference
+from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference, serial_shape_reference
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
@@ -530,6 +530,7 @@ def public_diagnostic(audit):
         "format_recovery_needs_action_date",
         "stable_phone_reread", "numeric_literal_auxiliary_retained",
         "stable_serial_reread", "vision_service_incomplete", "device_search_unavailable",
+        "serial_shape_reference_read",
         "ambiguous_order_numbers",
         "signature_dates_read", "signature_read_unavailable", "signature_date_conflict",
         "signature_date_protocol_rejected", "signature_date_live_visit_confirmed",
@@ -608,6 +609,9 @@ def _checklist_read(doc, zoom):
 
 def read_and_match(doc, job_type, reference_day=None):
     from . import device_search_agent, processor, private_ocr_context
+    serial_shapes_enabled = os.environ.get(serial_shape_reference.ENABLED_ENV) == '1'
+    if serial_shapes_enabled and os.environ.get('JOBSHEET_DRY_RUN') != '1':
+        raise ValueError('Serial reference requires read-only mode')
     search_agent_enabled = os.environ.get(device_search_agent.ENABLED_ENV) == "1"
     if search_agent_enabled:
         device_search_agent.require_read_only()  # Fail before any OCR/network access.
@@ -684,6 +688,10 @@ def read_and_match(doc, job_type, reference_day=None):
             for zoom in (5.0, 6.0):
                 if field in {"product_raw", "hospital_raw"}:
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus", field)
+                elif field == 'serial_candidates' and zoom == 6.0 and serial_shapes_enabled and (
+                        shapes := serial_shape_reference.project(ac._device_index, _stable(ev, 'product_raw'))):
+                    trace.append('serial_shape_reference_read')
+                    read(lambda: vision.ocr_jobsheet_serial_with_shapes(doc, 0, shapes, zoom=zoom), 'cover_focus', field)
                 else:
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_focused_field(doc, 0, f, zoom=z), "cover_focus", field)
         task = attempt()

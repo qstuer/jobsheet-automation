@@ -1192,6 +1192,50 @@ def ocr_jobsheet_focused_field(
         field if field in {"phone_candidates", "service_date_raw"} else None))
 
 
+def ocr_jobsheet_serial_with_shapes(pdf_doc, page_idx, shapes, zoom=6.0):
+    """One bounded transcription; a pattern-only suggestion is never a vote."""
+    from . import serial_shape_reference as reference
+    if os.environ.get(reference.ENABLED_ENV) != '1' or os.environ.get('JOBSHEET_DRY_RUN') != '1':
+        raise ValueError('Serial shape reference requires explicit read-only mode')
+    if (not shapes or len(shapes) > reference.MAX_SHAPES or any(
+            set(s) != {'pattern', 'devices'} or not re.fullmatch(r'[LD]{8,12}', s['pattern'])
+            or type(s['devices']) is not int or s['devices'] < reference.MIN_DISTINCT_DEVICES
+            for s in shapes)):
+        raise ValueError('Unverified serial shape reference')
+    image_b64 = crop_jobsheet_field_card(pdf_doc, page_idx, ('serial_candidates',), zoom=zoom,
+                                          strong=zoom>=6, focused=True)
+    prompt = _TRANSCRIPTION_RULES + (
+        'Read this SERIAL NO. value character by character. The following advisory patterns '
+        'describe LETTER (L) versus DIGIT (D) positions across at least three distinct devices '
+        'of the transcribed product family. They are incomplete character-class hints, NOT '
+        'candidate serials. They can help distinguish visually ambiguous letter/digit strokes, '
+        'but clear strokes override a pattern; a rare or different pattern is not invalid. '
+        'Never generate a serial from a pattern, fill a missing prefix, or change clear digits. '
+        'Put only visually supported transcription in serial_candidates; use ? for uncertainty. '
+        'Put any suggestion supported only by the pattern in assisted_candidates instead; '
+        'that list is diagnostic and cannot prove identity. Return JSON only: '
+        '{"serial_candidates":[],"assisted_candidates":[],"unreadable_fields":[]}. '
+        'Advisory patterns: ' + json.dumps(shapes, sort_keys=True))
+    last_error = None
+    for _ in range(2):
+        raw = _call_vision(prompt, image_b64, max_tokens=300, expects_json=True)
+        try:
+            data = _parse_json_object(raw, {'serial_candidates', 'assisted_candidates'})
+            if not set(data) <= {'serial_candidates', 'assisted_candidates', 'unreadable_fields'}:
+                raise NvidiaResponseError('Unexpected serial transcription fields')
+            for key in ('serial_candidates', 'assisted_candidates'):
+                if (not isinstance(data[key], list) or len(data[key]) > 3
+                        or any(not isinstance(v, str) or len(v) > 20 for v in data[key])):
+                    raise NvidiaResponseError('Invalid serial transcription protocol')
+            result = _normalize_ocr_data({'serial_candidates': data['serial_candidates'],
+                                        'unreadable_fields': data.get('unreadable_fields', [])})
+            result['_serial_shape_audit'] = {'reference': shapes, 'assisted_candidates': data['assisted_candidates']}
+            return result  # Only transcription enters existing evidence/format gates.
+        except NvidiaResponseError as exc:
+            last_error = exc
+    raise NvidiaResponseError('Serial shape transcription format unavailable') from last_error
+
+
 def normalize_action_identifiers(values) -> list[str]:
     """Keep only visible mixed letter/digit identifiers, never free-text guesses."""
     if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
