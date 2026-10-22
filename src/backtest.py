@@ -448,6 +448,10 @@ def _run_complete_sample(doc, sample):
         result = _match_complete_sample(doc, sample)
         if capture:
             task, detected, _metrics, ocr, evaluation = result
+            # Core retries reset their counters. The trace includes the earlier
+            # circle call even when a later service error loses partial metrics.
+            if type(capture.call_id) is int:
+                _metrics['calls'] = capture.call_id
             capture.emit("backtest_result", selected_task_gid=task.get("gid") if task else None,
                          planned_filename=_task_filename(task) if task else None,
                          detected_type=detected, ocr=ocr, evaluation=evaluation)

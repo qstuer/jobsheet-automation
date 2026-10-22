@@ -115,9 +115,9 @@ OCR_FIELD_BOXES = {
     # Customer sign-off may corroborate an ambiguous ACTION DATE; the engineer
     # may have signed earlier. Neither signature replaces ACTION DATE alone.
     "engineer_signed_date": (0.215, 0.930, 0.500, 0.980),
-    # Keep the handwritten date while excluding most of the hospital stamp;
-    # its high-contrast seal previously dominated this tiny OCR card.
-    "customer_signed_date": (0.760, 0.947, 0.960, 0.979),
+    # Keep the whole height of handwriting above the signature/date baseline.
+    # Exclude the stamp horizontally, not by cutting off upper date strokes.
+    "customer_signed_date": (0.760, 0.930, 0.975, 0.982),
     # Last Philips PM checklist page: signature dates below the tools table.
     # Never include the earlier calibration-date row in that table.
     # Keep tall handwritten year/day strokes above the printed underline.

@@ -184,6 +184,12 @@ class Capture:
             self.emit("live_pool", tasks=result[0], reason=result[1])
             return result
         self.stack.enter_context(patch.object(matching_rules, "live_pool", side_effect=observed_pool))
+        typeahead = asana_client._typeahead
+        def observed_typeahead(*args, **kwargs):
+            result = typeahead(*args, **kwargs)
+            self.emit("asana_typeahead", query=args[0] if args else kwargs.get("query"), tasks=result)
+            return result  # Private evidence only, never a new OCR vote.
+        self.stack.enter_context(patch.object(asana_client, "_typeahead", side_effect=observed_typeahead))
         select_task = matching_rules.select_task
         def observed_selection(*args, **kwargs):
             result = select_task(*args, **kwargs)

@@ -1109,6 +1109,62 @@ def ocr_jobsheet_action_identifiers(
     raise NvidiaResponseError("ACTION TAKEN 識別碼格式錯誤") from last_error
 
 
+_SIGNED_DATE_LITERAL = (
+    r"(?:[0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}|"
+    r"[0-9]{1,2}[-/.][0-9]{1,2}[-/.](?:[0-9]{4}|[0-9]{2}))"
+)
+
+
+def _parse_signature_date_reply(raw: str) -> Optional[str]:
+    """One date from one labelled panel, not free-form date extraction.
+
+    Some configured backends ignore JSON mode. A full-match date literal or
+    fixed single-date sentence is a serialization variant, not new evidence.
+    Ambiguous/multiple answers, partial dates and uncertain prose stay rejected.
+    This compatibility parser is NOT used by general OCR or candidate tools.
+    """
+    if not isinstance(raw, str) or len(raw) > 2000:
+        raise NvidiaResponseError("簽署日期回覆格式錯誤")
+    text = raw.strip().lstrip("\ufeff")
+    if text == "null":
+        return None
+    try:
+        data = _parse_json_object(text, required_keys={"signed_date"})
+    except NvidiaResponseError:
+        literal = re.fullmatch(
+            rf'(?:The handwritten date beside the signature in the (?:one labelled panel|panel) is )?'
+            rf'(?P<quote>["\']?)(?P<value>{_SIGNED_DATE_LITERAL})(?P=quote)\.?', text)
+        if not literal:
+            raise NvidiaResponseError("簽署日期不是唯一完整讀數")
+        value = literal['value']
+    else:
+        decoder = json.JSONDecoder()
+        objects = []
+        for match in re.finditer(r"\{", text):
+            try:
+                candidate, _ = decoder.raw_decode(text, match.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                objects.append(candidate)
+        if len(objects) != 1 or set(data) != {"signed_date"}:
+            raise NvidiaResponseError("簽署日期含多個或額外答案")
+        value = data['signed_date']
+        if value is None:
+            return None
+    if not isinstance(value, str) or not re.fullmatch(_SIGNED_DATE_LITERAL, value):
+        raise NvidiaResponseError("簽署日期不是完整日期")
+    parsed = _parse_action_date(value)
+    if not parsed:
+        raise NvidiaResponseError("簽署日期不合法")
+    # A valid JSON fragment must not conceal a different answer in its wrapper.
+    mentions = re.findall(rf"(?<![0-9])({_SIGNED_DATE_LITERAL})(?![0-9])", text)
+    if (any(_parse_action_date(mention) != parsed for mention in mentions) or '?' in text
+            or re.search(r"\b(?:maybe|unclear|uncertain|unsure|possibly|probably)\b|not (?:sure|clear|certain)", text, re.I)):
+        raise NvidiaResponseError("簽署日期有互相矛盾讀數")
+    return parsed.isoformat()
+
+
 def ocr_jobsheet_signature_date(
         pdf_doc: fitz.Document, page_idx: int, field: str, zoom: float = 5.0
 ) -> Optional[str]:
@@ -1133,17 +1189,13 @@ def ocr_jobsheet_signature_date(
         '{"signed_date":"DD/MM/YYYY"} using exactly the visible digits.'
     )
     last_error = None
-    for _ in range(2):
-        raw = _call_vision(prompt, image_b64, max_tokens=120, expects_json=True)
+    for attempt in range(2):
+        retry = (" The previous reply had an invalid single-value format. Read this same "
+                 "panel again. Output exactly one JSON object with only signed_date; "
+                 "no explanation, examples, alternatives or additional keys.") if attempt else ""
+        raw = _call_vision(prompt + retry, image_b64, max_tokens=120, expects_json=True)
         try:
-            data = _parse_json_object(raw, required_keys={"signed_date"})
-            value = data["signed_date"]
-            if value is None:
-                return None
-            if not isinstance(value, str):
-                raise NvidiaResponseError("簽署日期不是文字")
-            parsed = _parse_action_date(value)
-            return parsed.isoformat() if parsed else None
+            return _parse_signature_date_reply(raw)
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
     raise NvidiaResponseError("簽署日期格式錯誤") from last_error

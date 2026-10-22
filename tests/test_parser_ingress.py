@@ -246,7 +246,9 @@ class ParserIngressTests(unittest.TestCase):
                    "nearest_live_facts": [{"serial_distance": "ABC12X3456", "asset_level": 999}] * 20}}
         public = rules.public_diagnostic(audit)
         self.assertEqual(0, public["read_count"])
-        self.assertEqual(80, public["live"]["live_task_count"])
+        # This is the total read budget, not a single device's visit budget.
+        self.assertEqual(rules.MAX_SCANNED_TASKS, public["live"]["live_task_count"])
+        self.assertEqual(80, rules.MAX_LIVE_TASKS)
         self.assertEqual(10, len(public["live"]["nearest_live_facts"]))
         self.assertEqual(2, public["live"]["nearest_live_facts"][0]["asset_level"])
         self.assertNotIn("ABC12X3456", str(public))

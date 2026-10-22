@@ -100,6 +100,18 @@ class PrivateOCRTraceTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.capture()
 
+    def test_live_typeahead_is_saved_privately_without_changing_results(self):
+        from src import asana_client
+        result = [{'gid': '1', 'name': 'synthetic private task'}]
+        with patch.object(asana_client, '_typeahead', return_value=result) as original:
+            with patch('sys.stdout', new_callable=io.StringIO) as output, self.capture():
+                self.assertIs(result, asana_client._typeahead('synthetic serial'))
+                self.assertEqual('', output.getvalue())
+            self.assertIs(original, asana_client._typeahead)
+        saved = next(row for row in self.events() if row['event'] == 'asana_typeahead')
+        self.assertEqual('synthetic serial', saved['query'])
+        self.assertEqual(result, saved['tasks'])
+
     def test_rejects_outside_private_root_and_root_itself(self):
         for path in (self.root, Path(self.temporary.name) / "outside"):
             with self.assertRaises(ValueError):

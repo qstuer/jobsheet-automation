@@ -20,6 +20,9 @@ from . import asana_client as ac, asana_index, config, date_corroboration, devic
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
 MAX_LIVE_TASKS = 80
+# Resource limits are per device, not an invitation to discard other devices.
+# All retained competitors are read before the unchanged device/visit ranking.
+MAX_SCANNED_TASKS = MAX_DEVICE_ROWS * MAX_LIVE_TASKS
 VISIT_WINDOW_DAYS = 14
 SEARCH_HARD_STOPS = {"device_candidate_limit", "task_candidate_limit", "live_devices_tied",
                     "live_visits_tied", "compact_serial_not_unique", "crosspage_identity_conflict",
@@ -186,12 +189,24 @@ def retrieve_rows(index, ev, readings=()):
 
 
 def live_pool(rows, ev, reference_day):
-    refs = {str(ref["gid"]): ref for row in rows for ref in row.get("task_refs") or []
-            if ref.get("gid")}
-    if len(refs) > MAX_LIVE_TASKS:
+    groups = defaultdict(set)
+    for row in rows:
+        serial = (ac._norm(row.get("serial")) if not row.get("weak_identity")
+                  and not row.get("_retrieval_hint_only") else "")
+        groups[serial].update(str(ref['gid']) for ref in row.get('task_refs') or [] if ref.get('gid'))
+
+    def within_budget():
+        return (len([key for key in groups if key]) <= MAX_DEVICE_ROWS
+                and all(len(values) <= MAX_LIVE_TASKS for values in groups.values())
+                and len(set().union(*groups.values())) <= MAX_SCANNED_TASKS)
+
+    def refresh(serial):
+        groups[serial].update(str(task['gid']) for task in ac._typeahead(serial) if task.get('gid'))
+        return within_budget()
+
+    if not within_budget():
         return [], "task_candidate_limit"
     # NO indexed type/date filtering: both may have changed since the snapshot.
-    gids = set(refs)
     if rows:
         # The index narrows equipment, not the set of visits forever. A new
         # service task may have been created after this snapshot. Refresh only
@@ -203,7 +218,8 @@ def live_pool(rows, ev, reference_day):
                 and bool(_stable(ev, "product_raw")) and bool(_stable(ev, "hospital_raw"))
                 and any(len(v) == 8 and v.isascii() and v.isdigit() for v in ev["phone_candidates"]))
             if vision._valid_serial_token(serial) or compact_guard:
-                gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
+                if not refresh(serial):
+                    return [], "task_candidate_limit"
     else:
         # New equipment may not be indexed. Only transcribed serials are used;
         # unbounded phone/asset workspace searches are deliberately avoided.
@@ -217,9 +233,9 @@ def live_pool(rows, ev, reference_day):
             )
             if not vision._valid_serial_token(serial) and not compact_guard:
                 continue
-            gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
-    if len(gids) > MAX_LIVE_TASKS:
-        return [], "task_candidate_limit"
+            if not refresh(serial):
+                return [], "task_candidate_limit"
+    gids = set().union(*groups.values())
     tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
     if any(row.get("_retrieval_hint_only") for row in rows):
         # A legacy hint must not freeze the visit list at the old snapshot.
@@ -238,9 +254,9 @@ def live_pool(rows, ev, reference_day):
         if len(serials) > MAX_DEVICE_ROWS:
             return [], "device_candidate_limit"
         for serial in sorted(serials):
-            gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
-            if len(gids) > MAX_LIVE_TASKS:
+            if not refresh(serial):
                 return [], "task_candidate_limit"
+        gids = set().union(*groups.values())
         loaded = {str(task["gid"]) for task in tasks}
         tasks.extend(ac._fetch_task(gid) for gid in sorted(gids - loaded))
     return tasks, "live_tasks_read"
@@ -391,6 +407,8 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, 
                             - max(r["score"] for r in devices[ranking[1]])) < 15:
         return None, "live_devices_tied"
     visits = devices[ranking[0]]
+    if len(visits) > MAX_LIVE_TASKS:
+        return None, "task_candidate_limit"  # Never truncate a real device's visits.
     stable_dates = _stable(ev, "service_date_raw")
     if len(stable_dates) > 1:
         return None, "repeated_dates_conflict"
@@ -526,7 +544,7 @@ def public_diagnostic(audit):
     diagnostic = audit.get("last_live_diagnostic")
     if not isinstance(diagnostic, dict):
         return result
-    result["live"] = {k: count(diagnostic.get(k), MAX_LIVE_TASKS)
+    result["live"] = {k: count(diagnostic.get(k), MAX_SCANNED_TASKS if k == "live_task_count" else MAX_LIVE_TASKS)
                       for k in ("live_task_count", "repeated_product_count",
                                 "repeated_hospital_count", "repeated_date_count")}
     rows = []

@@ -12,6 +12,21 @@ from src import backtest
 
 
 class BacktestTests(unittest.TestCase):
+    def test_trace_counts_include_pre_reset_circle_call_even_on_service_failure(self):
+        from src import private_ocr_trace as trace
+        capture = MagicMock()
+        capture.__enter__.return_value = capture
+        capture.call_id = 7
+        metrics = {'calls': 6}
+        result = (None, None, metrics, None, {'status': 'SERVICE_ERROR'})
+        with patch.dict(os.environ, {'JOBSHEET_BACKTEST_RECIPIENT_KEY': 'eA=='}), \
+             patch.object(trace, 'Capture', return_value=capture), \
+             patch.object(backtest, '_match_complete_sample', return_value=result):
+            actual = backtest._run_complete_sample(MagicMock(), self._sample())
+        self.assertIs(result, actual)
+        self.assertEqual(7, metrics['calls'])
+        self.assertEqual('SERVICE_ERROR', actual[-1]['status'])
+
     def test_opt_in_capture_retains_actual_result_but_never_supplies_answer_to_reader(self):
         import base64
         import importlib.util
