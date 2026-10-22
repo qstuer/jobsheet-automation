@@ -472,6 +472,10 @@ def _match_complete_sample(doc, sample):
     else:
         evaluation = _evaluate_result(task, sample, doc.page_count, detected,
             _device_candidate_rank(ocr, sample["expected"].get("serial"), sample["job_type"]))
+        if task is None and (ocr or {}).get("_vision_service_incomplete"):
+            # Retain partial OCR and the actual circle result, but never relabel
+            # an interrupted evidence collection as an ordinary paper hold.
+            evaluation["status"] = "SERVICE_ERROR"
     return task, detected, metrics, ocr, evaluation
 
 

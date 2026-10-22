@@ -100,6 +100,15 @@ class PrivateOCRTraceTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.capture()
 
+    def test_transport_recovery_is_private_observation_not_new_reading(self):
+        with self.capture():
+            vision._transport_event('backoff', seconds=8)
+            vision._transport_event('recovery_probe', model='synthetic/model')
+        events = self.events()
+        self.assertEqual(['transport', 'transport'], [e['event'] for e in events])
+        self.assertEqual(['backoff', 'recovery_probe'], [e['category'] for e in events])
+        self.assertTrue(all(e['call_id'] == 0 for e in events))
+
     def test_live_typeahead_is_saved_privately_without_changing_results(self):
         from src import asana_client
         result = [{'gid': '1', 'name': 'synthetic private task'}]

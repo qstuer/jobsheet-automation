@@ -105,7 +105,7 @@ class Capture:
             # Whitelist request metadata; never serialize SDK clients, headers,
             # API keys, response objects, exception bodies or reasoning content.
             metadata = {key: request[key] for key in (
-                "model", "max_tokens", "temperature", "seed", "response_format")
+                "model", "max_tokens", "temperature", "seed", "response_format", "timeout")
                 if key in request}
             texts, images = [], []
             for message in request.get("messages", []):
@@ -153,6 +153,11 @@ class Capture:
         name = "events.encrypted.jsonl" if self.recipient else "events.private.jsonl"
         self.events = (self.output / name).open("xb")
         self.stack = ExitStack()
+        transport = vision._transport_event
+        def observed_transport(kind, **data):
+            self.emit("transport", category=kind, **data)
+            return transport(kind, **data)
+        self.stack.enter_context(patch.object(vision, "_transport_event", side_effect=observed_transport))
         get_client = vision.get_client
         self.stack.enter_context(patch.object(vision, "get_client", side_effect=lambda: self.client_proxy(get_client())))
         for name in ("_parse_json_object", "_normalize_ocr_data"):

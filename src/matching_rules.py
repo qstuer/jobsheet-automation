@@ -113,6 +113,23 @@ def _should_recheck_stable_phone(ev, diagnostic, trace):
     return not corroborated
 
 
+def _should_recheck_stable_serial(ev, diagnostic, trace):
+    """Repeated handwriting errors may still need the existing focused pass.
+
+    Only plausible live rivals with agreed product/hospital/type can request
+    a reread. This schedules readers; it never substitutes a table serial.
+    """
+    if (SEARCH_HARD_STOPS.intersection(trace)
+            or not (_stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates"))
+            or len(_stable(ev, "product_raw")) != 1 or len(_stable(ev, "hospital_raw")) != 1):
+        return False
+    relevant = [row for row in diagnostic.get("nearest_live_facts", [])
+                if row.get("product_supported") and row.get("hospital_supported")
+                and row.get("type_matches") and not row.get("product_conflict")
+                and not row.get("hospital_conflict") and row.get("serial_distance", 99) <= 3]
+    return bool(relevant) and not any(row["serial_distance"] == 0 for row in relevant)
+
+
 def _strong_conflict(ev, field, actual):
     """A known repeated disagreement is different from an unknown short code."""
     stable = _stable(ev, field)
@@ -512,6 +529,7 @@ def public_diagnostic(audit):
         "weak_compact_task_hints", "compact_serial_not_unique", "compact_serial_needs_action_date",
         "format_recovery_needs_action_date",
         "stable_phone_reread", "numeric_literal_auxiliary_retained",
+        "stable_serial_reread", "vision_service_incomplete", "device_search_unavailable",
         "ambiguous_order_numbers",
         "signature_dates_read", "signature_read_unavailable", "signature_date_conflict",
         "signature_date_protocol_rejected", "signature_date_live_visit_confirmed",
@@ -605,7 +623,9 @@ def read_and_match(doc, job_type, reference_day=None):
     last_rows = []
     equipment_audit = {}
     date_support = []  # Separate physical sources, never merged into OCR vote counts.
+    service_incomplete = False
     def read(call, source, field=None):
+        nonlocal service_incomplete
         try:
             result = {**call(), "_page": 0, "_source": source,
                       "_read_context": {"stage": source, "field": field}}
@@ -616,7 +636,8 @@ def read_and_match(doc, job_type, reference_day=None):
                 result.setdefault("_ocr_audit", {})["evidence_exclusions"] = dict(result["_evidence_exclusions"])
                 trace.append("product_reread_drift")
             readings.append(result)
-        except vision.NvidiaResponseError:
+        except vision.NvidiaResponseError as exc:
+            service_incomplete |= isinstance(exc, vision.NvidiaServiceUnavailable)
             trace.append("vision_read_unavailable")
     read(lambda: vision.ocr_jobsheet_fields(doc, 0, zoom=config.OCR_ZOOM_DEFAULT), "cover")
     read(lambda: vision.ocr_jobsheet_identity_fields(doc, 0, zoom=config.OCR_IDENTITY_ZOOM), "cover_identity")
@@ -654,9 +675,12 @@ def read_and_match(doc, job_type, reference_day=None):
         for field in ("product_raw", "hospital_raw", "serial_candidates", "phone_candidates", "service_date_raw"):
             ev = evidence(readings)
             if _stable(ev, field):
-                if field != "phone_candidates" or not _should_recheck_stable_phone(ev, last_diagnostic, trace):
+                if field == "phone_candidates" and _should_recheck_stable_phone(ev, last_diagnostic, trace):
+                    trace.append("stable_phone_reread")
+                elif field == "serial_candidates" and _should_recheck_stable_serial(ev, last_diagnostic, trace):
+                    trace.append("stable_serial_reread")
+                else:
                     continue
-                trace.append("stable_phone_reread")
             for zoom in (5.0, 6.0):
                 if field in {"product_raw", "hospital_raw"}:
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus", field)
@@ -667,7 +691,8 @@ def read_and_match(doc, job_type, reference_day=None):
         for zoom in (5.0, 6.0):
             try:
                 readings.append(_checklist_read(doc, zoom))
-            except vision.NvidiaResponseError:
+            except vision.NvidiaResponseError as exc:
+                service_incomplete |= isinstance(exc, vision.NvidiaServiceUnavailable)
                 trace.append("checklist_read_unavailable")
         trace.append("pm_crosspage_read")
         task = attempt()
@@ -682,7 +707,8 @@ def read_and_match(doc, job_type, reference_day=None):
                 for zoom in date_corroboration.ZOOMS:
                     try:
                         value = vision.ocr_jobsheet_signature_date(doc, page, field, zoom=zoom)
-                    except vision.NvidiaResponseError:
+                    except vision.NvidiaResponseError as exc:
+                        service_incomplete |= isinstance(exc, vision.NvidiaServiceUnavailable)
                         value = None
                         trace.append("signature_read_unavailable")
                     date_support.append({"page": page, "field": field, "source": source,
@@ -697,7 +723,13 @@ def read_and_match(doc, job_type, reference_day=None):
         task = attempt(allow_upload_prior=True)
     if task is None and search_agent_enabled and not SEARCH_HARD_STOPS.intersection(trace):
         equipment_audit["model_invoked"] = True
-        proposal = device_search_agent.run_search(doc, ac._device_index, evidence(readings), readings, last_rows)
+        try:
+            proposal = device_search_agent.run_search(doc, ac._device_index, evidence(readings), readings, last_rows)
+        except vision.NvidiaResponseError as exc:
+            # Keep all successful readings and diagnostics. A failed final
+            # model search must not erase the earlier identity/date evidence.
+            service_incomplete |= isinstance(exc, vision.NvidiaServiceUnavailable)
+            proposal = {"status": "unavailable", "reason": "device_search_unavailable", "audit": {}}
         equipment_audit["model_search"] = proposal["audit"]
         trace.append(proposal["reason"])
         if proposal["status"] == "proposal":
@@ -716,7 +748,10 @@ def read_and_match(doc, job_type, reference_day=None):
                     if not facts or facts["serial"] != proposal["proposed_serial"]:
                         trace.append("device_search_disagrees")
                         task = None
+    if service_incomplete:
+        trace.append("vision_service_incomplete")
     ocr = processor._consensus_ocr(readings)
+    ocr["_vision_service_incomplete"] = service_incomplete
     ocr["ocr_metrics"] = vision.get_ocr_metrics()
     ocr["rules_audit"] = {"version": RULESET_VERSION, "trace": trace,
         "reference_date_known": reference_day is not None,

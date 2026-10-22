@@ -61,6 +61,13 @@ NVIDIA_FALLBACK_MODEL = "meta/llama-3.2-11b-vision-instruct"
 # 免費入口不可無限等待。OpenAI SDK 的內建重試關掉，由本程式明確控制，
 # 讓一個失聯請求不會再拖住整批工作單數分鐘。
 NVIDIA_REQUEST_TIMEOUT_SECONDS = 45.0
+# Isolated read-only recovery experiment. No timeout extension or model change.
+OCR_TRANSPORT_RECOVERY_ENV = "JOBSHEET_OCR_TRANSPORT_RECOVERY"
+OCR_TRANSPORT_DEADLINE_SECONDS = 180.0
+OCR_TRANSPORT_MAX_REQUESTS = 6
+OCR_TRANSPORT_MAX_FAILURES = 12  # Per document, including circle detection.
+OCR_TRANSPORT_MAX_WAIT_SECONDS = 30.0
+OCR_TRANSPORT_COOLDOWN_SECONDS = 15.0
 
 # 官方建議純指令工作用 1024 輸出 token、top_k=1 並關閉 thinking。
 # Jobsheet 只要忠實抄錄，不需要模型展示推理過程。
@@ -133,7 +140,8 @@ OCR_FOCUSED_FIELD_BOXES = {
     "hospital_raw":      (0.180, 0.166, 0.575, 0.207),
     "contact_person_raw": (0.670, 0.166, 0.955, 0.207),
     "department_room_raw": (0.180, 0.198, 0.575, 0.242),
-    "phone_candidates":  (0.670, 0.198, 0.955, 0.242),
+    # Keep the whole phone cell: handwriting may start left of the old .670.
+    "phone_candidates":  (0.555, 0.198, 0.955, 0.242),
     # Handwritten dates can rise into the printed DATE heading. Starting at
     # 0.323 clipped their upper loops; B08's ambiguous month must be retested.
     "service_date_raw":   (0.555, 0.312, 0.735, 0.365),

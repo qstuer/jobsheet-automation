@@ -8,10 +8,12 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import time
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import fitz
@@ -22,6 +24,8 @@ from . import config
 _client: Optional[OpenAI] = None
 _client_identity: Optional[tuple] = None
 _unavailable_models: set[str] = set()
+_model_retry_at: dict[str, float] = {}
+_transport_failures = 0
 log = logging.getLogger(__name__)
 
 _ocr_metrics = {
@@ -37,6 +41,10 @@ class NvidiaResponseError(RuntimeError):
     """辨認服務回覆不完整或格式不正確；不得當成空白單據繼續處理。"""
 
 
+class NvidiaServiceUnavailable(NvidiaResponseError):
+    """Temporary transport failure, distinct from an invalid OCR value."""
+
+
 def reset_ocr_metrics() -> None:
     """每份工作單開始前重設非敏感的用量統計。"""
     for key in _ocr_metrics:
@@ -46,6 +54,9 @@ def reset_ocr_metrics() -> None:
 def reset_model_availability() -> None:
     """Reset temporary outage state between independent read-only test samples."""
     _unavailable_models.clear()
+    _model_retry_at.clear()
+    global _transport_failures
+    _transport_failures = 0
 
 
 def get_ocr_metrics() -> dict:
@@ -256,9 +267,11 @@ def crop_jobsheet_serial(pdf_doc: fitz.Document, page_idx: int,
 
 
 def _call_vision_once(prompt: str, image_b64: str, model: str,
-                      max_tokens: int, expects_json: bool) -> str:
+                      max_tokens: int, expects_json: bool, *, timeout_seconds=None) -> str:
     """向一個指定模型發出一次請求；重試和後備由外層控制。"""
     provider, _, _, _, timeout, _ = _provider_settings()
+    if timeout_seconds is not None:
+        timeout = min(timeout, max(0.1, timeout_seconds))
     normalized_model = model.strip().lower()
     is_deepseek = provider == "deepseek"
     is_kimi_k3 = normalized_model == "moonshotai/kimi-k3"
@@ -364,6 +377,109 @@ def _call_vision_once(prompt: str, image_b64: str, model: str,
 def _call_vision(prompt: str, image_b64: str, max_tokens: int = 300,
                  expects_json: bool = False,
                  allow_fallback: bool = True) -> str:
+    if os.environ.get(config.OCR_TRANSPORT_RECOVERY_ENV) == "1":
+        if os.environ.get("JOBSHEET_DRY_RUN") != "1":
+            raise ValueError("Transport recovery requires read-only mode")
+        return _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_fallback)
+    return _call_vision_legacy(prompt, image_b64, max_tokens, expects_json, allow_fallback)
+
+
+def _retry_after_seconds(exc):
+    """Only parse the standard delay header, never log response bodies/headers."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    value = headers.get("retry-after") if headers is not None else None
+    if value is None:
+        return None
+    try:
+        delay = float(value)
+        return max(0.0, delay) if math.isfinite(delay) else None
+    except (TypeError, ValueError):
+        try:
+            moment = parsedate_to_datetime(value)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _transport_event(kind, **data):
+    # The private trace observes this hook. Public output contains no values.
+    log.info("OCR transport: %s", kind)
+
+
+def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_fallback):
+    """Bounded recovery on the same image, with no extra evidence votes.
+
+    Two ordinary attempts/model, then at most one half-open probe/model.
+    A timeout never increases the 45-second request limit. Failure budget and
+    cooldown survive field readers but reset between independent documents.
+    """
+    global _transport_failures
+    if _transport_failures >= config.OCR_TRANSPORT_MAX_FAILURES:
+        raise NvidiaServiceUnavailable("OCR transport budget exhausted")
+    provider, _, _, primary, _, fallback = _provider_settings()
+    if provider != "nvidia":
+        raise ValueError("This transport experiment is restricted to NVIDIA")
+    primary = primary.strip()
+    models = [primary]
+    if allow_fallback and fallback and fallback.strip().lower() != primary.lower():
+        models.append(fallback.strip())
+    deadline = time.monotonic() + config.OCR_TRANSPORT_DEADLINE_SECONDS
+    attempts, last_error = 0, None
+
+    def wait(delay):
+        if delay > config.OCR_TRANSPORT_MAX_WAIT_SECONDS or time.monotonic() + delay + 1 >= deadline:
+            return False
+        if delay > 0:
+            _transport_event("backoff", seconds=delay)
+            time.sleep(delay)
+        return True
+
+    for phase in range(2):
+        for model in models:
+            delay = max(0.0, _model_retry_at.get(model, 0) - time.monotonic())
+            if delay and (phase == 0 or not wait(delay)):
+                continue
+            count = 1 if phase or (model == primary and primary.lower() == "moonshotai/kimi-k3") else 2
+            for number in range(count):
+                remaining = deadline - time.monotonic()
+                if (remaining <= 1 or attempts >= config.OCR_TRANSPORT_MAX_REQUESTS
+                        or _transport_failures >= config.OCR_TRANSPORT_MAX_FAILURES):
+                    raise NvidiaServiceUnavailable("OCR transport budget exhausted") from last_error
+                attempts += 1
+                if phase:
+                    _transport_event("recovery_probe", model=model)
+                try:
+                    value = _call_vision_once(prompt, image_b64, model, max_tokens, expects_json,
+                                              timeout_seconds=remaining)
+                    _model_retry_at.pop(model, None)
+                    return value
+                except Exception as exc:
+                    if not _is_retryable_error(exc):
+                        raise
+                    last_error = exc
+                    _transport_failures += 1
+                    retry_after = _retry_after_seconds(exc)
+                    # Never disregard a server's long Retry-After by falling
+                    # straight through to another model on the same provider.
+                    if retry_after is not None and retry_after > config.OCR_TRANSPORT_MAX_WAIT_SECONDS:
+                        for name in models:
+                            _model_retry_at[name] = time.monotonic() + retry_after
+                        raise NvidiaServiceUnavailable("OCR server requested a longer hold") from exc
+                    delay = max(2.0 * (2 ** number), retry_after or 0.0)
+                    _model_retry_at[model] = time.monotonic() + max(config.OCR_TRANSPORT_COOLDOWN_SECONDS, retry_after or 0)
+                    if number + 1 < count and not wait(delay):
+                        break
+                    if retry_after and number + 1 == count:
+                        if not wait(retry_after):
+                            raise NvidiaServiceUnavailable("OCR server hold exceeds budget") from exc
+    raise NvidiaServiceUnavailable("OCR models unavailable after bounded recovery") from last_error
+
+
+def _call_vision_legacy(prompt: str, image_b64: str, max_tokens: int = 300,
+                        expects_json: bool = False, allow_fallback: bool = True) -> str:
     """呼叫目前指定的視覺模型做單張圖 OCR。
 
     Kimi 失聯時只等待一次（避免它再次長時間掛起）；目前使用的 Nemotron
@@ -1062,6 +1178,14 @@ def ocr_jobsheet_focused_field(
     prompt = _TRANSCRIPTION_RULES + (
         f"This image contains only the panel labelled {_FIELD_DISPLAY_LABELS[field]}. "
         "Return only the exact visible value for that field. Do not repair unclear characters. "
+        + ("Read every serial character left to right, then check the whole sequence. "
+           "Keep letters as letters when their strokes support that reading; do not turn "
+           "them into digits just because they are joined to digits. Do not add a prefix. "
+           if field == "serial_candidates" else
+           "Read ALL phone digit groups from the left edge of the value through the last digit. "
+           "Spaces between groups do not mean missing digits; never complete a partial phone. "
+           if field == "phone_candidates" else "")
+        +
         f'Required shape: {{"{field}":{example_value},"unreadable_fields":[]}}'
     )
     return _read_card(image_b64, prompt, {field}, literal_field=(
