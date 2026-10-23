@@ -364,6 +364,18 @@ def assess_task(task, ev, job_type):
             safe = (serial_repeated and {"hospital", "product"} <= support) or (
                 "product" in support and "phone" in support
                 and (serial_repeated or "hospital" in support))
+            if not safe and {"hospital", "product", "asset_exact"} <= support:
+                # Assess retained alternatives, not just the nearest string.
+                # A lone exact read must not veto a fuzzy read that ALREADY
+                # qualifies with this task's exact asset. Keep every original
+                # read, and score only the supported fuzzy hypothesis; the
+                # unsupported exact read must not grant the 100-point tier.
+                alternatives = [_serial_distance(s, facts["serial"]) for s in serials
+                                if not ocr_reference.compact_serial_hint(s)
+                                and 1 <= _serial_distance(s, facts["serial"]) <= 3]
+                if alternatives:
+                    distance = min(alternatives)
+                    safe = True
         elif distance == 1:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
             # Complete the already agreed missing-hospital fallback. A

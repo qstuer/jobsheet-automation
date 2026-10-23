@@ -249,6 +249,44 @@ class TransportRecoveryTests(unittest.TestCase):
         vision.reset_model_availability()
         self.assertEqual({}, vision._transport_last_failure_at)
 
+    def prime_expired_preference(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            vision._call_vision('p', 'i')
+        self.clock.now += config.OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS + 1
+
+    def test_failed_primary_probe_can_failover_without_second_primary_failure(self):
+        self.prime_expired_preference()
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('same', 'image'))
+        self.assertEqual(['primary', 'fallback'], [c.args[2] for c in call.call_args_list])
+        self.assertEqual(3, vision._transport_failures)
+        self.assertTrue(all(c.args[:2] == ('same', 'image') for c in call.call_args_list))
+
+    def test_fast_failover_still_waits_for_server_delay(self):
+        self.prime_expired_preference()
+        started = self.clock.now
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(503, '8'), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('p', 'i'))
+        self.assertEqual(2, call.call_count)
+        self.assertEqual(8, self.clock.now - started)
+
+    def test_fast_failover_does_not_bypass_disallowed_or_cooling_fallback(self):
+        for allow in (False, True):
+            vision.reset_model_availability()
+            self.prime_expired_preference()
+            if allow:
+                vision._model_retry_at['fallback'] = self.clock.now + 120
+            with patch.object(vision, '_call_vision_once', side_effect=[Transient(), 'PM']) as call:
+                self.assertEqual('PM', vision._call_vision('p', 'i', allow_fallback=allow))
+            self.assertEqual(['primary', 'primary'], [c.args[2] for c in call.call_args_list])
+
+    def test_fast_failover_never_bypasses_long_retry_after(self):
+        self.prime_expired_preference()
+        with patch.object(vision, '_call_vision_once', side_effect=Transient(429, '120')) as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i')
+        self.assertEqual(1, call.call_count)
+
 
 class FieldRecoveryTests(unittest.TestCase):
     def setUp(self):

@@ -499,6 +499,17 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
                         raise NvidiaServiceUnavailable("OCR server requested a longer hold") from exc
                     delay = max(2.0 * (2 ** number), retry_after or 0.0)
                     _model_retry_at[model] = time.monotonic() + max(config.OCR_TRANSPORT_COOLDOWN_SECONDS, retry_after or 0)
+                    if model == primary and number + 1 < count and any(
+                            name != model and name in _transport_healthy_models
+                            and _model_retry_at.get(name, 0) <= time.monotonic()
+                            for name in models):
+                        # After a failed primary probe, a previously reachable
+                        # permitted fallback need not wait for a second primary
+                        # failure. Respect the same server delay and all caps.
+                        if not wait(delay):
+                            raise NvidiaServiceUnavailable("OCR failover delay exceeds budget") from exc
+                        _transport_event("healthy_model_failover")
+                        break
                     if number + 1 < count and not wait(delay):
                         break
                     if retry_after and number + 1 == count:
