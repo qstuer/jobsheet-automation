@@ -138,6 +138,64 @@ class TransportRecoveryTests(unittest.TestCase):
                 self.assertEqual('PM', vision._call_vision_once('p', 'i', 'primary', 64, False, timeout_seconds=remaining))
                 self.assertEqual(min(45, remaining), client.chat.completions.create.call_args.kwargs['timeout'])
 
+    def prime_successful_fallback(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            self.assertEqual('PM', vision._call_vision('p', 'i'))
+        self.assertEqual({'fallback'}, vision._transport_healthy_models)
+        self.clock.now += 20  # Primary cooldown is expired; preference must not depend on it.
+        vision._transport_failures = config.OCR_TRANSPORT_MAX_FAILURES - 1
+
+    def test_last_failure_reserve_prefers_proven_fallback_for_later_readers(self):
+        self.prime_successful_fallback()
+        with patch.object(vision, '_call_vision_once', return_value='PM') as call:
+            for _ in range(3):
+                self.assertEqual('PM', vision._call_vision('same prompt', 'same image'))
+        self.assertEqual(['fallback'] * 3, [c.args[2] for c in call.call_args_list])
+        self.assertTrue(all(c.args[:2] == ('same prompt', 'same image') for c in call.call_args_list))
+        self.assertEqual(config.OCR_TRANSPORT_MAX_FAILURES - 1, vision._transport_failures)
+
+    def test_proven_fallback_failure_uses_last_token_then_stops_all_requests(self):
+        self.prime_successful_fallback()
+        with patch.object(vision, '_call_vision_once', side_effect=Transient()) as call:
+            for _ in range(3):
+                with self.assertRaises(vision.NvidiaServiceUnavailable):
+                    vision._call_vision('p', 'i')
+        self.assertEqual(1, call.call_count)
+        self.assertEqual('fallback', call.call_args.args[2])
+        self.assertEqual(config.OCR_TRANSPORT_MAX_FAILURES, vision._transport_failures)
+
+    def test_unproven_model_is_not_granted_extra_requests_at_the_cap(self):
+        vision._transport_failures = config.OCR_TRANSPORT_MAX_FAILURES - 1
+        with patch.object(vision, '_call_vision_once', side_effect=Transient()) as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i')
+        self.assertEqual(1, call.call_count)
+        self.assertEqual('primary', call.call_args.args[2])
+
+    def test_conservation_never_enables_a_disallowed_fallback(self):
+        self.prime_successful_fallback()
+        with patch.object(vision, '_call_vision_once', side_effect=Transient()) as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i', allow_fallback=False)
+        self.assertEqual(['primary'], [c.args[2] for c in call.call_args_list])
+
+    def test_server_hold_cannot_be_bypassed_by_a_previously_healthy_model(self):
+        self.prime_successful_fallback()
+        for model in ('primary','fallback'):
+            vision._model_retry_at[model] = self.clock.now + 120
+        with patch.object(vision, '_call_vision_once') as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i')
+        call.assert_not_called()
+
+    def test_proven_model_state_never_leaks_between_documents(self):
+        self.prime_successful_fallback()
+        vision.reset_model_availability()
+        self.assertEqual(set(), vision._transport_healthy_models)
+        with patch.object(vision, '_call_vision_once', return_value='PM') as call:
+            self.assertEqual('PM', vision._call_vision('p', 'i'))
+        self.assertEqual('primary', call.call_args.args[2])
+
 
 class FieldRecoveryTests(unittest.TestCase):
     def setUp(self):

@@ -25,6 +25,7 @@ _client: Optional[OpenAI] = None
 _client_identity: Optional[tuple] = None
 _unavailable_models: set[str] = set()
 _model_retry_at: dict[str, float] = {}
+_transport_healthy_models: set[str] = set()
 _transport_failures = 0
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def reset_model_availability() -> None:
     """Reset temporary outage state between independent read-only test samples."""
     _unavailable_models.clear()
     _model_retry_at.clear()
+    _transport_healthy_models.clear()
     global _transport_failures
     _transport_failures = 0
 
@@ -439,6 +441,8 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
 
     for phase in range(2):
         for model in models:
+            if _transport_failures >= config.OCR_TRANSPORT_MAX_FAILURES:
+                raise NvidiaServiceUnavailable("OCR transport budget exhausted") from last_error
             delay = max(0.0, _model_retry_at.get(model, 0) - time.monotonic())
             if delay and (phase == 0 or not wait(delay)):
                 continue
@@ -448,6 +452,15 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
                 if (remaining <= 1 or attempts >= config.OCR_TRANSPORT_MAX_REQUESTS
                         or _transport_failures >= config.OCR_TRANSPORT_MAX_FAILURES):
                     raise NvidiaServiceUnavailable("OCR transport budget exhausted") from last_error
+                if _transport_failures == config.OCR_TRANSPORT_MAX_FAILURES - 1:
+                    healthy = [name for name in models if name in _transport_healthy_models
+                               and _model_retry_at.get(name, 0) <= time.monotonic()]
+                    if healthy:
+                        # Reserve the last permitted failure for a model that
+                        # has actually succeeded since its last transport error.
+                        # Success is still ordinary OCR, never an extra vote.
+                        model = healthy[0]
+                        _transport_event("budget_conserving_read", model=model)
                 attempts += 1
                 if phase:
                     _transport_event("recovery_probe", model=model)
@@ -455,11 +468,13 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
                     value = _call_vision_once(prompt, image_b64, model, max_tokens, expects_json,
                                               timeout_seconds=remaining)
                     _model_retry_at.pop(model, None)
+                    _transport_healthy_models.add(model)
                     return value
                 except Exception as exc:
                     if not _is_retryable_error(exc):
                         raise
                     last_error = exc
+                    _transport_healthy_models.discard(model)
                     _transport_failures += 1
                     retry_after = _retry_after_seconds(exc)
                     # Never disregard a server's long Retry-After by falling
