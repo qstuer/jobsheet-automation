@@ -68,6 +68,7 @@ OCR_TRANSPORT_MAX_REQUESTS = 6
 OCR_TRANSPORT_MAX_FAILURES = 12  # Per document, including circle detection.
 OCR_TRANSPORT_MAX_WAIT_SECONDS = 30.0
 OCR_TRANSPORT_COOLDOWN_SECONDS = 15.0
+OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS = 60.0
 
 # 官方建議純指令工作用 1024 輸出 token、top_k=1 並關閉 thinking。
 # Jobsheet 只要忠實抄錄，不需要模型展示推理過程。

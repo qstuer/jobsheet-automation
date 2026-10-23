@@ -15,7 +15,7 @@ from datetime import date, timedelta
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference, serial_shape_reference
+from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference, pm_field_cards, serial_shape_reference
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
@@ -590,6 +590,39 @@ def public_diagnostic(audit):
 
 
 def _checklist_read(doc, zoom):
+    if os.environ.get(pm_field_cards.ENABLED_ENV) == "1":
+        image_b64 = pm_field_cards.render(doc, zoom)
+        prompt = (
+            "These labelled panels are separate handwritten fields from PDF page 2, "
+            "Philips Ultrasound System PM Checklist page 1 of 3. Read only each "
+            "panel's value, not the new label. Customer is hospital/site, System "
+            "is product, sn is the complete MACHINE serial, Date is checklist "
+            "date, Asset No. is asset. Inspect each serial character left to right; "
+            "letters may be joined to digits. Preserve visible letters and digits, "
+            "use ? for unclear characters and null for blank fields. Do not complete "
+            "a serial from a product, copy neighbouring values, or infer missing "
+            "digits. No device candidates or previous readings are supplied. "
+            'JSON only: {"hospital":null,"product":null,"serial":null,"date":null,"asset":null}'
+        )
+    else:
+        image_b64 = _checklist_strip(doc, zoom)
+        prompt = CHECKLIST_PROMPT
+    raw = vision._call_vision(prompt=prompt, image_b64=image_b64,
+                             max_tokens=300, expects_json=True)
+    data = vision._parse_json_object(raw, required_keys={"hospital", "product", "serial", "date", "asset"})
+    if set(data) != {"hospital", "product", "serial", "date", "asset"} or any(
+            v is not None and not isinstance(v, str) for v in data.values()):
+        raise vision.NvidiaResponseError("Invalid checklist field types")
+    normalized = vision._normalize_ocr_data({
+        "hospital_raw": data["hospital"], "product_raw": data["product"],
+        "serial_candidates": [data["serial"]] if data["serial"] else [],
+        "service_date_raw": data["date"], "date_source": "ACTION_DATE",
+        "asset_candidates": [data["asset"]] if data["asset"] else [],
+    })
+    return {**normalized, "_page": 1, "_source": "pm_checklist_header"}
+
+
+def _checklist_strip(doc, zoom):
     rect = doc[1].rect
     l, t, r, b = CHECKLIST_HEADER
     pix = doc[1].get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=fitz.Rect(
@@ -598,25 +631,13 @@ def _checklist_read(doc, zoom):
     img = ImageOps.autocontrast(Image.open(io.BytesIO(pix.tobytes("png"))).convert("L"))
     output = io.BytesIO()
     img.save(output, format="JPEG", quality=92)
-    raw = vision._call_vision(prompt=CHECKLIST_PROMPT,
-        image_b64=base64.b64encode(output.getvalue()).decode("ascii"),
-        max_tokens=300, expects_json=True)
-    data = vision._parse_json_object(raw, required_keys={"hospital", "product", "serial", "date", "asset"})
-    if any(v is not None and not isinstance(v, str) for v in data.values()):
-        raise vision.NvidiaResponseError("Invalid checklist field types")
-    normalized = vision._normalize_ocr_data({
-        "hospital_raw": data["hospital"], "product_raw": data["product"],
-        "serial_candidates": [data["serial"]] if data["serial"] else [],
-        "service_date_raw": data["date"], "date_source": "ACTION_DATE",
-        "asset_candidates": [data["asset"]] if data["asset"] else [],
-    })
-    # Preserve the distinct physical source: checklist Date corroborates the
-    # service date; it is never presented as handwriting in ACTION DATE.
-    return {**normalized, "_page": 1, "_source": "pm_checklist_header"}
+    return base64.b64encode(output.getvalue()).decode("ascii")
 
 
 def read_and_match(doc, job_type, reference_day=None):
     from . import device_search_agent, processor, private_ocr_context
+    if os.environ.get(pm_field_cards.ENABLED_ENV) == "1":
+        pm_field_cards.require_read_only()
     serial_shapes_enabled = os.environ.get(serial_shape_reference.ENABLED_ENV) == '1'
     if serial_shapes_enabled and os.environ.get('JOBSHEET_DRY_RUN') != '1':
         raise ValueError('Serial reference requires read-only mode')

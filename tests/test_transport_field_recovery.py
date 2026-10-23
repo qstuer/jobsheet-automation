@@ -196,6 +196,59 @@ class TransportRecoveryTests(unittest.TestCase):
             self.assertEqual('PM', vision._call_vision('p', 'i'))
         self.assertEqual('primary', call.call_args.args[2])
 
+    def test_recent_primary_failure_uses_healthy_fallback_before_final_budget(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            self.assertEqual('PM', vision._call_vision('p', 'i'))
+        self.clock.now += config.OCR_TRANSPORT_COOLDOWN_SECONDS + 1
+        with patch.object(vision, '_call_vision_once', return_value='PM') as call:
+            self.assertEqual('PM', vision._call_vision('next', 'same'))
+        self.assertEqual('fallback', call.call_args.args[2])
+        self.assertEqual(2, vision._transport_failures)
+
+    def test_health_lease_expires_without_renewal_from_fallback_success(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            vision._call_vision('p', 'i')
+        failed_at = vision._transport_last_failure_at['primary']
+        with patch.object(vision, '_call_vision_once', return_value='PM') as call:
+            self.clock.now = failed_at + config.OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS - 1
+            vision._call_vision('p', 'i')
+            self.assertEqual('fallback', call.call_args.args[2])
+            self.clock.now += 2
+            vision._call_vision('p', 'i')
+            self.assertEqual('primary', call.call_args.args[2])
+        self.assertNotIn('primary', vision._transport_last_failure_at)
+
+    def test_healthy_preference_respects_disallowed_fallback_and_server_hold(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            vision._call_vision('p', 'i')
+        self.clock.now += 20
+        with patch.object(vision, '_call_vision_once', return_value='PM') as call:
+            vision._call_vision('p', 'i', allow_fallback=False)
+        self.assertEqual('primary', call.call_args.args[2])
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        vision._transport_healthy_models.discard('primary')
+        for model in ('primary', 'fallback'):
+            vision._model_retry_at[model] = self.clock.now + 120
+        with patch.object(vision, '_call_vision_once') as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i')
+        call.assert_not_called()
+
+    def test_failed_preferred_model_does_not_gain_extra_attempts(self):
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):
+            vision._call_vision('p', 'i')
+        self.clock.now += 20
+        with patch.object(vision, '_call_vision_once', side_effect=Transient()) as call:
+            with self.assertRaises(vision.NvidiaServiceUnavailable):
+                vision._call_vision('p', 'i')
+        self.assertEqual(config.OCR_TRANSPORT_MAX_REQUESTS, call.call_count)
+        self.assertEqual(2 + config.OCR_TRANSPORT_MAX_REQUESTS, vision._transport_failures)
+
+    def test_last_failure_times_are_reset_between_documents(self):
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        vision.reset_model_availability()
+        self.assertEqual({}, vision._transport_last_failure_at)
+
 
 class FieldRecoveryTests(unittest.TestCase):
     def setUp(self):

@@ -26,6 +26,7 @@ _client_identity: Optional[tuple] = None
 _unavailable_models: set[str] = set()
 _model_retry_at: dict[str, float] = {}
 _transport_healthy_models: set[str] = set()
+_transport_last_failure_at: dict[str, float] = {}
 _transport_failures = 0
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ def reset_model_availability() -> None:
     _unavailable_models.clear()
     _model_retry_at.clear()
     _transport_healthy_models.clear()
+    _transport_last_failure_at.clear()
     global _transport_failures
     _transport_failures = 0
 
@@ -428,6 +430,16 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
     models = [primary]
     if allow_fallback and fallback and fallback.strip().lower() != primary.lower():
         models.append(fallback.strip())
+    failed_at = _transport_last_failure_at.get(primary)
+    if (failed_at is not None and primary not in _transport_healthy_models
+            and time.monotonic() - failed_at < config.OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS):
+        healthy = [name for name in models if name in _transport_healthy_models
+                   and _model_retry_at.get(name, 0) <= time.monotonic()]
+        if healthy:
+            # Short lease measured from the failure, not renewed by successful
+            # fallback reads. Afterwards the primary can be probed normally.
+            models = healthy + [name for name in models if name not in healthy]
+            _transport_event("healthy_model_preference", model=models[0])
     deadline = time.monotonic() + config.OCR_TRANSPORT_DEADLINE_SECONDS
     attempts, last_error = 0, None
 
@@ -468,6 +480,7 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
                     value = _call_vision_once(prompt, image_b64, model, max_tokens, expects_json,
                                               timeout_seconds=remaining)
                     _model_retry_at.pop(model, None)
+                    _transport_last_failure_at.pop(model, None)
                     _transport_healthy_models.add(model)
                     return value
                 except Exception as exc:
@@ -475,6 +488,7 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
                         raise
                     last_error = exc
                     _transport_healthy_models.discard(model)
+                    _transport_last_failure_at[model] = time.monotonic()
                     _transport_failures += 1
                     retry_after = _retry_after_seconds(exc)
                     # Never disregard a server's long Retry-After by falling
