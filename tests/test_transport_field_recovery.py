@@ -241,13 +241,45 @@ class TransportRecoveryTests(unittest.TestCase):
         with patch.object(vision, '_call_vision_once', side_effect=Transient()) as call:
             with self.assertRaises(vision.NvidiaServiceUnavailable):
                 vision._call_vision('p', 'i')
-        self.assertEqual(config.OCR_TRANSPORT_MAX_REQUESTS, call.call_count)
-        self.assertEqual(2 + config.OCR_TRANSPORT_MAX_REQUESTS, vision._transport_failures)
+        # The recently failed primary gets one ordinary probe, not two.
+        self.assertEqual(['fallback', 'fallback', 'primary', 'fallback', 'primary'],
+                         [c.args[2] for c in call.call_args_list])
+        self.assertEqual(5, call.call_count)
+        self.assertEqual(7, vision._transport_failures)
 
     def test_last_failure_times_are_reset_between_documents(self):
         vision._transport_last_failure_at['primary'] = self.clock.now
         vision.reset_model_availability()
         self.assertEqual({}, vision._transport_last_failure_at)
+
+    def test_recently_failed_model_gets_one_probe_not_two_after_field_change(self):
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('new field', 'same image'))
+        self.assertEqual(['primary', 'fallback'], [c.args[2] for c in call.call_args_list])
+        self.assertEqual(1, vision._transport_failures)
+
+    def test_recent_failure_probe_success_restores_ordinary_attempts(self):
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        with patch.object(vision, '_call_vision_once', return_value='PM'):
+            vision._call_vision('p', 'i')
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('p', 'i', allow_fallback=False))
+        self.assertEqual(['primary', 'primary'], [c.args[2] for c in call.call_args_list])
+
+    def test_recent_failure_probe_does_not_skip_retry_after_or_enable_fallback(self):
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(503, '8'), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('p', 'i', allow_fallback=False))
+        self.assertEqual(['primary', 'primary'], [c.args[2] for c in call.call_args_list])
+        self.assertGreaterEqual(self.clock.now, 8)
+
+    def test_expired_failure_history_does_not_permanently_single_probe_model(self):
+        vision._transport_last_failure_at['primary'] = self.clock.now
+        self.clock.now += config.OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS + 1
+        with patch.object(vision, '_call_vision_once', side_effect=[Transient(), 'PM']) as call:
+            self.assertEqual('PM', vision._call_vision('p', 'i'))
+        self.assertEqual(['primary', 'primary'], [c.args[2] for c in call.call_args_list])
 
     def prime_expired_preference(self):
         with patch.object(vision, '_call_vision_once', side_effect=[Transient(), Transient(), 'PM']):

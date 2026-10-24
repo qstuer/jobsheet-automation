@@ -417,6 +417,8 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
     """Bounded recovery on the same image, with no extra evidence votes.
 
     Two ordinary attempts/model, then at most one half-open probe/model.
+    A model with a recent unresolved failure gets only one ordinary probe;
+    changing field readers does not make a known outage a fresh endpoint.
     A timeout never increases the 45-second request limit. Failure budget and
     cooldown survive field readers but reset between independent documents.
     """
@@ -458,7 +460,11 @@ def _call_vision_recovering(prompt, image_b64, max_tokens, expects_json, allow_f
             delay = max(0.0, _model_retry_at.get(model, 0) - time.monotonic())
             if delay and (phase == 0 or not wait(delay)):
                 continue
-            count = 1 if phase or (model == primary and primary.lower() == "moonshotai/kimi-k3") else 2
+            failed_at = _transport_last_failure_at.get(model)
+            recent_failure = (failed_at is not None and
+                              time.monotonic() - failed_at < config.OCR_TRANSPORT_HEALTH_PREFERENCE_SECONDS)
+            count = 1 if (phase or recent_failure or
+                          (model == primary and primary.lower() == "moonshotai/kimi-k3")) else 2
             for number in range(count):
                 remaining = deadline - time.monotonic()
                 if (remaining <= 1 or attempts >= config.OCR_TRANSPORT_MAX_REQUESTS
@@ -1389,6 +1395,30 @@ def ocr_jobsheet_signature_date(
         raise ValueError("不支援的簽署日期欄位")
     if field.startswith("checklist_") and (page_idx != 3 or len(pdf_doc) != 4):
         raise ValueError("Checklist signature date requires the final page of a complete PM packet")
+    from . import signature_date_cards
+    if os.environ.get(signature_date_cards.ENABLED_ENV) == "1":
+        signature_date_cards.require_read_only()
+        image_b64 = signature_date_cards.render(pdf_doc, page_idx, field, zoom)
+        prompt = _TRANSCRIPTION_RULES + (
+            "Read only the handwritten date in this one labelled date-value panel. "
+            "Copy the three digit groups separately in their written order: "
+            "day before the first separator, month between separators, year after "
+            "the second separator. Ignore printed lines, labels, signatures and stamps. "
+            "Do not rearrange digits into a likely date, expand a year, or use task "
+            "information. If any group is uncertain, return null for that group. "
+            'Return exactly one JSON object with only day, month, year; '
+            'use strings of visible digits or null. No explanation or alternatives.'
+        )
+        last_error = None
+        for attempt in range(2):
+            retry = (" Reply format was invalid. Read this same panel; return only "
+                     "the three requested keys in one JSON object.") if attempt else ""
+            raw = _call_vision(prompt + retry, image_b64, max_tokens=120, expects_json=True)
+            try:
+                return _parse_signature_date_parts_reply(raw)
+            except NvidiaResponseError as exc:
+                last_error = exc
+        raise NvidiaResponseError("簽署日期分組格式錯誤") from last_error
     image_b64 = crop_jobsheet_field_card(
         pdf_doc, page_idx, (field,), zoom=zoom, strong=zoom >= 6.0
     )
@@ -1410,6 +1440,39 @@ def ocr_jobsheet_signature_date(
         except (json.JSONDecodeError, NvidiaResponseError) as exc:
             last_error = exc
     raise NvidiaResponseError("簽署日期格式錯誤") from last_error
+
+
+def _parse_signature_date_parts_reply(raw: str) -> Optional[str]:
+    """Literal digit groups only; never repair a year from Asana or today."""
+    if not isinstance(raw, str) or len(raw) > 2000:
+        raise NvidiaResponseError("簽署日期分組格式錯誤")
+    text = raw.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I)
+    if fence:
+        text = fence[1]
+    try:
+        pairs = json.loads(text, object_pairs_hook=lambda items: items)
+        if (not isinstance(pairs, list) or len(pairs) != 3 or
+                any(not isinstance(item, tuple) or len(item) != 2 for item in pairs)):
+            raise ValueError("Not a three-key object")
+        data = dict(pairs)
+        if set(data) != {"day", "month", "year"}:
+            raise ValueError("Unexpected or duplicate keys")
+        for key, maximum in (("day", 2), ("month", 2), ("year", 4)):
+            value = data[key]
+            if value is not None and (not isinstance(value, str) or
+                    not re.fullmatch(r"[0-9]{1," + str(maximum) + "}", value)):
+                raise ValueError("Not literal digit groups")
+        if any(value is None for value in data.values()):
+            return None
+        if len(data['year']) not in {2, 4}:
+            raise ValueError("Partial year")
+        parsed = _parse_action_date('/'.join(data[key] for key in ('day', 'month', 'year')))
+        if parsed is None:
+            raise ValueError("Invalid calendar date")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise NvidiaResponseError("簽署日期分組不是唯一合法讀數") from exc
+    return parsed.isoformat()
 
 
 def ocr_jobsheet_customer_date_parts(
