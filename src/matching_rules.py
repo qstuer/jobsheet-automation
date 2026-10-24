@@ -15,7 +15,7 @@ from datetime import date, timedelta
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference, pm_field_cards, serial_shape_reference
+from . import asana_client as ac, asana_index, checklist_date_focus, config, date_corroboration, device_table_search, nvidia_client as vision, ocr_reference, pm_field_cards, serial_shape_reference
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
@@ -27,7 +27,8 @@ VISIT_WINDOW_DAYS = 14
 SEARCH_HARD_STOPS = {"device_candidate_limit", "task_candidate_limit", "live_devices_tied",
                     "live_visits_tied", "compact_serial_not_unique", "crosspage_identity_conflict",
                     "repeated_order_conflict", "live_order_conflict", "repeated_dates_conflict",
-                    "ambiguous_order_numbers", "signature_date_conflict", "signature_date_protocol_rejected"}
+                    "ambiguous_order_numbers", "signature_date_conflict", "signature_date_protocol_rejected",
+                    "checklist_date_conflict", "checklist_date_protocol_rejected"}
 CHECKLIST_HEADER = (0.05, 0.125, 0.95, 0.225)
 CHECKLIST_PROMPT = (
     "This is the top of Philips Ultrasound System PM Checklist page 1 of 3, "
@@ -405,7 +406,8 @@ def assess_task(task, ev, job_type):
             "compact_ambiguity": compact_ambiguity, "format_corroborated": format_corroborated}
 
 
-def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, date_support=()):
+def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, date_support=(),
+                checklist_date_support=()):
     """Confirm device first, then a unique dated visit. No best-of-run selection."""
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
     if not candidates:
@@ -450,6 +452,15 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, 
     if len(stable_dates) > 1:
         return None, "repeated_dates_conflict"
     action_day = date.fromisoformat(next(iter(stable_dates))) if stable_dates else None
+    checklist_proof = checklist_date_focus.summarize(checklist_date_support)
+    if checklist_proof['status'] == 'invalid' or (checklist_date_support and job_type != 'PM'):
+        return None, 'checklist_date_protocol_rejected'
+    if checklist_proof['status'] == 'conflict' or (action_day and checklist_proof['status'] == 'confirmed'
+                                                  and action_day != checklist_proof['date']):
+        return None, 'checklist_date_conflict'
+    checklist_used = not action_day and checklist_proof['status'] == 'confirmed'
+    if checklist_used:
+        action_day = checklist_proof['date']
     proof = date_corroboration.summarize(date_support)
     if (proof["status"] == "invalid" or (job_type != "PM" and
             any(r.get("page") == 3 for r in date_support if isinstance(r, dict)))):
@@ -475,7 +486,8 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True, 
             return None, "live_visits_tied"
         if ac.resolve_order_number(best['task'])['status'] == 'ambiguous':
             return None, 'ambiguous_order_numbers'
-        return best["task"], ("signature_date_live_visit_confirmed" if supplemented
+        return best["task"], ("checklist_date_live_visit_confirmed" if checklist_used else
+                             "signature_date_live_visit_confirmed" if supplemented
                               else "action_date_live_visit_confirmed")
     if any(row.get("requires_reliable_date") for row in visits):
         return None, ("compact_serial_needs_action_date" if any(row.get("compact_ambiguity") for row in visits)
@@ -554,6 +566,8 @@ def public_diagnostic(audit):
         "ambiguous_order_numbers",
         "signature_dates_read", "signature_read_unavailable", "signature_date_conflict",
         "signature_date_protocol_rejected", "signature_date_live_visit_confirmed",
+        "checklist_date_focus_read", "checklist_date_focus_unavailable", "checklist_date_conflict",
+        "checklist_date_protocol_rejected", "checklist_date_live_visit_confirmed",
         "table_context_retrieval", "table_fragment_retrieval",
         "device_search_proposal", "device_search_uncertain", "device_search_protocol_rejected",
         "device_search_disagrees",
@@ -580,6 +594,11 @@ def public_diagnostic(audit):
         result["date_support"] = {key: count(support.get(key), ceiling) for key, ceiling in
             (("read_count", 8), ("stable_panel_count", 4), ("page_count", 2))}
         result["date_support"]["confirmed"] = support.get("status") == "confirmed"
+    checklist = audit.get('checklist_date_focus')
+    if isinstance(checklist, dict):
+        result['checklist_date_focus'] = {'read_count': count(checklist.get('read_count'), 2),
+            'page_count': count(checklist.get('page_count'), 1),
+            'confirmed': checklist.get('status') == 'confirmed'}
     diagnostic = audit.get("last_live_diagnostic")
     if not isinstance(diagnostic, dict):
         return result
@@ -659,6 +678,9 @@ def read_and_match(doc, job_type, reference_day=None):
     signature_dates_enabled = os.environ.get(date_corroboration.ENABLED_ENV) == "1"
     if signature_dates_enabled:
         date_corroboration.require_read_only()
+    checklist_focus_enabled = os.environ.get(checklist_date_focus.ENABLED_ENV) == '1'
+    if checklist_focus_enabled:
+        checklist_date_focus.require_read_only()
     if len(doc) != (4 if job_type == "PM" else 1):
         raise ValueError("Incomplete jobsheet cannot enter matching")
     vision.reset_ocr_metrics()
@@ -668,6 +690,7 @@ def read_and_match(doc, job_type, reference_day=None):
     last_rows = []
     equipment_audit = {}
     date_support = []  # Separate physical sources, never merged into OCR vote counts.
+    checklist_date_support = []  # Separate checklist provenance, never cover ACTION DATE.
     service_incomplete = False
     def read(call, source, field=None):
         nonlocal service_incomplete
@@ -709,7 +732,8 @@ def read_and_match(doc, job_type, reference_day=None):
         trace.append(reason)
         last_diagnostic = diagnostic_pool(pool, ev, job_type)
         task, reason = select_task(pool, ev, job_type, reference_day,
-                                  allow_upload_prior=allow_upload_prior, date_support=date_support)
+                                  allow_upload_prior=allow_upload_prior, date_support=date_support,
+                                  checklist_date_support=checklist_date_support)
         trace.append(reason)
         return task
     task = attempt()
@@ -745,7 +769,24 @@ def read_and_match(doc, job_type, reference_day=None):
                 trace.append("checklist_read_unavailable")
         trace.append("pm_crosspage_read")
         task = attempt()
+    if (task is None and job_type == 'PM' and checklist_focus_enabled
+            and not SEARCH_HARD_STOPS.intersection(trace)
+            and not _stable(evidence(readings), 'service_date_raw')
+            and any(row.get('passes_identity') for row in last_diagnostic.get('nearest_live_facts', []))):
+        for zoom in checklist_date_focus.ZOOMS:
+            try:
+                value = vision.ocr_pm_checklist_focused_date(doc, page_idx=1, zoom=zoom)
+            except vision.NvidiaResponseError as exc:
+                service_incomplete |= isinstance(exc, vision.NvidiaServiceUnavailable)
+                value = None
+                trace.append('checklist_date_focus_unavailable')
+            checklist_date_support.append({'page': checklist_date_focus.PAGE,
+                'field': checklist_date_focus.FIELD, 'source': checklist_date_focus.SOURCE,
+                'zoom': zoom, 'date': value})
+        trace.append('checklist_date_focus_read')
+        task = attempt()
     if (task is None and signature_dates_enabled and not SEARCH_HARD_STOPS.intersection(trace)
+            and checklist_date_focus.summarize(checklist_date_support)['status'] not in {'confirmed', 'conflict', 'invalid'}
             and not _stable(evidence(readings), "service_date_raw")
             and any(row.get("passes_identity") for row in last_diagnostic.get("nearest_live_facts", []))):
         for page, fields, source in ((0, date_corroboration.COVER_FIELDS, "cover_signature"),
@@ -809,7 +850,10 @@ def read_and_match(doc, job_type, reference_day=None):
         "equipment_search": {key: equipment_audit.get(key) for key in
             ("candidate_count", "legacy_reference_count", "model_invoked")},
         "date_support": {key: value for key, value in date_corroboration.summarize(date_support).items()
-                         if key != "date"}}
+                         if key != "date"},
+        'checklist_date_focus': {key: value for key, value in checklist_date_focus.summarize(checklist_date_support).items()
+                                 if key != 'date'}}
     ocr["_device_table_audit"] = equipment_audit  # Private, never an OCR reading.
     ocr["_signature_date_audit"] = date_support
+    ocr['_checklist_date_audit'] = checklist_date_support
     return task, 2 if task else 0, ocr

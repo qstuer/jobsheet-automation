@@ -1332,7 +1332,7 @@ _SIGNED_DATE_LITERAL = (
 )
 
 
-def _parse_signature_date_reply(raw: str) -> Optional[str]:
+def _parse_signature_date_reply(raw: str, *, value_key="signed_date") -> Optional[str]:
     """One date from one labelled panel, not free-form date extraction.
 
     Some configured backends ignore JSON mode. A full-match date literal or
@@ -1346,7 +1346,7 @@ def _parse_signature_date_reply(raw: str) -> Optional[str]:
     if text == "null":
         return None
     try:
-        data = _parse_json_object(text, required_keys={"signed_date"})
+        data = _parse_json_object(text, required_keys={value_key})
     except NvidiaResponseError:
         literal = re.fullmatch(
             rf'(?:The handwritten date beside the signature in the (?:one labelled panel|panel) is )?'
@@ -1364,9 +1364,9 @@ def _parse_signature_date_reply(raw: str) -> Optional[str]:
                 continue
             if isinstance(candidate, dict):
                 objects.append(candidate)
-        if len(objects) != 1 or set(data) != {"signed_date"}:
+        if len(objects) != 1 or set(data) != {value_key}:
             raise NvidiaResponseError("簽署日期含多個或額外答案")
-        value = data['signed_date']
+        value = data[value_key]
         if value is None:
             return None
     if not isinstance(value, str) or not re.fullmatch(_SIGNED_DATE_LITERAL, value):
@@ -1512,6 +1512,35 @@ def ocr_jobsheet_customer_date_parts(
         return None
     parsed = _parse_action_date(f"{day}/{month}/{year}")
     return parsed.isoformat() if parsed else None
+
+
+def ocr_pm_checklist_focused_date(
+        pdf_doc: fitz.Document, page_idx: int = 1, zoom: float = 5.0
+) -> Optional[str]:
+    """Read one existing checklist Date box; no cover date or task hints."""
+    from . import checklist_date_focus
+    checklist_date_focus.require_read_only()
+    image_b64 = checklist_date_focus.render(pdf_doc, page_idx, zoom)
+    prompt = _TRANSCRIPTION_RULES + (
+        "This image contains only the handwritten Date value from the first "
+        "Philips Ultrasound System PM Checklist, PDF page 2. Read the complete "
+        "date from left to right, distinguishing slanted separators from digit "
+        "strokes. Preserve the written day, month and year; do not repair a year "
+        "or choose a likely month. Ignore the printed underline and label. "
+        "No service-task dates or other page readings are supplied. "
+        'Return one JSON object only: {"checklist_date":null} if any digit is '
+        'uncertain, otherwise {"checklist_date":"DD/MM/YYYY"} with visible digits.'
+    )
+    last_error = None
+    for attempt in range(2):
+        retry = (' The prior reply format was invalid. Read the same image and '
+                 'return only checklist_date, with one literal date or null.') if attempt else ''
+        raw = _call_vision(prompt + retry, image_b64, max_tokens=120, expects_json=True)
+        try:
+            return _parse_signature_date_reply(raw, value_key='checklist_date')
+        except NvidiaResponseError as exc:
+            last_error = exc
+    raise NvidiaResponseError('Checklist date reply invalid') from last_error
 
 
 def ocr_pm_checklist_date(
