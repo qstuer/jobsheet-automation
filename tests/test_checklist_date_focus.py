@@ -1,7 +1,7 @@
 """Synthetic PM date focus, provenance and unchanged live-acceptance gates."""
 import base64
 from contextlib import ExitStack
-from datetime import date
+from datetime import date, timedelta
 import io
 import os
 import unittest
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import fitz
 from PIL import Image
 
-from src import asana_client as ac, asana_index, checklist_date_focus as focus
+from src import asana_client as ac, asana_index, checklist_date_focus as focus, config
 from src import date_corroboration, matching_rules as rules, nvidia_client as vision, rclone_helper
 from tests.test_matching_rules import reading, task
 from tests.test_ocr_resilience import vocabulary_index
@@ -150,6 +150,30 @@ class ChecklistDateReaderTests(unittest.TestCase):
                 vision.ocr_pm_checklist_focused_date(None)
         crop.assert_not_called()
         call.assert_not_called()
+
+    def test_out_of_window_year_is_rejected_without_repair_or_another_format_attempt(self):
+        raw = '{"checklist_date":"28/9/2016"}'
+        with patch.object(vision, '_today', return_value=date(2026, 9, 30)), \
+             patch.object(focus, 'render', return_value='only-date'), \
+             patch.object(vision, '_call_vision', return_value=raw) as call, \
+             self.assertLogs(vision.log, level='INFO') as logs:
+            self.assertIsNone(vision.ocr_pm_checklist_focused_date(None))
+        self.assertEqual(1, call.call_count)
+        self.assertIn('date_outside_window', str(logs.output))
+        self.assertNotIn('2016', str(logs.output))
+
+    def test_existing_header_age_and_future_boundaries_are_unchanged(self):
+        today = date(2026, 9, 30)
+        for age, accepted in ((config.OCR_SERVICE_DATE_MAX_AGE_DAYS, True),
+                              (config.OCR_SERVICE_DATE_MAX_AGE_DAYS+1, False),
+                              (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS, True),
+                              (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS-1, False)):
+            day = today-timedelta(days=age)
+            raw = '{"checklist_date":"'+day.strftime('%d/%m/%Y')+'"}'
+            with self.subTest(age=age), patch.object(vision, '_today', return_value=today), \
+                 patch.object(focus, 'render', return_value='only-date'), \
+                 patch.object(vision, '_call_vision', return_value=raw):
+                self.assertEqual(day.isoformat() if accepted else None, vision.ocr_pm_checklist_focused_date(None))
 
 
 class ChecklistDatePipelineTests(unittest.TestCase):

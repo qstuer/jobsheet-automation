@@ -1537,7 +1537,18 @@ def ocr_pm_checklist_focused_date(
                  'return only checklist_date, with one literal date or null.') if attempt else ''
         raw = _call_vision(prompt + retry, image_b64, max_tokens=120, expects_json=True)
         try:
-            return _parse_signature_date_reply(raw, value_key='checklist_date')
+            value = _parse_signature_date_reply(raw, value_key='checklist_date')
+            if value is None:
+                return None
+            # Match the existing multi-field PM header normalization. A
+            # repeated but out-of-window year is retained in the private raw
+            # trace, not certified as reliable or repaired from Asana/today.
+            age = (_today() - date.fromisoformat(value)).days
+            if not (-config.OCR_SERVICE_DATE_FUTURE_TOLERANCE_DAYS <= age
+                    <= config.OCR_SERVICE_DATE_MAX_AGE_DAYS):
+                log.info('Checklist date focus: date_outside_window')
+                return None
+            return value
         except NvidiaResponseError as exc:
             last_error = exc
     raise NvidiaResponseError('Checklist date reply invalid') from last_error
