@@ -223,7 +223,11 @@ def _name_parts_with_review(name: str) -> tuple:
     # broad ``extract_serial`` regex.  The index applies the same business
     # gate as OCR: 2–3 leading letters, 8–12 total characters, and digits.
     for index, part in enumerate(parts):
+        if index > 0 and asana_client.exact_ocr_product(part):
+            continue
         for candidate in re.findall(r"\b[A-Z]{2,3}[A-Z0-9]{5,9}\b", part.upper()):
+            if asana_client.exact_ocr_product(candidate) or asana_client._WORK_ORDER_PATTERN.fullmatch(candidate):
+                continue
             if 8 <= len(candidate) <= 12 and sum(ch.isdigit() for ch in candidate) >= 4:
                 serial, serial_part_index = candidate, index
                 break

@@ -125,6 +125,19 @@ class AsanaIndexTests(unittest.TestCase):
         self.assertEqual(rows["devices"][0]["serial"], "")
         self.assertTrue(rows["devices"][0]["department_rooms"])
 
+    def test_reviewed_product_codes_do_not_become_serials(self):
+        for label in ("TRx4851A", "PIIC iX 866389", "M3002A"):
+            with self.subTest(label=label):
+                record = asana_index.task_to_record(task(
+                    "1", f"Test Hospital / {label} / US123F4567 / WO123456"
+                ))
+                self.assertEqual(record["serial"], "US123F4567")
+                self.assertEqual(record["product_variants"], [label])
+                self.assertEqual(record["task_refs"][0]["product_parse_status"], "confirmed")
+        record = asana_index.task_to_record(task("2", "Test Hospital / TRx4851A / WO123456"))
+        self.assertTrue(record["weak_identity"])
+        self.assertEqual(record["serial"], "")
+
     def test_write_and_manifest_round_trip(self):
         index = asana_index.build_index([
             task("1", "QMH / CX50 / US123F4567")

@@ -14,7 +14,7 @@ from datetime import date, timedelta
 import fitz
 from PIL import Image, ImageOps
 
-from . import asana_client as ac, asana_index, config, nvidia_client as vision
+from . import asana_client as ac, asana_index, config, nvidia_client as vision, product_catalog, product_models
 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
@@ -42,7 +42,16 @@ def _key(field, value):
     if field == "hospital_raw":
         return ac._norm(ac.hospital_core(value))
     if field == "product_raw":
-        return ac._norm(ac.product_group(ac.normalize_product(value)))
+        product = ac.normalize_product(value)
+        if product in product_models.EXACT_MATCH_MODELS:
+            return ac.product_key(product)
+        return ac._norm(ac.product_group(product))
+    if field == "product_model":
+        info = product_catalog.inspect_product(value)
+        return info["canonical"] if info["status"] == "confirmed" else ""
+    if field == "work_order_candidates":
+        match = ac._WORK_ORDER_PATTERN.fullmatch(value)
+        return match[1].upper() + match[2] if match else ""
     if field == "service_date_raw":
         parsed = vision._parse_action_date(value)
         return parsed.isoformat() if parsed else ""
@@ -59,12 +68,13 @@ def evidence(readings):
     physical fields. Page provenance is retained for contradiction checks.
     """
     fields = ("serial_candidates", "serial_visual_candidates", "hospital_raw",
-              "product_raw", "phone_candidates", "asset_candidates",
-              "contact_person_raw", "service_date_raw", "order_no")
+              "product_raw", "product_model", "phone_candidates", "asset_candidates",
+              "contact_person_raw", "service_date_raw", "order_no", "work_order_candidates")
     result = {field: {} for field in fields}
     for reading in readings:
         for field in fields:
-            for key in {_key(field, v) for v in _values(reading, field)} - {""}:
+            source_field = "product_raw" if field == "product_model" else field
+            for key in {_key(field, v) for v in _values(reading, source_field)} - {""}:
                 item = result[field].setdefault(key, {"votes": 0, "pages": Counter()})
                 item["votes"] += 1
                 item["pages"][reading.get("_page", 0)] += 1
@@ -95,11 +105,11 @@ def retrieve_rows(index, ev):
         serial = ac._norm(row.get("serial"))
         if not serial or row.get("weak_identity"):
             continue
-        families = {ac._norm(ac.product_group(v)) for v in (
+        products = {_key("product_raw", v) for v in (
             *(row.get("product_variants") or []), *(row.get("product_families") or []))} - {""}
         hospitals = {ac._norm(ac.hospital_core(v)) for v in (
             *(row.get("hospitals") or []), *(row.get("hospital_aliases") or []))} - {""}
-        product = bool(families & set(ev["product_raw"]))
+        product = bool(products & set(ev["product_raw"]))
         hospital = bool(hospitals & set(ev["hospital_raw"]))
         phone = bool({ac._norm(v) for v in row.get("phones") or []} & set(ev["phone_candidates"]))
         if serials:
@@ -131,25 +141,39 @@ def retrieve_rows(index, ev):
     return close, "serial_first_retrieval"
 
 
-def live_pool(rows, ev, reference_day):
-    refs = {str(ref["gid"]): ref for row in rows for ref in row.get("task_refs") or []
+def live_pool(rows, ev, reference_day, *, job_type=None):
+    gids = {str(ref["gid"]) for row in rows for ref in row.get("task_refs") or []
             if ref.get("gid")}
-    if len(refs) > MAX_LIVE_TASKS:
-        return [], "task_candidate_limit"
-    # NO indexed type/date filtering: both may have changed since the snapshot.
-    tasks = [ac._fetch_task(gid) for gid in refs]
-    if not rows:
+    work_orders = _stable(ev, "work_order_candidates") if job_type == "CM" else set()
+    if len(work_orders) > 1:
+        return [], "repeated_work_orders_conflict"
+    if work_orders:
+        # Even an exact indexed device can predate this work order. Search
+        # live by the confirmed reference and, when known, the exact serial.
+        # The serial also finds titles that write the reference with spaces.
+        terms = list(work_orders)
+        serials = _stable(ev, "serial_candidates")
+        if len(serials) == 1 and vision._valid_serial_token(next(iter(serials))):
+            terms.extend(serials)
+        for term in terms:
+            matches = ac._typeahead(term)
+            if len(matches) >= ac.TYPEAHEAD_DEFAULT_COUNT:
+                return [], "task_candidate_limit"
+            gids.update(str(t["gid"]) for t in matches
+                        if t.get("gid") and work_orders.intersection(
+                            ac._task_work_orders(t, with_prefix=True)))
+    elif not rows:
         # New equipment may not be indexed. Only transcribed serials are used;
         # unbounded phone/asset workspace searches are deliberately avoided.
-        gids = set()
         for serial in _serials(ev)[:3]:
             if not vision._valid_serial_token(serial):
                 continue
             gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
-        if len(gids) > MAX_LIVE_TASKS:
-            return [], "task_candidate_limit"
-        tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
-    return tasks, "live_tasks_read"
+    if len(gids) > MAX_LIVE_TASKS:
+        return [], "task_candidate_limit"
+    # NO indexed type/date filtering: both may have changed since the snapshot.
+    tasks = [ac._fetch_task(gid) for gid in sorted(gids)]
+    return tasks, "live_work_order_tasks_read" if work_orders else "live_tasks_read"
 
 
 def _live_facts(task):
@@ -159,7 +183,8 @@ def _live_facts(task):
     ref = record["task_refs"][0]
     return {
         "serial": ac._norm(record.get("serial")),
-        "product": {ac._norm(record.get("product"))} - {""},
+        "product": {_key("product_raw", ref.get("product_variant") or record.get("product"))} - {""},
+        "product_model": _key("product_model", ref.get("product_variant")),
         "hospital": {ac._norm(ac.hospital_core(v)) for v in record.get("hospital_aliases") or []} - {""},
         "phones": set(record.get("phones") or []),
         "assets": set(record.get("assets") or []),
@@ -201,6 +226,21 @@ def assess_task(task, ev, job_type):
             safe = (serial_repeated and {"hospital", "product"} <= support) or (
                 "product" in support and "phone" in support
                 and (serial_repeated or "hospital" in support))
+            if not safe and job_type == "CM" and not _stable(ev, "hospital_raw"):
+                # An unconfirmed site code cannot vote. A CM visit can
+                # instead corroborate the exact serial and model with both
+                # the printed work reference and the exact service date.
+                work_orders = _stable(ev, "work_order_candidates")
+                dates = _stable(ev, "service_date_raw")
+                safe = (
+                    _stable(ev, "serial_candidates") == {facts["serial"]}
+                    and bool(facts["product_model"])
+                    and _stable(ev, "product_model") == {facts["product_model"]}
+                    and len(work_orders) == 1
+                    and work_orders.issubset(ac._task_work_orders(task, with_prefix=True))
+                    and len(dates) == 1
+                    and dates.issubset(day.isoformat() for day in facts["formal_dates"])
+                )
         elif distance == 1:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
             # Complete the already agreed missing-hospital fallback. A
@@ -231,6 +271,17 @@ def assess_task(task, ev, job_type):
 
 def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     """Confirm device first, then a unique dated visit. No best-of-run selection."""
+    models = _stable(ev, "product_model")
+    if len(models) > 1 and models.intersection(product_models.EXACT_MATCH_MODELS):
+        return None, "repeated_product_models_conflict"
+    work_orders = _stable(ev, "work_order_candidates") if job_type == "CM" else set()
+    if len(work_orders) > 1:
+        return None, "repeated_work_orders_conflict"
+    if work_orders:
+        tasks = [t for t in tasks
+                 if work_orders.issubset(ac._task_work_orders(t, with_prefix=True))]
+        if not tasks:
+            return None, "live_work_order_conflict"
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
     if not candidates:
         return None, "live_identity_not_confirmed"
@@ -377,7 +428,7 @@ def read_and_match(doc, job_type, reference_day=None):
         trace.append(reason)
         if reason in {"device_candidate_limit", "missing_serial_not_unique"}:
             return None
-        pool, reason = live_pool(rows, ev, reference_day)
+        pool, reason = live_pool(rows, ev, reference_day, job_type=job_type)
         trace.append(reason)
         last_diagnostic = diagnostic_pool(pool, ev, job_type)
         task, reason = select_task(pool, ev, job_type, reference_day,

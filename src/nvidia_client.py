@@ -835,7 +835,8 @@ def ocr_jobsheet_fields(
     prompt = _TRANSCRIPTION_RULES + (
         "CUSTOMER NAME / HOSPITAL is the hospital field; DEPT./ROOM is not a hospital. "
         "Only report asset numbers visibly preceded by the printed or handwritten word Asset. "
-        "Only report HAWO/WO references visibly marked as such in the two reference panels. "
+        "Only report references visibly marked HAWO or WO in the two reference panels. "
+        "Keep the visible HAWO or WO prefix with its digits. "
         "The date must come only from ACTION DATE. At most three character readings may be "
         "returned for a genuinely ambiguous number. Required shape:\n"
         '{"order_no":null,"serial_candidates":[],"product_raw":null,'
@@ -936,7 +937,8 @@ def ocr_jobsheet_support_fields(
         "A contact name is a literal transcription and must never be inferred from a phone number. "
         "An Asset value is valid only "
         "when the word Asset is visibly attached to it. A work-order value is valid only when "
-        "HAWO or WO is visibly attached to it. Read the date only from ACTION DATE. Required shape:\n"
+        "HAWO or WO is visibly attached to it. Keep the visible prefix with its digits. "
+        "Read the date only from ACTION DATE. Required shape:\n"
         '{"contact_person_raw":null,"department_room_raw":null,"phone_candidates":[],"asset_candidates":[],'
         '"work_order_candidates":[],"service_date_raw":null,'
         '"date_source":"ACTION_DATE","unreadable_fields":[]}'

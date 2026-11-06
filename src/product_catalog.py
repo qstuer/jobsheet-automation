@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import asana_client
 
-PARSER_VERSION = 1
+PARSER_VERSION = 3
 _REFERENCE = re.compile(r"\b(?:HAWO|WO|SR|ORDER|ASSET|PHONE|TEL|CONTACT)\b", re.I)
 _JOB_TYPE = re.compile(r"^(?:CM|PM|FCO|INS|REPAIR|MAINTENANCE)$", re.I)
 _SERIAL = re.compile(r"\b[A-Z]{2,3}[A-Z0-9]{5,9}\b", re.I)
@@ -34,20 +34,16 @@ def inspect_product(value: str | None) -> dict:
         return result("rejected", "job_type_not_product")
     if _REFERENCE.search(text):
         return result("rejected", "reference_not_product")
+    # Reviewed equipment codes can contain four digits or resemble serials.
+    # Unknown text still has to pass the identifier and product-slot checks.
+    canonical = asana_client.exact_ocr_product(text)
+    if canonical:
+        return result("group_only" if canonical in asana_client.PRODUCT_GROUP_NAMES else "confirmed",
+                      "confirmed_spelling", canonical)
     if any(sum(c.isdigit() for c in token) >= 4 for token in _SERIAL.findall(text)):
         return result("rejected", "serial_not_product")
     if re.search(r"\d{4,}", text):
         return result("rejected", "identifier_not_product")
-    # Exact confirmed spellings only; fuzzy correction must not certify a new
-    # entry in the knowledge table (or turn a common Asana typo into truth).
-    key = re.sub(r"[^A-Z0-9+]", "", text.upper())
-    canonical = next((p for p in asana_client.OCR_PRODUCT_NAMES
-                      if re.sub(r"[^A-Z0-9+]", "", p.upper()) == key), None)
-    if key == "EPIQ7PLUS":
-        canonical = "EPIQ 7+"
-    if canonical and re.fullmatch(r"[A-Za-z0-9+ .-]+", text):
-        return result("group_only" if canonical in asana_client.PRODUCT_GROUP_NAMES else "confirmed",
-                      "confirmed_spelling", canonical)
     # Model-like unknowns may still be indexed positionally, but are NEVER
     # promoted into vision knowledge. CM10/CM12 must not be stripped as 'CM'.
     if (not re.fullmatch(r"[A-Za-z0-9+ .-]{2,50}", text)

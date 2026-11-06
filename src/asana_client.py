@@ -19,7 +19,7 @@ from typing import Optional, List, Tuple
 
 import requests
 
-from . import config
+from . import config, product_models
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +33,32 @@ KNOWN_PRODUCTS = [
 MAX_PRODUCT_DIST = 2  # 型號校正容許的最大編輯距離
 MAX_HOSPITAL_NAME_DIST = 2  # 完整醫院名只容許很小的手寫/OCR 誤差
 PRODUCT_GROUP_NAMES = {"EPIQ", "Affiniti", "CX"}
-# Confirmed spelling variant, not permission to invent a missing suffix.
-OCR_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G", *sorted(PRODUCT_GROUP_NAMES)]
+# Confirmed spelling variants, not permission to invent a missing suffix.
+_OCR_FUZZY_PRODUCT_NAMES = [*KNOWN_PRODUCTS, "Affiniti 70G", *sorted(PRODUCT_GROUP_NAMES)]
+OCR_PRODUCT_NAMES = [
+    *_OCR_FUZZY_PRODUCT_NAMES,
+    *(model for group in product_models.MODEL_GROUPS.values() for model in group),
+]
+
+
+def product_key(value: str) -> str:
+    """Ignore model typography but retain a meaningful plus sign."""
+    return re.sub(r"[^A-Z0-9+]", "", (value or "").upper())
+
+
+_EXACT_PRODUCTS = {product_key(model): model for model in OCR_PRODUCT_NAMES}
+_EXACT_PRODUCTS.update({
+    product_key(alias): model for alias, model in product_models.MODEL_ALIASES.items()
+})
+_EXACT_PRODUCTS["EPIQ7PLUS"] = "EPIQ 7+"
+_PRODUCT_LABEL = re.compile(r"[A-Za-z0-9+ .-]+")
+
+
+def exact_ocr_product(value: Optional[str]) -> Optional[str]:
+    label = re.sub(r"^PHILIPS\s+", "", (value or "").strip(), flags=re.I)
+    if not _PRODUCT_LABEL.fullmatch(label):
+        return None
+    return _EXACT_PRODUCTS.get(product_key(label))
 
 _typeahead_cache: dict = {}
 _task_cache: dict = {}
@@ -123,23 +147,22 @@ def normalize_product(ocr_product: Optional[str]) -> Optional[str]:
     """Only normalize unambiguous spellings; never invent model digits/suffixes."""
     if not ocr_product:
         return None
-    # Keep '+' meaningful (the general evidence normalizer drops punctuation).
-    def key(value):
-        return re.sub(r"[^A-Z0-9+]", "", value.upper())
-    target = key(ocr_product)
-    if target == "EPIQ7PLUS":
-        return "EPIQ 7+"
-    exact = [p for p in OCR_PRODUCT_NAMES if key(p) == target]
+    exact = exact_ocr_product(ocr_product)
     if exact:
-        return exact[0]
+        return exact
+    if not _PRODUCT_LABEL.fullmatch(ocr_product.strip()):
+        return ocr_product
+    target = product_key(ocr_product)
     # A broad family is useful evidence in its own right, not a blank model.
     # Typo correction must preserve all observed model numbers and '+' signs.
-    candidates = [p for p in OCR_PRODUCT_NAMES
-                  if re.findall(r"\d+", key(p)) == re.findall(r"\d+", target)
-                  and ("+" in key(p)) == ("+" in target)
-                  and (not re.search(r"\d", target)
-                       or re.split(r"\d+", key(p))[-1] == re.split(r"\d+", target)[-1])]
-    distances = [(p, _lev(target, key(p))) for p in candidates]
+    candidates = [(name, product_key(name)) for name in _OCR_FUZZY_PRODUCT_NAMES]
+    distances = [(name, _lev(target, key)) for name, key in candidates
+                 # Do not turn an unknown MX/MP code into a CX ultrasound model.
+                 if (not key.startswith("CX") or target.startswith("CX"))
+                 and re.findall(r"\d+", key) == re.findall(r"\d+", target)
+                 and ("+" in key) == ("+" in target)
+                 and (not re.search(r"\d", target)
+                      or re.split(r"\d+", key)[-1] == re.split(r"\d+", target)[-1])]
     best_d = min((d for _, d in distances), default=99)
     best = [p for p, d in distances if d == best_d]
     # Very short tokens are too ambiguous to correct by edit distance.
@@ -389,7 +412,10 @@ def _name_has_product(name: str, product_norm: str) -> bool:
 
 # ── Asana typeahead（免費全域；只負責撈池，子字串比對）────────────
 
-def _typeahead(query: str, count: int = 60) -> List[dict]:
+TYPEAHEAD_DEFAULT_COUNT = 60
+
+
+def _typeahead(query: str, count: int = TYPEAHEAD_DEFAULT_COUNT) -> List[dict]:
     query = (query or "").strip()
     if not query:
         return []
@@ -1314,9 +1340,13 @@ def _task_assets(task: dict) -> List[str]:
     ))
 
 
-def _task_work_orders(task: dict) -> List[str]:
+_WORK_ORDER_PATTERN = re.compile(r"\b(HAWO|WO)\s*[#.:\-]?\s*(\d{6,})\b", re.I)
+
+
+def _task_work_orders(task: dict, *, with_prefix: bool = False) -> List[str]:
     text = f"{task.get('name') or ''}\n{task.get('notes') or ''}"
-    values = re.findall(r"(?i)\b(?:HAWO|WO)\s*[#.:\-]?\s*(\d{6,})\b", text)
+    values = (f"{prefix.upper()}{number}" if with_prefix else number
+              for prefix, number in _WORK_ORDER_PATTERN.findall(text))
     return list(dict.fromkeys(values))
 
 

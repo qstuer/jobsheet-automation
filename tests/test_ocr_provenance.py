@@ -23,7 +23,8 @@ class OCRProvenanceTests(unittest.TestCase):
             self.assertEqual(expected, consensus["product"])
 
     def test_product_number_and_suffix_are_never_invented(self):
-        for raw in ("EPIQ 7", "EPIQ 6G", "Affiniti 7", "CX5", "CX40", "EPIQ 7X"):
+        for raw in ("EPIQ 4", "EPIQ 6G", "Affiniti 7", "CX5", "CX40", "EPIQ 7X",
+                    "MX50", "MX45?", "TC99"):
             self.assertEqual(raw, asana_client.normalize_product(raw))
             result = self.normalize(product_raw=raw)
             self.assertIsNone(result["product"])
@@ -32,7 +33,11 @@ class OCRProvenanceTests(unittest.TestCase):
 
     def test_confirmed_spelling_variants_remain_supported(self):
         for raw, expected in (("EPLQ 5G", "EPIQ 5G"), ("EPIQ7Plus", "EPIQ 7+"),
-                              ("EPIQ 7+", "EPIQ 7+"), ("Affiniti70G", "Affiniti 70G")):
+                              ("EPIQ 7+", "EPIQ 7+"), ("Affiniti70G", "Affiniti 70G"),
+                              ("EPIQ 7", "EPIQ 7"), ("X3", "X3"), ("M3002A", "X2"),
+                              ("Philips PageWriter TC 35", "TC35"),
+                              ("HeartStart XL+", "HeartStart XL+"),
+                              ("TRx 4851A", "TRx4851A")):
             result = self.normalize(product_raw=raw)
             self.assertEqual(expected, result["product"])
             self.assertEqual(raw, result["product_raw"])
