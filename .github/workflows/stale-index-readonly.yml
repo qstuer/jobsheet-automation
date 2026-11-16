@@ -18,6 +18,8 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
+        sample: [B01, B02, B03, B04]
+        date_mode: [normal, missing]
         include:
           - sample: B01
             kind: PM
@@ -58,7 +60,7 @@ jobs:
         env:
           STALE_SAMPLE: ${{ matrix.sample }}
           STALE_JOB_TYPE: ${{ matrix.kind }}
-          JOBSHEET_ORIGINAL_UPLOAD_DATE: '2026-11-16'
+          DATE_MODE: ${{ matrix.date_mode }}
           JOBSHEET_MATCHING_RULES: evidence-live-v2
           JOBSHEET_DRY_RUN: 'true'
           OCR_PROVIDER: nvidia
