@@ -40,7 +40,8 @@ def main():
         assert len(doc) == (4 if kind == "PM" else 1)
         if date_mode == "missing":
             for name in ("ocr_jobsheet_fields", "ocr_jobsheet_identity_fields",
-                         "ocr_jobsheet_support_fields", "ocr_jobsheet_focused_field"):
+                         "ocr_jobsheet_support_fields", "ocr_jobsheet_focused_field",
+                         "ocr_jobsheet_context_field"):
                 readers.enter_context(patch.object(nvidia_client, name,
                     side_effect=without_date(getattr(nvidia_client, name))))
             readers.enter_context(patch.object(matching_rules, "_checklist_read",
