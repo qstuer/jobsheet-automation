@@ -128,6 +128,30 @@ class MatchingRulesTests(unittest.TestCase):
         result = self.choose([task()], [reading(day=None)]*2, allow_upload_prior=False)
         self.assertEqual(result[1], "need_crosspage_before_upload_prior")
 
+    def test_upload_date_does_not_choose_between_same_device_visits(self):
+        ev = rules.evidence([reading(day=None)] * 2)
+        for kind in ("PM", "CM"):
+            with self.subTest(kind=kind):
+                pool = [task("101", due="2026-09-21", kind=kind),
+                        task("102", due="2026-09-28", kind=kind)]
+                self.assertEqual(rules.select_task(pool, ev, kind, self.upload),
+                                 (None, "upload_prior_not_unique"))
+
+    def test_clear_action_date_selects_visit_after_upload_prior_is_rejected(self):
+        pool = [task("101", due="2026-09-21"), task("102", due="2026-09-28")]
+        for paper_date, expected in (("21/9/2026", "101"), ("28/9/2026", "102")):
+            with self.subTest(paper_date=paper_date):
+                selected, reason = self.choose(pool, [reading(day=paper_date)] * 2)
+                self.assertEqual(selected["gid"], expected)
+                self.assertEqual(reason, "action_date_live_visit_confirmed")
+
+    def test_single_visit_upload_prior_remains_available(self):
+        ev = rules.evidence([reading(day=None)] * 2)
+        pool = [task("101", due="2026-06-01"), task("102", due="2026-09-28")]
+        selected, reason = rules.select_task(pool, ev, "PM", self.upload)
+        self.assertEqual(selected["gid"], "102")
+        self.assertEqual(reason, "upload_prior_live_visit_confirmed")
+
     def test_different_repeated_dates_are_not_averaged(self):
         self.assertIsNone(self.choose([task()], [reading()]*2 + [reading(day="28/8/2026", page=1)]*2)[0])
 
