@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -15,6 +16,14 @@ def download(remote, destination):
         "--retries", "1", "--low-level-retries", "2", "--contimeout", "15s",
         "--timeout", "30s"], capture_output=True, timeout=60)
     if result.returncode:
+        error = result.stderr.decode("utf-8", errors="replace").lower()
+        print("CLOUD_DOWNLOAD_FAILURE " + json.dumps({
+            "local_label": destination.name, "remote_kind": remote.split(":", 1)[0],
+            "exit": result.returncode, "http_codes": sorted(set(re.findall(r"\b[45]\d\d\b", error))),
+            "categories": [tag for tag in ("quota", "rate limit", "directory not found",
+                "object not found", "invalid_grant", "expired", "access denied", "timeout",
+                "connection", "unauthorized", "file not found") if tag in error],
+        }), flush=True)
         raise RuntimeError("Read-only cloud download failed")
 
 
