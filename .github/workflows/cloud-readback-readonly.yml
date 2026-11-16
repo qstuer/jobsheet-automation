@@ -1,0 +1,43 @@
+name: Jobsheet - Current Batch Cloud Readback
+
+on:
+  push:
+    branches: [codex/verify-stale-index-20261116]
+    paths:
+      - .github/workflows/cloud-readback-readonly.yml
+      - scripts/check_current_batch_cloud_readback.py
+
+permissions:
+  contents: read
+
+env:
+  JOBSHEET_RCLONE_RELEASE: '1.75.0'
+
+jobs:
+  readback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Install rclone
+        run: |
+          curl --fail --location --output rclone.zip "https://downloads.rclone.org/v${JOBSHEET_RCLONE_RELEASE}/rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo mv "rclone-v${JOBSHEET_RCLONE_RELEASE}-linux-amd64/rclone" /usr/local/bin/rclone
+      - name: Restore credentials
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Download exact current-batch cloud files and compare private originals
+        run: python -m scripts.check_current_batch_cloud_readback
+      - name: Remove runner credentials
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true

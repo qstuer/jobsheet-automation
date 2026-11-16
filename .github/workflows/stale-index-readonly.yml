@@ -1,8 +1,7 @@
 name: Jobsheet - Stale Index Read-only Regression
 
 on:
-  push:
-    branches: [codex/verify-stale-index-20261116]
+  workflow_dispatch:
 
 permissions:
   contents: read
