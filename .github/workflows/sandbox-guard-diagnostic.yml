@@ -1,0 +1,24 @@
+name: Jobsheet - Sandbox Guard Diagnostic
+
+on:
+  push:
+    branches: [codex/simulate-unattended-20261116]
+    paths:
+      - .github/workflows/sandbox-guard-diagnostic.yml
+      - scripts/diagnose_sandbox_guard.py
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m scripts.diagnose_sandbox_guard
