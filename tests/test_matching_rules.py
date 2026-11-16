@@ -94,6 +94,17 @@ class MatchingRulesTests(unittest.TestCase):
                 reads = [good, {**good, "serial_candidates": [other] if other else []}]
                 self.assertIsNone(self.choose([task(asset="1234567")], reads)[0])
 
+    def test_strong_fuzzy_identity_retains_poorer_serial_readings(self):
+        good = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
+        poorer = {**good, "serial_candidates": [], "serial_visual_candidates": ["ABC12X3400"]}
+        selected, _ = self.choose([task(asset="1234567")], [good] * 2 + [poorer] * 2)
+        self.assertEqual(selected, task(asset="1234567"))
+
+    def test_strong_fuzzy_identity_does_not_arbitrate_two_repeated_near_serials(self):
+        good = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
+        other = {**good, "serial_candidates": ["ABC12X3451"]}
+        self.assertIsNone(self.choose([task(asset="1234567")], [good] * 2 + [other] * 2)[0])
+
     def test_unreadable_date_fuzzy_identity_requires_exact_model(self):
         reads = [reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)] * 2
         self.assertIsNone(self.choose([task(asset="1234567", product="Affiniti 50")], reads)[0])

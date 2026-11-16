@@ -261,15 +261,19 @@ def assess_task(task, ev, job_type):
                 and {"product", "phone"} <= support
             )
             repeated_assets = _stable(ev, "asset_candidates")
+            one_edit_serials = {s for s in repeated_serials
+                               if ac._lev(s, facts["serial"]) == 1}
             exact_device_support = (
-                len(repeated_serials) == 1
-                and ac._lev(next(iter(repeated_serials)), facts["serial"]) == 1
+                len(one_edit_serials) == 1
                 and bool(facts["product_model"])
                 and _stable(ev, "product_model") == {facts["product_model"]}
                 and bool(_stable(ev, "phone_candidates") & facts["phones"])
                 and len(repeated_assets) == 1
                 and repeated_assets.issubset(facts["assets"])
             )
+            # Keep poorer OCR alternatives in the candidate pool; they do
+            # not erase this corroborated reading. Competing live devices
+            # and visits still pass through the uniqueness gates below.
             missing_hospital_fuzzy_needs_date = missing_hospital_fuzzy and not exact_device_support
             safe = safe or missing_hospital_fuzzy
         else:
