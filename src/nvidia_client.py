@@ -11,7 +11,7 @@ import math
 import re
 import time
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import fitz
@@ -539,7 +539,7 @@ _OCR_LIST_FIELDS = {
 
 
 def _today() -> date:
-    return date.today()
+    return datetime.now(timezone(timedelta(hours=8))).date()
 
 
 def _valid_serial_token(value: str) -> bool:

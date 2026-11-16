@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from src import asana_client as ac, matching_rules as rules, nvidia_client as vision, processor
+from src import asana_client as ac, matching_rules as rules, nvidia_client as vision, processor, private_ocr_context
 
 
 def reading(serial="ABC12X3456", hospital="Test Hospital", product="Affiniti 70",
@@ -118,11 +118,45 @@ class MatchingRulesTests(unittest.TestCase):
         self.assertIsNotNone(self.choose([task(prefix="(CM)")])[0])
         self.assertIsNone(self.choose([task(kind="CM", prefix="(PM)")])[0])
 
-    def test_date_prior_uses_original_upload_not_run_date(self):
+    def test_month_fallback_requires_a_reference_day(self):
         readings = [reading(day=None)]*2
         self.assertIsNotNone(self.choose([task()], readings)[0])
         self.assertIsNone(self.choose([task()], readings, upload=False)[0])
         self.assertIsNone(self.choose([task(due="2026-06-01")], readings)[0])
+
+    def test_fallback_accepts_only_the_surrounding_calendar_months(self):
+        ev = rules.evidence([reading(day=None)] * 2)
+        for due, accepted in (("2026-10-15", False), ("2026-10-16", True),
+                              ("2026-11-11", True), ("2026-12-16", True),
+                              ("2026-12-17", False), ("2026-09-28", False)):
+            with self.subTest(due=due):
+                selected, _ = rules.select_task([task(due=due)], ev, "PM", date(2026, 11, 16))
+                self.assertEqual(selected is not None, accepted)
+
+    def test_calendar_month_window_handles_month_ends_and_new_year(self):
+        for day, first, last in (
+            (date(2026, 3, 31), date(2026, 2, 28), date(2026, 4, 30)),
+            (date(2024, 3, 31), date(2024, 2, 29), date(2024, 4, 30)),
+            (date(2026, 1, 31), date(2025, 12, 31), date(2026, 2, 28)),
+        ):
+            with self.subTest(day=day):
+                self.assertEqual(rules.month_window(day), (first, last))
+
+    def test_reader_uses_today_when_no_replay_day_is_supplied(self):
+        current = task(kind="CM", due="2026-11-11")
+        ac.set_device_index({"schema_version": 3, "location_directory": [],
+            "devices": [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]})
+        with patch.dict("os.environ", {processor.MATCHING_RULES_ENV: rules.RULESET_VERSION}), \
+                patch.object(private_ocr_context, "build_vocabulary", return_value={}), \
+                patch.object(vision, "_today", return_value=date(2026, 11, 16)), \
+                patch.object(vision, "ocr_jobsheet_fields", return_value=reading(day=None)), \
+                patch.object(vision, "ocr_jobsheet_identity_fields", return_value=reading(day=None)), \
+                patch.object(vision, "ocr_jobsheet_support_fields", return_value=reading(day=None)), \
+                patch.object(vision, "ocr_jobsheet_focused_field", return_value={}), \
+                patch.object(ac, "_typeahead", return_value=[current]), \
+                patch.object(ac, "_fetch_task", return_value=current):
+            selected, _, _ = processor._ocr_and_match([object()], "CM")
+        self.assertEqual(selected, current)
 
     def test_date_prior_not_before_checklist(self):
         result = self.choose([task()], [reading(day=None)]*2, allow_upload_prior=False)
