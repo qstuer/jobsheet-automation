@@ -37,6 +37,8 @@ jobs:
           printf '%s' "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
       - name: Download exact current-batch cloud files and compare private originals
+        env:
+          JOBSHEET_READBACK_SPEC: ${{ secrets.JOBSHEET_READBACK_20261116 }}
         run: python -m scripts.check_current_batch_cloud_readback
       - name: Remove runner credentials
         if: always()
