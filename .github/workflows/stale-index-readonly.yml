@@ -18,11 +18,17 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        sample: [B03]
-        date_mode: [normal]
+        sample: [B01, B02, B03, B04]
+        date_mode: [normal, missing]
         include:
+          - sample: B01
+            kind: PM
+          - sample: B02
+            kind: CM
           - sample: B03
             kind: PM
+          - sample: B04
+            kind: CM
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
