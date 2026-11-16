@@ -47,9 +47,6 @@ def main():
                 side_effect=without_date(matching_rules._checklist_read)))
         task, tier, ocr = processor._ocr_and_match(doc, kind, reference_day)
     trace = (ocr.get("rules_audit") or {}).get("trace") or []
-    if date_mode == "missing":
-        assert not ocr.get("service_date_raw")
-        assert trace[-1] == "upload_prior_live_visit_confirmed"
     metrics = ocr.get("ocr_metrics") or {}
     indexed_gids = {ref["gid"] for row in index["devices"] for ref in row["task_refs"]}
     receipt = None
@@ -64,8 +61,12 @@ def main():
               "index_generated_at": index["generated_at"],
               "calls": metrics.get("calls"), "seconds": metrics.get("seconds"),
               "tokens": metrics.get("total_tokens"), "cloud_writes": 0,
-              "trace": trace}
+              "trace": trace, "date_present": bool(ocr.get("service_date_raw")),
+              "diagnostic": (ocr.get("rules_audit") or {}).get("last_live_diagnostic")}
     print("STALE_INDEX_RESULT " + json.dumps(result), flush=True)
+    if date_mode == "missing":
+        assert not result["date_present"]
+        assert trace[-1] == "upload_prior_live_visit_confirmed"
     if not task or (kind == "CM" and result["selected_task_was_indexed"]):
         raise SystemExit(1)
 
