@@ -1,0 +1,41 @@
+name: Jobsheet - One Pass Isolated Simulation
+
+on:
+  push:
+    branches: [codex/simulate-unattended-20261116]
+    paths:
+      - .github/workflows/unattended-sandbox.yml
+      - scripts/unattended_sandbox.py
+      - scripts/prepare_unattended_inputs.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SANDBOX_PREP: ${{ runner.temp }}/unattended-inputs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Prepare read-only input exports
+        env:
+          JOBSHEET_SANDBOX_INPUTS: ${{ secrets.JOBSHEET_SANDBOX_INPUTS_20261116 }}
+        run: python -m scripts.prepare_unattended_inputs
+      - name: Run production Stage A and B once with confined virtual cloud folders
+        env:
+          OCR_PROVIDER: nvidia
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          JOBSHEET_MATCHING_RULES: evidence-live-v2
+          JOBSHEET_DRY_RUN: 'false'
+        run: python -m scripts.unattended_sandbox
