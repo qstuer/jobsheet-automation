@@ -224,8 +224,10 @@ def assess_task(task, ev, job_type):
         support.add("contact")
     serials = _serials(ev)
     distance = min((ac._lev(s, facts["serial"]) for s in serials), default=99)
-    serial_repeated = facts["serial"] in _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+    repeated_serials = _stable(ev, "serial_candidates") | _stable(ev, "serial_visual_candidates")
+    serial_repeated = facts["serial"] in repeated_serials
     missing_hospital_fuzzy = False
+    missing_hospital_fuzzy_needs_date = False
     if serials:
         if distance > 3:
             return None
@@ -250,15 +252,25 @@ def assess_task(task, ev, job_type):
                 )
         elif distance == 1:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
-            # Complete the already agreed missing-hospital fallback. A
-            # one-character serial transcription error is not a veto when
-            # product and full phone identify the equipment. This branch
-            # additionally requires a readable date and a unique live visit;
-            # it must never use the upload-date prior to fill that gap.
+            # Product and full phone can support a one-character serial
+            # error, but normally still need the paper date. Repeated exact
+            # model, full phone and full asset independently identify the
+            # equipment strongly enough to use the month-window fallback.
             missing_hospital_fuzzy = (
                 not _stable(ev, "hospital_raw")
                 and {"product", "phone"} <= support
             )
+            repeated_assets = _stable(ev, "asset_candidates")
+            exact_device_support = (
+                len(repeated_serials) == 1
+                and ac._lev(next(iter(repeated_serials)), facts["serial"]) == 1
+                and bool(facts["product_model"])
+                and _stable(ev, "product_model") == {facts["product_model"]}
+                and bool(_stable(ev, "phone_candidates") & facts["phones"])
+                and len(repeated_assets) == 1
+                and repeated_assets.issubset(facts["assets"])
+            )
+            missing_hospital_fuzzy_needs_date = missing_hospital_fuzzy and not exact_device_support
             safe = safe or missing_hospital_fuzzy
         else:
             safe = {"hospital", "product"} <= support and bool(support & {"phone", "asset_exact"})
@@ -273,7 +285,7 @@ def assess_task(task, ev, job_type):
              + (10 if asset == 2 else 5 if asset == 1 else 0))
     return {"task": task, "facts": facts, "score": score, "support": support,
             "serial_distance": distance,
-            "requires_reliable_date": missing_hospital_fuzzy}
+            "requires_reliable_date": missing_hospital_fuzzy_needs_date}
 
 
 def month_window(reference_day):
@@ -373,6 +385,7 @@ def diagnostic_pool(tasks, ev, job_type):
         if not facts:
             continue
         serials = _serials(ev)
+        assessed = assess_task(task, ev, job_type)
         rows.append({
             "serial_distance": min((ac._lev(v, facts["serial"]) for v in serials), default=99),
             "product_supported": bool(_stable(ev, "product_raw") & facts["product"]),
@@ -382,12 +395,15 @@ def diagnostic_pool(tasks, ev, job_type):
             "phone_exact": bool(set(ev["phone_candidates"]) & facts["phones"]),
             "asset_level": ac._asset_match_level(list(ev["asset_candidates"]), list(facts["assets"])),
             "type_matches": facts["type"] == job_type,
-            "passes_identity": assess_task(task, ev, job_type) is not None,
+            "passes_identity": assessed is not None,
+            "requires_reliable_date": assessed.get("requires_reliable_date") if assessed else None,
         })
     rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
     return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
             "repeated_product_count": len(_stable(ev, "product_raw")),
             "repeated_hospital_count": len(_stable(ev, "hospital_raw")),
+            "repeated_phone_count": len(_stable(ev, "phone_candidates")),
+            "repeated_asset_count": len(_stable(ev, "asset_candidates")),
             "repeated_date_count": len(_stable(ev, "service_date_raw"))}
 
 

@@ -72,6 +72,49 @@ class MatchingRulesTests(unittest.TestCase):
         self.assertIsNone(self.choose([task()],
             [reading(hospital=None, serial="ABC12X3450", day=None)]*2)[0])
 
+    def test_unreadable_date_with_fuzzy_serial_uses_repeated_exact_device_evidence(self):
+        reads = [reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)] * 2
+        selected, reason = self.choose([task(asset="1234567")], reads)
+        self.assertEqual(selected, task(asset="1234567"))
+        self.assertEqual(reason, "upload_prior_live_visit_confirmed")
+
+    def test_unreadable_date_fuzzy_identity_requires_repeated_full_asset_and_phone(self):
+        good = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
+        for field, weak in (("asset_candidates", []), ("phone_candidates", []),
+                            ("asset_candidates", ["1234560"]),
+                            ("phone_candidates", ["23456780"])):
+            with self.subTest(field=field, weak=weak):
+                self.assertIsNone(self.choose([task(asset="1234567")],
+                    [good, {**good, field: weak}])[0])
+
+    def test_unreadable_date_fuzzy_identity_requires_one_repeated_serial(self):
+        good = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
+        for other in (None, "ABC12X3451"):
+            with self.subTest(other=other):
+                reads = [good, {**good, "serial_candidates": [other] if other else []}]
+                self.assertIsNone(self.choose([task(asset="1234567")], reads)[0])
+
+    def test_unreadable_date_fuzzy_identity_requires_exact_model(self):
+        reads = [reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)] * 2
+        self.assertIsNone(self.choose([task(asset="1234567", product="Affiniti 50")], reads)[0])
+
+    def test_strong_fuzzy_identity_does_not_choose_between_visits_or_devices(self):
+        reads = [reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)] * 2
+        for other in (task("102", asset="1234567", due="2026-09-21"),
+                      task("102", asset="1234567", serial="ABC12X3451")):
+            with self.subTest(other=other["gid"], serial=other["name"]):
+                self.assertIsNone(self.choose([task(asset="1234567"), other], reads)[0])
+
+    def test_strong_fuzzy_identity_does_not_override_known_hospital_conflict(self):
+        reads = [reading(hospital="Other Hospital", serial="ABC12X3450",
+                         asset="1234567", day=None)] * 2
+        self.assertIsNone(self.choose([task(asset="1234567")], reads)[0])
+
+    def test_strong_fuzzy_identity_still_requires_reference_window(self):
+        reads = [reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)] * 2
+        self.assertIsNone(self.choose([task(asset="1234567", due="2026-08-01")], reads)[0])
+        self.assertIsNone(self.choose([task(asset="1234567")], reads, upload=False)[0])
+
     def test_missing_hospital_two_character_serial_is_not_relaxed(self):
         self.assertIsNone(self.choose([task()],
             [reading(hospital=None, serial="ABC12X3400")]*2)[0])
