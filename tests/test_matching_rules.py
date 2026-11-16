@@ -100,6 +100,14 @@ class MatchingRulesTests(unittest.TestCase):
         selected, _ = self.choose([task(asset="1234567")], [good] * 2 + [poorer] * 2)
         self.assertEqual(selected, task(asset="1234567"))
 
+    def test_strong_fuzzy_identity_uses_repeated_near_serial_to_corroborate_single_close_read(self):
+        close = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
+        poorer = {**close, "serial_candidates": [], "serial_visual_candidates": ["ABC12X3400"]}
+        selected, _ = self.choose([task(asset="1234567")], [close] + [poorer] * 2)
+        self.assertEqual(selected, task(asset="1234567"))
+        too_far = {**poorer, "serial_visual_candidates": ["ABC12X3000"]}
+        self.assertIsNone(self.choose([task(asset="1234567")], [close] + [too_far] * 2)[0])
+
     def test_strong_fuzzy_identity_does_not_arbitrate_two_repeated_near_serials(self):
         good = reading(hospital=None, serial="ABC12X3450", asset="1234567", day=None)
         other = {**good, "serial_candidates": ["ABC12X3451"]}
