@@ -20,7 +20,7 @@ from . import asana_client as ac, asana_index, config, nvidia_client as vision, 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
 MAX_LIVE_TASKS = 80
-MAX_SERIAL_QUERIES = 3
+MAX_SERIAL_QUERIES = 6
 VISIT_WINDOW_DAYS = 14
 CHECKLIST_HEADER = (0.05, 0.125, 0.95, 0.225)
 CHECKLIST_PROMPT = (
@@ -407,6 +407,8 @@ def diagnostic_pool(tasks, ev, job_type):
         })
     rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
     return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
+            "valid_serial_count": len([s for s in _serials(ev) if vision._valid_serial_token(s)]),
+            "serial_query_limit": MAX_SERIAL_QUERIES,
             "repeated_product_count": len(_stable(ev, "product_raw")),
             "repeated_hospital_count": len(_stable(ev, "hospital_raw")),
             "repeated_phone_count": len(_stable(ev, "phone_candidates")),
@@ -470,7 +472,7 @@ def read_and_match(doc, job_type, reference_day=None):
             return None
         pool, reason = live_pool(rows, ev, reference_day, job_type=job_type)
         trace.append(reason)
-        last_diagnostic = diagnostic_pool(pool, ev, job_type)
+        last_diagnostic = {**diagnostic_pool(pool, ev, job_type), "pool_reason": reason}
         task, reason = select_task(pool, ev, job_type, reference_day,
                                   allow_upload_prior=allow_upload_prior)
         trace.append(reason)

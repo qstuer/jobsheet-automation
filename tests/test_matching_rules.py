@@ -370,11 +370,36 @@ class MatchingRulesTests(unittest.TestCase):
 
     def test_serial_search_does_not_truncate_transcription_alternatives(self):
         ev = rules.evidence([{"serial_candidates": [
-            "ABC12X3456", "ABC12X3457", "ABC12X3458", "ABC12X3459"]}])
+            "ABC12X3456", "ABC12X3457", "ABC12X3458", "ABC12X3459",
+            "ABC12X3460", "ABC12X3461", "ABC12X3462"]}])
         with patch.object(ac, "_typeahead") as search, patch.object(ac, "_fetch_task") as fetch:
             self.assertEqual(rules.live_pool([], ev, self.upload, job_type="CM"),
                              ([], "task_candidate_limit"))
         search.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_crosspage_serial_alternatives_do_not_hide_a_late_live_visit(self):
+        for count in (4, 6):
+            with self.subTest(count=count):
+                serials = [f"ABC12X{3456 + i}" for i in range(count)]
+                current = task("102", serial=serials[-1])
+                ev = rules.evidence([reading(serial=serials[-1])] * 2
+                    + [{"serial_candidates": serials[:-1]}])
+                with patch.object(ac, "_typeahead", side_effect=lambda term:
+                        [current] if term == serials[-1] else []) as search, \
+                        patch.object(ac, "_fetch_task", return_value=current):
+                    pool, reason = rules.live_pool([], ev, self.upload, job_type="PM")
+                self.assertEqual(search.call_count, count)
+                self.assertEqual(reason, "live_tasks_read")
+                self.assertEqual(rules.select_task(pool, ev, "PM", self.upload)[0], current)
+
+    def test_expanded_serial_search_still_bounds_combined_live_tasks(self):
+        ev = rules.evidence([{"serial_candidates": ["ABC12X3456", "ABC12X3457"]}])
+        batches = [[{"gid": str(start + i)} for i in range(41)] for start in (100, 200)]
+        with patch.object(ac, "_typeahead", side_effect=batches), \
+                patch.object(ac, "_fetch_task") as fetch:
+            self.assertEqual(rules.live_pool([], ev, self.upload, job_type="PM"),
+                             ([], "task_candidate_limit"))
         fetch.assert_not_called()
 
     def test_serial_lookup_failure_is_an_infrastructure_error(self):
