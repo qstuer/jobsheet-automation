@@ -35,8 +35,29 @@ def with_identity_checks(diagnostic):
                 "repeated_phone_exact": bool(matching_rules._stable(ev, "phone_candidates") & facts["phones"]),
                 "repeated_asset_exact": len(assets) == 1 and assets.issubset(facts["assets"]),
             })
-        return {**result, "fallback_identity_checks": checks}
+        return {**result, "fallback_identity_checks": checks[:10]}
     return check
+
+
+def with_lookup_counts(reader, audit):
+    def lookup(rows, ev, reference_day, **kwargs):
+        entry = {"valid_serial_count": len([s for s in matching_rules._serials(ev)
+            if nvidia_client._valid_serial_token(s)]),
+            "indexed_task_count": len({str(ref["gid"]) for row in rows
+                for ref in row.get("task_refs") or [] if ref.get("gid")}),
+            "typeahead_result_counts": []}
+        typeahead = asana_client._typeahead
+        def search(*args, **kw):
+            result = typeahead(*args, **kw)
+            entry["typeahead_result_counts"].append(len(result))
+            return result
+        with patch.object(asana_client, "_typeahead", side_effect=search):
+            result = reader(rows, ev, reference_day, **kwargs)
+        entry["live_task_count"] = len(result[0])
+        entry["reason"] = result[1]
+        audit.append(entry)
+        return result
+    return lookup
 
 
 def main():
@@ -55,6 +76,7 @@ def main():
     source = Path("/tmp/jobsheet.pdf")
     reference_day = nvidia_client._today()
     first_day, last_day = matching_rules.month_window(reference_day)
+    lookup_audit = []
     with fitz.open(source) as doc, ExitStack() as readers, \
             patch.object(rclone_helper, "upload_unique", side_effect=AssertionError("Cloud write blocked")), \
             patch.object(rclone_helper, "delete", side_effect=AssertionError("Cloud delete blocked")), \
@@ -62,6 +84,8 @@ def main():
         assert len(doc) == (4 if kind == "PM" else 1)
         readers.enter_context(patch.object(matching_rules, "diagnostic_pool",
             side_effect=with_identity_checks(matching_rules.diagnostic_pool)))
+        readers.enter_context(patch.object(matching_rules, "live_pool",
+            side_effect=with_lookup_counts(matching_rules.live_pool, lookup_audit)))
         if date_mode == "missing":
             for name in ("ocr_jobsheet_fields", "ocr_jobsheet_identity_fields",
                          "ocr_jobsheet_support_fields", "ocr_jobsheet_focused_field",
@@ -87,6 +111,7 @@ def main():
               "calls": metrics.get("calls"), "seconds": metrics.get("seconds"),
               "tokens": metrics.get("total_tokens"), "cloud_writes": 0,
               "trace": trace, "date_present": bool(ocr.get("service_date_raw")),
+              "lookup_audit": lookup_audit,
               "diagnostic": (ocr.get("rules_audit") or {}).get("last_live_diagnostic")}
     print("STALE_INDEX_RESULT " + json.dumps(result), flush=True)
     if date_mode == "missing":
