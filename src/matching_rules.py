@@ -261,19 +261,22 @@ def assess_task(task, ev, job_type):
                 and {"product", "phone"} <= support
             )
             repeated_assets = _stable(ev, "asset_candidates")
-            one_edit_serials = {s for s in repeated_serials
-                               if ac._lev(s, facts["serial"]) == 1}
+            serial_distances = {s: ac._lev(s, facts["serial"]) for s in repeated_serials}
+            closest_repeat = min(serial_distances.values(), default=99)
+            nearest_repeats = {s for s, delta in serial_distances.items()
+                               if delta == closest_repeat and delta <= 2}
             exact_device_support = (
-                len(one_edit_serials) == 1
+                len(nearest_repeats) == 1
                 and bool(facts["product_model"])
                 and _stable(ev, "product_model") == {facts["product_model"]}
                 and bool(_stable(ev, "phone_candidates") & facts["phones"])
                 and len(repeated_assets) == 1
                 and repeated_assets.issubset(facts["assets"])
             )
-            # Keep poorer OCR alternatives in the candidate pool; they do
-            # not erase this corroborated reading. Competing live devices
-            # and visits still pass through the uniqueness gates below.
+            # This branch already requires an actual one-edit reading. A
+            # repeated visual reading within two edits can corroborate it
+            # when the three other exact identifiers also repeat. Poorer
+            # alternatives stay in the pool; live rivals still cannot tie.
             missing_hospital_fuzzy_needs_date = missing_hospital_fuzzy and not exact_device_support
             safe = safe or missing_hospital_fuzzy
         else:
