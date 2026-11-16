@@ -17,6 +17,28 @@ def without_date(reader):
     return read
 
 
+def with_identity_checks(diagnostic):
+    def check(tasks, ev, job_type):
+        result = diagnostic(tasks, ev, job_type)
+        repeated_serials = (matching_rules._stable(ev, "serial_candidates")
+                            | matching_rules._stable(ev, "serial_visual_candidates"))
+        checks = []
+        for task in tasks:
+            facts = matching_rules._live_facts(task)
+            if not facts:
+                continue
+            assets = matching_rules._stable(ev, "asset_candidates")
+            checks.append({
+                "serial_repeat_count": len(repeated_serials),
+                "repeated_serial_distances": sorted(asana_client._lev(s, facts["serial"]) for s in repeated_serials),
+                "exact_model_supported": matching_rules._stable(ev, "product_model") == {facts["product_model"]},
+                "repeated_phone_exact": bool(matching_rules._stable(ev, "phone_candidates") & facts["phones"]),
+                "repeated_asset_exact": len(assets) == 1 and assets.issubset(facts["assets"]),
+            })
+        return {**result, "fallback_identity_checks": checks}
+    return check
+
+
 def main():
     sample = os.environ["STALE_SAMPLE"]
     kind = os.environ["STALE_JOB_TYPE"]
@@ -38,6 +60,8 @@ def main():
             patch.object(rclone_helper, "delete", side_effect=AssertionError("Cloud delete blocked")), \
             patch.object(rclone_helper, "moveto", side_effect=AssertionError("Cloud move blocked")):
         assert len(doc) == (4 if kind == "PM" else 1)
+        readers.enter_context(patch.object(matching_rules, "diagnostic_pool",
+            side_effect=with_identity_checks(matching_rules.diagnostic_pool)))
         if date_mode == "missing":
             for name in ("ocr_jobsheet_fields", "ocr_jobsheet_identity_fields",
                          "ocr_jobsheet_support_fields", "ocr_jobsheet_focused_field",
