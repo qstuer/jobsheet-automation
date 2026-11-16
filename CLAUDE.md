@@ -208,7 +208,8 @@ workflow 失败。
 - Asset 缺失／不符不扣分；四捨五入達 70% 才加輔助分，不能代替精確電話。
 - 可靠原件日期與 Asana 正式到期／完成日期前後 14 天核對；PM 未能確認便讀
   第二頁 checklist 固定 Customer／System／sn／Date／Asset No.。跨頁確定身份衝突停下。
-- 日期仍不能讀穩才用原始上傳日前 70 天至後 30 天範圍，挑唯一最近工作；
+- 日期仍不能讀穩才用原始上傳日前 70 天至後 30 天範圍。只有一張同設備、
+  同類型工作在範圍內才可繼續；兩張以上會待核對，與上傳日的距離不能決定答案。
   完成或未完成都可考慮。不用 `modified_at` 或重跑日冒充服務／上傳日期。
 - Stage A 以 rclone 只讀 metadata 的 Drive `btime` 保存 `source_uploaded_at`，
   Stage B 按香港時區換算日期。批次 `created_at` 是處理時間，不是上傳時間。

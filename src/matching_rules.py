@@ -341,18 +341,17 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         return None, "upload_date_unknown"
     if not allow_upload_prior:
         return None, "need_crosspage_before_upload_prior"
-    # This is an upload-time prior, NOT a fabricated ACTION DATE. Do not use
-    # today's run date when replaying an old document; retain completed tasks.
+    # Upload time bounds the possible visit window. Without a reliable paper
+    # date it cannot choose between visits, even when one is closer to upload.
     dated = []
     for row in visits:
         task = row["task"]
         day = ac._parse_date(task.get("due_on") or task.get("completed_at"))
         if day and reference_day - timedelta(days=70) <= day <= reference_day + timedelta(days=30):
-            dated.append((abs((day - reference_day).days), row))
-    dated.sort(key=lambda item: item[0])
-    if not dated or (len(dated) > 1 and dated[0][0] == dated[1][0]):
+            dated.append(row)
+    if len(dated) != 1:
         return None, "upload_prior_not_unique"
-    return dated[0][1]["task"], "upload_prior_live_visit_confirmed"
+    return dated[0]["task"], "upload_prior_live_visit_confirmed"
 
 
 def diagnostic_pool(tasks, ev, job_type):
