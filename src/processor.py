@@ -1092,8 +1092,7 @@ def _process_split_file(filename: str, work_dir: Path,
                 task, tier, ocr = None, 0, _ocr_for_pending_review(doc)
             else:
                 if os.environ.get(MATCHING_RULES_ENV, "").strip():
-                    manifest = _manifest_for_job(work_dir, filename)
-                    reference_day = batch_state.source_upload_day(manifest, filename)
+                    reference_day = nvidia_client._today()
                     task, tier, ocr = _ocr_and_match(doc, job_type, reference_day=reference_day)
                 else:
                     task, tier, ocr = _ocr_and_match(doc, job_type)

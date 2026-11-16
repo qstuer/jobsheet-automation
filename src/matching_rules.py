@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import base64
 import io
+from calendar import monthrange
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date
 
 import fitz
 from PIL import Image, ImageOps
@@ -275,6 +276,15 @@ def assess_task(task, ev, job_type):
             "requires_reliable_date": missing_hospital_fuzzy}
 
 
+def month_window(reference_day):
+    bounds = []
+    for offset in (-1, 1):
+        year, month_index = divmod(reference_day.year * 12 + reference_day.month - 1 + offset, 12)
+        month = month_index + 1
+        bounds.append(date(year, month, min(reference_day.day, monthrange(year, month)[1])))
+    return tuple(bounds)
+
+
 def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     """Confirm device first, then a unique dated visit. No best-of-run selection."""
     models = _stable(ev, "product_model")
@@ -341,13 +351,14 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         return None, "upload_date_unknown"
     if not allow_upload_prior:
         return None, "need_crosspage_before_upload_prior"
-    # Upload time bounds the possible visit window. Without a reliable paper
-    # date it cannot choose between visits, even when one is closer to upload.
+    # An unreadable paper date uses the Hong Kong processing day's surrounding
+    # calendar months. Multiple visits in that window remain unresolved.
+    first_day, last_day = month_window(reference_day)
     dated = []
     for row in visits:
         task = row["task"]
         day = ac._parse_date(task.get("due_on") or task.get("completed_at"))
-        if day and reference_day - timedelta(days=70) <= day <= reference_day + timedelta(days=30):
+        if day and first_day <= day <= last_day:
             dated.append(row)
     if len(dated) != 1:
         return None, "upload_prior_not_unique"
@@ -408,6 +419,7 @@ def _checklist_read(doc, zoom):
 
 def read_and_match(doc, job_type, reference_day=None):
     from . import processor, private_ocr_context
+    reference_day = reference_day or vision._today()
     if len(doc) != (4 if job_type == "PM" else 1):
         raise ValueError("Incomplete jobsheet cannot enter matching")
     vision.reset_ocr_metrics()

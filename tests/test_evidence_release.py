@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,6 +27,14 @@ class ReleaseWiringTests(unittest.TestCase):
 
     def test_original_upload_day_uses_hong_kong_timezone(self):
         self.assertEqual(batch_state.source_upload_day(self.manifest(), self.filename), date(2026, 10, 5))
+
+    def test_processing_day_uses_hong_kong_timezone(self):
+        for hour, minute, expected in ((15, 59, date(2026, 11, 15)),
+                                       (16, 0, date(2026, 11, 16))):
+            utc = datetime(2026, 11, 15, hour, minute, tzinfo=timezone.utc)
+            with self.subTest(utc=utc), patch.object(nvidia_client, "datetime") as clock:
+                clock.now.side_effect = lambda tz: utc.astimezone(tz)
+                self.assertEqual(nvidia_client._today(), expected)
 
     def test_missing_upload_time_does_not_use_processing_time(self):
         self.assertIsNone(batch_state.source_upload_day(self.manifest(source_uploaded_at=None), self.filename))
@@ -100,6 +108,7 @@ class ReleaseWiringTests(unittest.TestCase):
         ocr = {"rules_audit": {"version": matching_rules.RULESET_VERSION}}
         with patch.dict(os.environ, {processor.MATCHING_RULES_ENV: matching_rules.RULESET_VERSION,
                                     "JOBSHEET_EVIDENCE_LIVE_RULES": ""}), \
+                patch.object(nvidia_client, "_today", return_value=date(2026, 11, 16)), \
                 patch.object(rclone_helper, "download", side_effect=lambda _r, p: p.write_bytes(b"synthetic")), \
                 patch.object(processor.fitz, "open"), \
                 patch.object(processor, "_manifest_for_job", return_value=self.manifest()), \
@@ -118,9 +127,15 @@ class ReleaseWiringTests(unittest.TestCase):
     def test_match_uploads_only_after_matching_then_records_before_source_delete(self):
         with tempfile.TemporaryDirectory() as temp:
             result, events, call, *_ = self.process(temp, task())
-        self.assertEqual(call.kwargs["reference_day"], date(2026, 10, 5))
+        self.assertEqual(call.kwargs["reference_day"], date(2026, 11, 16))
         self.assertEqual(events, ["upload", "uploaded", "delete"])
         self.assertEqual(result["state"], "uploaded")
+
+    def test_full_processor_uses_today_instead_of_old_source_upload_date(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(nvidia_client, "_today", return_value=date(2026, 11, 16)):
+            _, _, call, *_ = self.process(temp, task(), dry_run=True)
+        self.assertEqual(call.kwargs["reference_day"], date(2026, 11, 16))
 
     def test_full_processor_dryrun_does_not_write_or_move(self):
         with tempfile.TemporaryDirectory() as temp:
