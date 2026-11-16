@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      SANDBOX_PREP: ${{ runner.temp }}/unattended-inputs
+      SANDBOX_PREP: /tmp/unattended-inputs
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
