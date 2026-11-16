@@ -234,17 +234,12 @@ function processBatchReports(props) {
       continue;
     }
     if (report.action_required && !alreadyEmailed) {
-      const lines = (report.jobs || [])
-        .filter(job => ['incomplete', 'pending', 'versioned'].includes(job.state))
-        .map(job => {
-          const detail = job.reason || job.onedrive || '';
-          return `- Job ${job.index} (${job.type})：${job.state}${detail ? ` — ${detail}` : ''}`;
-        });
+      const lines = batchReportAttentionLines(report);
       const ok = sendPipelineEmail(
         email,
         `Jobsheet 需要處理：${report.source_file}`,
         `原始掃描：${report.source_file}\n共 ${report.jobs.length} 份工作單。\n\n`
-          + `${lines.join('\n')}\n\n完整成功的工作單不會逐份寄信。`
+          + `${lines.join('\n')}\n\n同批提醒合併為這一封；歸檔結果與單號／描述檢查分開列出。`
       );
       if (!ok) continue;
       // 先留一個寄信標記才搬檔；即使 moveTo 暫時失敗，下輪也只重試搬檔，
@@ -255,6 +250,20 @@ function processBatchReports(props) {
     file.moveTo(sent);
     props.deleteProperty(sentMarker);
   }
+}
+
+function batchReportAttentionLines(report) {
+  return (report.jobs || [])
+    .filter(job => ['incomplete', 'pending', 'versioned'].includes(job.state)
+      || (job.order_review && job.order_review.needs_attention === true))
+    .map(job => {
+      const review = job.order_review || {};
+      const detail = review.message || job.reason || job.onedrive || '';
+      const note = review.appended || review.draft;
+      const suffix = note ? `\n  ${String(note).replace(/\n/g, ' / ')}` : '';
+      const link = review.task_url ? `\n  Asana：${review.task_url}` : '';
+      return `- Job ${job.index} (${job.type})：${job.state}${detail ? ` — ${detail}` : ''}${suffix}${link}`;
+    });
 }
 
 function checkPipelineHealth(pat, props) {

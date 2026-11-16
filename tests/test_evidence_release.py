@@ -144,6 +144,48 @@ class ReleaseWiringTests(unittest.TestCase):
         self.assertEqual((uploads, deletes, moves), (0, 0, 0))
         self.assertIn("預覽", result["status"])
 
+    def test_followup_runs_after_durable_delivery_and_before_source_cleanup(self):
+        stages = []
+
+        def followup(*args, **kwargs):
+            self.assertEqual(kwargs["delivery_state"], "uploaded")
+            self.assertTrue(args[2].exists())
+            self.assertEqual(processor._save_result.call_count, 1)
+            self.assertEqual(processor._save_result.call_args.args[3], "uploaded")
+            rclone_helper.delete.assert_not_called()
+            stages.append("review")
+            return {"status": "pm_missing_order", "needs_attention": True}
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(processor, "_review_uploaded_job", side_effect=followup) as review:
+            result, events, *_ = self.process(temp, task())
+        review.assert_called_once()
+        self.assertEqual(stages, ["review"])
+        self.assertEqual(events, ["upload", "uploaded", "uploaded", "delete"])
+        self.assertEqual(result["state"], "uploaded")
+        self.assertTrue(result["order_review"]["needs_attention"])
+
+    def test_dryrun_never_enters_description_followup_even_when_apply_enabled(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, {"JOBSHEET_ORDER_REVIEW_MODE": "apply"}), \
+                patch.object(processor, "_review_uploaded_job") as review:
+            self.process(temp, task(), dry_run=True)
+        review.assert_not_called()
+
+    def test_failed_followup_state_save_retains_source_for_retry(self):
+        def followup(*args, **kwargs):
+            def fail_save(*_args, **_kwargs):
+                rclone_helper.delete.assert_not_called()
+                raise RuntimeError("synthetic state save failure")
+            processor._save_result.side_effect = fail_save
+            return {"status": "description_updated", "needs_attention": True}
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(processor, "_review_uploaded_job", side_effect=followup):
+            with self.assertRaisesRegex(RuntimeError, "state save failure"):
+                self.process(temp, task())
+            self.assertTrue((Path(temp) / self.filename).exists())
+
     def test_rejected_evidence_cannot_use_legacy_neutral_naming(self):
         with tempfile.TemporaryDirectory() as temp:
             _, _, _, uploads, deletes, moves, neutral = self.process(temp, None, dry_run=True)

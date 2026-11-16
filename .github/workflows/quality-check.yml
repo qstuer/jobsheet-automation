@@ -28,3 +28,5 @@ jobs:
         run: python -m compileall -q src tests
       - name: Check Apps Script syntax
         run: node --check < apps_script/trigger.gs
+      - name: Test order notification formatting
+        run: node tests/test_order_notification.js

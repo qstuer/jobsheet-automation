@@ -49,6 +49,7 @@ def new_manifest(source_file: str, source_pages: int, jobs: list,
         "updated_at": utc_now(),
         "final": False,
         "action_required": any(not job.get("complete", True) for job in jobs),
+        "post_upload_review_policy": "order-description-v1",
         "jobs": [
             {
                 "index": index,
@@ -129,12 +130,19 @@ def record_result(manifest: dict, filename: str, state: str, **details) -> dict:
     job["state"] = state
     job.update({key: value for key, value in details.items() if value is not None})
     manifest["action_required"] = any(
-        row.get("state") in ACTION_STATES for row in manifest.get("jobs", [])
+        job_needs_attention(row) for row in manifest.get("jobs", [])
     )
     manifest["final"] = bool(manifest.get("jobs")) and all(
-        row.get("state") in TERMINAL_STATES for row in manifest.get("jobs", [])
+        row.get("state") in TERMINAL_STATES and not row.get("order_review_pending")
+        for row in manifest.get("jobs", [])
     )
     return job
+
+
+def job_needs_attention(job: dict) -> bool:
+    review = job.get("order_review")
+    return job.get("state") in ACTION_STATES or (
+        isinstance(review, dict) and review.get("needs_attention") is True)
 
 
 def ensure_legacy_manifest(filename: str) -> dict:
@@ -158,10 +166,11 @@ def finalize_ready_manifests(work_dir: Path) -> int:
         manifest = load(work_dir, Path(filename).stem)
         if not manifest or manifest.get("final") or not manifest.get("jobs"):
             continue
-        if all(job.get("state") in TERMINAL_STATES for job in manifest["jobs"]):
+        if all(job.get("state") in TERMINAL_STATES and not job.get("order_review_pending")
+               for job in manifest["jobs"]):
             manifest["final"] = True
             manifest["action_required"] = any(
-                job.get("state") in ACTION_STATES for job in manifest["jobs"]
+                job_needs_attention(job) for job in manifest["jobs"]
             )
             save(work_dir, manifest)
             changed += 1

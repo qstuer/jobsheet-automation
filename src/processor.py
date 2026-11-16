@@ -15,6 +15,7 @@
 手動模式可指定 _SPLIT 或 _PENDING 的一份 PDF；dry-run 全程不寫雲端。
 """
 import logging
+import hashlib
 import os
 import re
 import sys
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import fitz
 
-from . import asana_client, asana_index, batch_state, config, nvidia_client, pending_review, private_ocr_context, rclone_helper, selection_audit
+from . import asana_client, asana_index, batch_state, config, nvidia_client, pending_review, post_upload_review, private_ocr_context, rclone_helper, selection_audit
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1048,6 +1049,55 @@ def _save_result(work_dir: Path, manifest: dict, filename: str,
     batch_state.save(work_dir, manifest)
 
 
+def _review_uploaded_job(task, job_type, local_pdf, manifest, *, work_dir=None, filename=None, delivery_state=None):
+    mode = os.environ.get(post_upload_review.MODE_ENV, "off").strip().lower()
+    if mode == "off":
+        return None
+    legacy = manifest.get("post_upload_review_policy") != post_upload_review.POLICY
+    effective_mode = "preview" if legacy else mode
+    cached_fault = []
+    calls_before = nvidia_client.get_ocr_metrics().get("calls", 0)
+    fingerprint = hashlib.sha256(local_pdf.read_bytes()).hexdigest() if local_pdf.exists() else None
+    previous = batch_state.find_job(manifest, filename) if filename else None
+    old_review = (previous or {}).get("order_review") or {}
+    old_backup = (previous or {}).get("order_review_backup") or {}
+    prior_block = None
+    gid = str((task or {}).get("gid") or "")
+    for saved in (old_review, old_backup):
+        if fingerprint and saved.get("input_sha256") == fingerprint and saved.get("task_gid") == gid:
+            prior_block = saved.get("appended") or saved.get("intended_block") or prior_block
+
+    def read_fault():
+        if not cached_fault:
+            with fitz.open(local_pdf) as doc:
+                cached_fault.append(nvidia_client.ocr_jobsheet_fault_issue(doc))
+        return cached_fault[0]
+
+    def backup(current, block):
+        if work_dir is None or filename is None or delivery_state is None:
+            raise ValueError("Durable description backup unavailable")
+        value = {key: current.get(key) for key in ("notes", "html_notes", "modified_at")}
+        value.update(task_gid=gid, input_sha256=fingerprint, intended_block=block)
+        _save_result(work_dir, manifest, filename, delivery_state, order_review_backup=value)
+
+    try:
+        review = post_upload_review.review(task, job_type, mode=effective_mode,
+            fault_reader=read_fault, before_write=backup, prior_block=prior_block)
+    except Exception as exc:
+        review = {"policy": post_upload_review.POLICY, "mode": effective_mode,
+            "status": "followup_failed", "needs_attention": True,
+            "message": "檔案已上傳，但單號／描述檢查未完成，請核對。",
+            "error_type": type(exc).__name__}
+    if legacy:
+        review["mode_reason"] = "legacy_batch_preview_only"
+    if fingerprint:
+        review["input_sha256"] = fingerprint
+    if cached_fault:
+        review["fault_ocr_calls"] = max(0, nvidia_client.get_ocr_metrics().get("calls", 0) - calls_before)
+    log.info("  上傳後單號檢查：%s", review.get("status", "unknown"))
+    return review
+
+
 def _process_split_file(filename: str, work_dir: Path,
                         source_folder: str = None,
                         dry_run: bool = False,
@@ -1077,7 +1127,14 @@ def _process_split_file(filename: str, work_dir: Path,
         _save_result(
             work_dir, manifest, filename, result["state"],
             onedrive=result.get("onedrive"), confirmed=True,
+            order_review_pending=os.environ.get(post_upload_review.MODE_ENV, "off").strip().lower() != "off",
         )
+        review = _review_uploaded_job(None, _parse_job_type(filename), local, manifest,
+            work_dir=work_dir, filename=filename, delivery_state=result["state"])
+        if review is not None:
+            result["order_review"] = review
+            _save_result(work_dir, manifest, filename, result["state"], order_review=review,
+                order_review_pending=False)
         # 與自動配對相同：先記錄成功，最後才刪 Google Drive 來源。
         rclone_helper.delete(remote)
         local.unlink(missing_ok=True)
@@ -1222,7 +1279,19 @@ def _process_split_file(filename: str, work_dir: Path,
         onedrive=result.get("onedrive"), order_no=result.get("order_no"),
         asana_task_gid=result.get("asana_task_gid"),
         ocr_metrics=result.get("ocr_metrics", {}),
+        order_review_pending=os.environ.get(post_upload_review.MODE_ENV, "off").strip().lower() != "off",
     )
+    # Persist delivery before attempting a separate append-only follow-up.
+    # If its second state save fails, retain the source; a retry verifies both
+    # the already delivered PDF and existing service note without duplicating.
+    review = _review_uploaded_job(task, job_type, local, manifest,
+        work_dir=work_dir, filename=filename, delivery_state=result["state"])
+    if review is not None:
+        result["order_review"] = review
+        if review.get("fault_ocr_calls"):
+            result["ocr_metrics"] = nvidia_client.get_ocr_metrics()
+        _save_result(work_dir, manifest, filename, result["state"], order_review=review,
+            order_review_pending=False)
     # OneDrive 已接收檔案後，先把結果寫進耐久批次狀態，最後才刪來源。
     # 若狀態寫入失敗，_SPLIT 仍在，下輪會以內容比對認出既有檔而不重複上傳；
     # 反過來先刪來源，runner 此刻中斷便會留下永遠未完成的批次報告。
