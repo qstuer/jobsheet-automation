@@ -19,6 +19,7 @@ from . import asana_client as ac, asana_index, config, nvidia_client as vision, 
 RULESET_VERSION = "evidence-live-v2"
 MAX_DEVICE_ROWS = 10
 MAX_LIVE_TASKS = 80
+MAX_SERIAL_QUERIES = 3
 VISIT_WINDOW_DAYS = 14
 CHECKLIST_HEADER = (0.05, 0.125, 0.95, 0.225)
 CHECKLIST_PROMPT = (
@@ -162,13 +163,18 @@ def live_pool(rows, ev, reference_day, *, job_type=None):
             gids.update(str(t["gid"]) for t in matches
                         if t.get("gid") and work_orders.intersection(
                             ac._task_work_orders(t, with_prefix=True)))
-    elif not rows:
-        # New equipment may not be indexed. Only transcribed serials are used;
-        # unbounded phone/asset workspace searches are deliberately avoided.
-        for serial in _serials(ev)[:3]:
-            if not vision._valid_serial_token(serial):
-                continue
-            gids.update(str(t["gid"]) for t in ac._typeahead(serial) if t.get("gid"))
+    else:
+        # A known device can have new visits absent from its indexed task list.
+        # Search transcribed serials for both indexed and unindexed equipment,
+        # then apply the same live identity, job-type and date checks below.
+        serials = [serial for serial in _serials(ev) if vision._valid_serial_token(serial)]
+        if len(serials) > MAX_SERIAL_QUERIES:
+            return [], "task_candidate_limit"
+        for serial in serials:
+            matches = ac._typeahead(serial)
+            if len(matches) >= ac.TYPEAHEAD_DEFAULT_COUNT:
+                return [], "task_candidate_limit"
+            gids.update(str(t["gid"]) for t in matches if t.get("gid"))
     if len(gids) > MAX_LIVE_TASKS:
         return [], "task_candidate_limit"
     # NO indexed type/date filtering: both may have changed since the snapshot.

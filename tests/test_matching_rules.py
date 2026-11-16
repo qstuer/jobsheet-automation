@@ -146,7 +146,8 @@ class MatchingRulesTests(unittest.TestCase):
 
     def test_index_dates_never_exclude_live_work(self):
         rows = [{"task_refs": [{"gid": "101", "due_on": "2025-01-01", "job_type": "CM"}]}]
-        with patch.object(ac, "_fetch_task", return_value=task()) as fetch:
+        with patch.object(ac, "_typeahead", return_value=[]), \
+                patch.object(ac, "_fetch_task", return_value=task()) as fetch:
             pool, _ = rules.live_pool(rows, rules.evidence([reading()]*2), self.upload)
         fetch.assert_called_once_with("101")
         self.assertIsNotNone(self.choose(pool)[0])
@@ -199,6 +200,72 @@ class MatchingRulesTests(unittest.TestCase):
                              ([], "task_candidate_limit"))
         fetch.assert_not_called()
 
+    def test_indexed_device_discovers_new_visit_without_work_order(self):
+        for old_kind, new_kind in (("PM", "CM"), ("CM", "CM"), ("PM", "PM")):
+            with self.subTest(old_kind=old_kind, new_kind=new_kind):
+                ev = rules.evidence([reading()] * 2)
+                old = task("101", due="2026-06-01", kind=old_kind)
+                current = task("102", kind=new_kind)
+                rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+                with patch.object(ac, "_typeahead", return_value=[old, current]) as search, \
+                        patch.object(ac, "_fetch_task", side_effect={"101": old, "102": current}.__getitem__):
+                    pool, _ = rules.live_pool(rows, ev, self.upload, job_type=new_kind)
+                self.assertEqual(search.call_args_list[0].args, ("ABC12X3456",))
+                self.assertEqual(rules.select_task(pool, ev, new_kind, self.upload)[0], current)
+
+    def test_production_matching_finds_cm_missing_from_index(self):
+        old = task("101", kind="PM")
+        current = task("102", kind="CM")
+        ac.set_device_index({"devices": [{"serial": "ABC12X3456",
+            "task_refs": [{"gid": "101"}]}]})
+        with patch.dict("os.environ", {processor.MATCHING_RULES_ENV: rules.RULESET_VERSION}), \
+                patch.object(vision, "ocr_jobsheet_fields", return_value=reading()), \
+                patch.object(vision, "ocr_jobsheet_identity_fields", return_value=reading()), \
+                patch.object(vision, "ocr_jobsheet_support_fields", return_value=reading()), \
+                patch.object(ac, "_typeahead", return_value=[old, current]), \
+                patch.object(ac, "_fetch_task", side_effect={"101": old, "102": current}.__getitem__):
+            selected, tier, _ = processor._ocr_and_match([object()], "CM", self.upload)
+        self.assertEqual(selected, current)
+        self.assertEqual(tier, 2)
+
+    def test_new_same_day_visit_is_retained_as_a_competing_candidate(self):
+        ev = rules.evidence([reading()] * 2)
+        old = task("101", kind="CM")
+        current = task("102", kind="CM")
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        with patch.object(ac, "_typeahead", return_value=[old, current]), \
+                patch.object(ac, "_fetch_task", side_effect={"101": old, "102": current}.__getitem__):
+            pool, _ = rules.live_pool(rows, ev, self.upload, job_type="CM")
+        self.assertEqual(rules.select_task(pool, ev, "CM", self.upload),
+                         (None, "live_visits_tied"))
+
+    def test_serial_search_at_limit_holds_without_fetching_partial_results(self):
+        ev = rules.evidence([reading()] * 2)
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        with patch.object(ac, "_typeahead", return_value=[{}] * ac.TYPEAHEAD_DEFAULT_COUNT), \
+                patch.object(ac, "_fetch_task") as fetch:
+            self.assertEqual(rules.live_pool(rows, ev, self.upload, job_type="CM"),
+                             ([], "task_candidate_limit"))
+        fetch.assert_not_called()
+
+    def test_serial_search_does_not_truncate_transcription_alternatives(self):
+        ev = rules.evidence([{"serial_candidates": [
+            "ABC12X3456", "ABC12X3457", "ABC12X3458", "ABC12X3459"]}])
+        with patch.object(ac, "_typeahead") as search, patch.object(ac, "_fetch_task") as fetch:
+            self.assertEqual(rules.live_pool([], ev, self.upload, job_type="CM"),
+                             ([], "task_candidate_limit"))
+        search.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_serial_lookup_failure_is_an_infrastructure_error(self):
+        ev = rules.evidence([reading()] * 2)
+        rows = [{"serial": "ABC12X3456", "task_refs": [{"gid": "101"}]}]
+        with patch.object(ac, "_typeahead", side_effect=ac.AsanaError("offline")), \
+                patch.object(ac, "_fetch_task") as fetch:
+            with self.assertRaises(ac.AsanaError):
+                rules.live_pool(rows, ev, self.upload, job_type="CM")
+        fetch.assert_not_called()
+
     def test_work_order_recovery_requires_a_unique_exact_dated_cm_visit(self):
         live = task(hospital="ZZZ", product="MX40", kind="CM", phone="")
         live["name"] += "/ WO123456"
@@ -232,9 +299,11 @@ class MatchingRulesTests(unittest.TestCase):
         self.assertEqual(reason, "device_candidate_limit")
 
     def test_live_api_failure_propagates(self):
-        with patch.object(ac, "_fetch_task", side_effect=ac.AsanaError("offline")):
+        with patch.object(ac, "_typeahead", return_value=[]), \
+                patch.object(ac, "_fetch_task", side_effect=ac.AsanaError("offline")):
             with self.assertRaises(ac.AsanaError):
-                rules.live_pool([{"task_refs": [{"gid": "101"}]}], {}, self.upload)
+                rules.live_pool([{"task_refs": [{"gid": "101"}]}],
+                                rules.evidence([reading()] * 2), self.upload, job_type="CM")
 
     def test_index_corruption_not_a_miss(self):
         with self.assertRaises(Exception):
