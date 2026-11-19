@@ -26,7 +26,6 @@ from src import asana_client, asana_index, config, nvidia_client, pdf_utils, pro
 
 PRODUCTION_SHA = "7c1b1fa0ae8518da47406a74e3cb6a4efc0377ca"
 RAW_NAME = "20261119092353_001.pdf"
-RAW_REMOTE = f"googledrive:{RAW_NAME}"
 logging.getLogger().handlers = [logging.NullHandler()]
 
 
@@ -41,7 +40,11 @@ def main():
                      "JOBSHEET_EVIDENCE_LIVE_RULES"):
         assert not os.environ.get(variable), "Answer/date override is forbidden"
 
-    counters = {"cloud_write_attempts": 0, "drive_downloads": 0,
+    downloads = json.loads(os.environ.pop("JOBSHEET_BLIND_DOWNLOADS"))
+    assert set(downloads) == {"source", "index", "manifest"}
+    assert all(urlparse(url).scheme == "https" for url in downloads.values())
+    download_hosts = {urlparse(url).hostname for url in downloads.values()}
+    counters = {"cloud_write_attempts": 0, "input_downloads": 0,
                 "asana_gets": 0, "vision_posts": 0}
     results = {"production_sha": PRODUCTION_SHA, "single_pass": True,
                "expected_answers_supplied": False, "jobs": [], "guards": counters}
@@ -56,6 +59,7 @@ def main():
     def request_allowed(method, url):
         host = urlparse(str(url)).hostname
         return ((host == "app.asana.com" and method.upper() == "GET") or
+                (host in download_hosts and method.upper() == "GET") or
                 (host == nvidia_host and method.upper() == "POST"))
 
     # Exercise the policy without issuing a request.
@@ -70,6 +74,8 @@ def main():
             return blocked()
         if urlparse(str(url)).hostname == "app.asana.com":
             counters["asana_gets"] += 1
+        elif urlparse(str(url)).hostname in download_hosts:
+            counters["input_downloads"] += 1
         return original_request(session, method, url, **kwargs)
     requests.sessions.Session.request = readonly_request
 
@@ -82,56 +88,30 @@ def main():
         return original_send(client, request, **kwargs)
     httpx.Client.send = guarded_send
 
-    for name in ("upload", "upload_unique", "delete", "moveto"):
+    for name in ("upload", "upload_unique", "delete", "moveto", "download", "run_result"):
         setattr(rclone_helper, name, blocked)
     processor._review_uploaded_job = blocked
     processor._save_result = blocked
     processor._finalize_match = blocked
     processor._finalize_confirmed = blocked
     processor._move_to_pending_unique = blocked
+    subprocess.Popen = blocked
+    results["guard_policy_self_checks"] = True
 
     with tempfile.TemporaryDirectory(prefix="jobsheet_blind_20261119_") as folder:
         temp = Path(folder).resolve()
         source = temp / RAW_NAME
         index_file = temp / "index.json"
         manifest_file = temp / "index-manifest.json"
-        allowed_downloads = {RAW_REMOTE: source,
-                             config.GDRIVE_ASANA_INDEX_JSON: index_file,
-                             config.GDRIVE_ASANA_INDEX_MANIFEST: manifest_file}
-
-        def command_allowed(args):
-            if not isinstance(args, (list, tuple)) or len(args) < 4:
-                return False
-            if args[0] != "rclone" or args[1] != "copyto":
-                return False
-            wanted = allowed_downloads.get(str(args[2]))
-            if wanted is None or Path(args[3]).resolve() != wanted:
-                return False
-            extra = list(args[4:])
-            return (extra == ["--drive-root-folder-id", config.GDRIVE_FROM_BROTHER_FOLDER_ID,
-                              "--drive-trashed-only", "--retries", "1",
-                              "--low-level-retries", "2", "--contimeout", "15s", "--timeout", "60s"]
-                    if args[2] == RAW_REMOTE else not extra)
-
-        assert not command_allowed(["rclone", "copyto", str(source), "onedrive:anything"])
-        assert not command_allowed(["rclone", "deletefile", RAW_REMOTE])
-        original_popen = subprocess.Popen
-        def guarded_popen(args, *pos, **kwargs):
-            if kwargs.get("shell") or not command_allowed(args):
-                return blocked()
-            counters["drive_downloads"] += 1
-            return original_popen(args, *pos, **kwargs)
-        subprocess.Popen = guarded_popen
-        results["guard_policy_self_checks"] = True
-
         try:
-            # Trash is read directly; no restore, move, re-upload or queue write.
-            rclone_helper.run("copyto", RAW_REMOTE, str(source),
-                "--drive-root-folder-id", config.GDRIVE_FROM_BROTHER_FOLDER_ID,
-                "--drive-trashed-only", "--retries", "1", "--low-level-retries", "2",
-                "--contimeout", "15s", "--timeout", "60s")
-            rclone_helper.download(config.GDRIVE_ASANA_INDEX_JSON, index_file)
-            rclone_helper.download(config.GDRIVE_ASANA_INDEX_MANIFEST, manifest_file)
+            # The connected Drive reader supplied these short-lived download
+            # links in one encrypted temporary input. No expected answers, source
+            # files, tokens or links are committed or printed in public logs.
+            for name, local in (("source", source), ("index", index_file),
+                                ("manifest", manifest_file)):
+                response = requests.get(downloads[name], timeout=90)
+                response.raise_for_status()
+                local.write_bytes(response.content)
             index = asana_index.load_index(index_file, manifest_file)
             key = hashlib.sha256(source.read_bytes()).digest()
             def tag(label, value):
