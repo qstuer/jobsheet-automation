@@ -41,10 +41,6 @@ def main():
                      "JOBSHEET_EVIDENCE_LIVE_RULES"):
         assert not os.environ.get(variable), "Answer/date override is forbidden"
 
-    downloads = json.loads(os.environ.pop("JOBSHEET_BLIND_DOWNLOADS"))
-    assert set(downloads) == {"source", "index", "manifest"}
-    assert all(urlparse(url).scheme == "https" for url in downloads.values())
-    download_hosts = {urlparse(url).hostname for url in downloads.values()}
     counters = {"cloud_write_attempts": 0, "input_downloads": 0,
                 "asana_gets": 0, "vision_posts": 0}
     results = {"production_sha": PRODUCTION_SHA, "single_pass": True,
@@ -53,7 +49,7 @@ def main():
     out.mkdir(exist_ok=True)
 
     nvidia_host = urlparse(config.NVIDIA_BASE_URL).hostname
-    guard = ReadOnlyGuard(counters, vision_host=nvidia_host, download_hosts=download_hosts)
+    guard = ReadOnlyGuard(counters, vision_host=nvidia_host)
     request_allowed = guard.request_allowed
 
     # Exercise the policy without issuing a request.
@@ -68,8 +64,6 @@ def main():
             return guard.reject_network(method)
         if urlparse(str(url)).hostname == "app.asana.com":
             counters["asana_gets"] += 1
-        elif urlparse(str(url)).hostname in download_hosts:
-            counters["input_downloads"] += 1
         return original_request(session, method, url, **kwargs)
     requests.sessions.Session.request = readonly_request
 
@@ -84,8 +78,6 @@ def main():
 
     for name in ("upload", "upload_unique", "delete", "moveto"):
         setattr(rclone_helper, name, guard.reject_cloud_write)
-    for name in ("download", "run_result"):
-        setattr(rclone_helper, name, guard.reject_subprocess)
     processor._review_uploaded_job = guard.reject_cloud_write
     processor._save_result = guard.reject_cloud_write
     processor._finalize_match = guard.reject_cloud_write
@@ -100,14 +92,17 @@ def main():
         index_file = temp / "index.json"
         manifest_file = temp / "index-manifest.json"
         try:
-            # The connected Drive reader supplied these short-lived download
-            # links in one encrypted temporary input. No expected answers, source
-            # files, tokens or links are committed or printed in public logs.
-            for name, local in (("source", source), ("index", index_file),
-                                ("manifest", manifest_file)):
-                response = requests.get(downloads[name], timeout=90)
-                response.raise_for_status()
-                local.write_bytes(response.content)
+            # Use the same dedicated Drive credentials as production. Only
+            # these three exact Drive-to-runner copies can start a subprocess.
+            raw_remote=f'googledrive:{RAW_NAME}'
+            raw_options=('--drive-root-folder-id',config.GDRIVE_FROM_BROTHER_FOLDER_ID,
+                         '--drive-trashed-only')
+            guard.allow_drive_download(raw_remote,source,*raw_options)
+            guard.allow_drive_download(config.GDRIVE_ASANA_INDEX_JSON,index_file)
+            guard.allow_drive_download(config.GDRIVE_ASANA_INDEX_MANIFEST,manifest_file)
+            rclone_helper.run('copyto',raw_remote,str(source),*raw_options)
+            rclone_helper.download(config.GDRIVE_ASANA_INDEX_JSON,index_file)
+            rclone_helper.download(config.GDRIVE_ASANA_INDEX_MANIFEST,manifest_file)
             index = asana_index.load_index(index_file, manifest_file)
             key = hashlib.sha256(source.read_bytes()).digest()
             def tag(label, value):

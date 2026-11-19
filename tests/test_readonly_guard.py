@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.readonly_guard import ReadOnlyGuard
@@ -18,6 +20,29 @@ class ReadOnlyGuardTests(unittest.TestCase):
         self.assertEqual(self.counts['local_metadata_queries'],1)
         self.assertEqual(self.counts['cloud_write_attempts'],0)
         self.guard.assert_clean()
+
+    def test_only_registered_drive_to_local_download_is_allowed(self):
+        self.guard._rclone='/usr/bin/rclone'
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory).resolve()/'input.pdf'
+            self.guard.allow_drive_download('googledrive:allowed.pdf',target)
+            command=['rclone','copyto','googledrive:allowed.pdf',str(target)]
+            self.guard.popen(command,stdout=-1,text=True)
+            self.native.assert_called_once_with(['/usr/bin/rclone',*command[1:]],stdout=-1,text=True)
+            self.guard.assert_clean()
+            with self.assertRaises(RuntimeError):
+                self.guard.popen(['rclone','copyto','googledrive:other.pdf',str(target)])
+        self.assertEqual(self.counts['input_downloads'],1)
+        self.assertEqual(self.counts['cloud_write_attempts'],0)
+
+    def test_cloud_destination_and_arbitrary_options_cannot_be_registered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for remote,target,options in (
+                ('googledrive:source.pdf','onedrive:destination.pdf',()),
+                ('onedrive:source.pdf',str(Path(directory)/'out.pdf'),()),
+                ('googledrive:source.pdf',str(Path(directory)/'out.pdf'),('--config','other.conf'))):
+                with self.subTest(remote=remote),self.assertRaises(ValueError):
+                    self.guard.allow_drive_download(remote,target,*options)
 
     def test_other_subprocesses_and_overrides_are_blocked(self):
         for args,kwargs in ((['uname','-a'],{}),(['uname','-p'],{'shell':True}),
