@@ -318,13 +318,20 @@ Apps Script 的 Project Settings → Script properties：
 | `GITHUB_PAT` | 是 | 通知 GitHub及讀取結果；只授權本 repo，`Contents: Read and write`、`Actions: Read-only` |
 | `ALERT_EMAIL` | 建議 | 收 Google 端故障電郵；填自己的地址 |
 
-加入 `ALERT_EMAIL` 後，手動執行一次 `checkDriveAndTrigger()` 批准寄信權限。地址不是密鑰，但不要寫死在公開程式碼。
+加入 `ALERT_EMAIL` 後，若專案有明列 `oauthScopes`，必須同時包含
+`https://www.googleapis.com/auth/script.send_mail`（參考 `apps_script/appsscript.json`，保留專案原有設定）。
+手動執行一次 `checkDriveAndTrigger()`，由使用者在 Google 批准新增寄信權限；只有收件地址
+或定時執行成功不代表已可寄信。Cloud 記錄若出現 `Specified permissions are not sufficient`
+及 `script.send_mail`，須處理此授權，不能當作郵件已送出。地址不是密鑰，但不要寫死在公開程式碼。
 
 ## 7. 告警
 
 `.github/workflows/jobsheet-failure-alert.yml` 分別監看 Stage A、Stage B。只有登入、雲端、網路、程式等整體故障令 workflow 失敗才計入；缺頁、配對證據不足及單檔辨認重試不當成 pipeline 崩潰。連續 3 次才建立 `[Pipeline Alert] ...` Issue，後續失敗只靜默更新同一 Issue。
 
-每批的 `_REPORTS/*.json` 是耐久狀態。Apps Script 只在報告最終包含 `incomplete`、`pending` 或 `versioned` 時寄一封中文摘要；全部成功不寄信。寄出或確認無需通知後，報告移入 `_REPORTS/_REPORTS_SENT/`，不會重寄。
+每批的 `_REPORTS/*.json` 是耐久狀態。完成報告若有 `incomplete`、`pending`、`versioned`
+或單號／描述的 `needs_attention`，Apps Script 合併寄一封中文摘要；已歸檔但欠公司單號
+仍須通知。所有檔案及後續檢查均無待處理事項時才不寄信。寄出或確認無需通知後，報告
+移入 `_REPORTS/_REPORTS_SENT/`，不會重寄；寄信失敗則留在原處供下輪重試。
 
 如果 GitHub 連告警工作都無法啟動，Issue 當下也不會建立。因此 Apps Script 會在設定 `ALERT_EMAIL` 後做第二層檢查：某階段連敗 3 次寄一次；恢復後重設。若連續 3 次連 GitHub 狀態也讀不到，會寄另一封通知。寄信失敗不阻止正常處理。
 
