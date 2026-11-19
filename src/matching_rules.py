@@ -13,6 +13,7 @@ import logging
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import date
+from pathlib import Path
 
 import fitz
 from PIL import Image, ImageOps
@@ -527,5 +528,16 @@ def read_and_match(doc, job_type, reference_day=None):
         "reference_date_known": reference_day is not None,
         "read_count": len(readings), "crosspage_used": any(r.get("_page") == 1 for r in readings),
         "last_live_diagnostic": last_diagnostic}
+    # Opaque evidence lets an operator compare a private paper reference with
+    # the actual transcription without publishing it in public Actions logs.
+    source_path = getattr(doc, "name", "")
+    if isinstance(source_path, str) and source_path and Path(source_path).is_file():
+        references = _stable(evidence(readings), "work_order_candidates")
+        ocr["rules_audit"]["work_order_receipts"] = [
+            {"prefix": match[1], "digits": len(match[2]),
+             "tag": processor.selection_audit.receipt(Path(source_path), task_gid="",
+                 filename="work-order:" + value)["filename"]}
+            for value in sorted(references)
+            if (match := ac._WORK_ORDER_PATTERN.fullmatch(value))]
     logging.getLogger(__name__).info("MATCHING_DIAGNOSTIC %s", json.dumps(ocr["rules_audit"]))
     return task, 2 if task else 0, ocr
