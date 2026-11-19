@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import logging
+import re
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import date
@@ -117,6 +118,50 @@ def _matching_work_orders(ev):
     return stable, None
 
 
+def _focused_company_order(ev):
+    orders = _stable(ev, "order_no")
+    if len(orders) == 1:
+        value = next(iter(orders))
+        if re.fullmatch(r"[56][0-9]{7}", value) and ev["order_no"][value]["sources"]["company_order_focus"] >= 2:
+            return value
+    return None
+
+
+def _uncertain_full_reference(ev):
+    """A bounded fault-field disagreement is retained as uncertainty."""
+    stable = _stable(ev, "work_order_candidates")
+    if len(stable) != 1:
+        return None
+    old = ac._WORK_ORDER_PATTERN.fullmatch(next(iter(stable)))
+    if not old or len(old[2]) != 7:
+        return None
+    focused = {key: item for key, item in ev["work_order_candidates"].items()
+               if item["sources"]["fault_reference_focus"]}
+    if sum(item["sources"]["fault_reference_focus"] for item in focused.values()) != 2:
+        return None
+    full = [key for key in focused if len(ac._WORK_ORDER_PATTERN.fullmatch(key)[2]) == 8]
+    if len(full) != 1:
+        return None
+    match = ac._WORK_ORDER_PATTERN.fullmatch(full[0])
+    return full[0] if ac._lev(old[2], match[2]) == 1 else None
+
+
+def _reference_identity_corroborated(row, ev):
+    return (row is not None and row["serial_distance"] == 0
+        and row["facts"]["serial"] in _stable(ev, "serial_candidates")
+        and {"product", "hospital", "phone"} <= row["support"]
+        and bool(_stable(ev, "phone_candidates") & row["facts"]["phones"])
+        and len(_stable(ev, "service_date_raw")) == 1)
+
+
+def _company_confirms_uncertain_reference(task, ev):
+    order = _focused_company_order(ev)
+    full = _uncertain_full_reference(ev)
+    return (order is not None and ac.extract_order_no_from_name(task) == order
+        and full is not None and full in _task_work_order_keys(task)
+        and _reference_identity_corroborated(assess_task(task, ev, "CM"), ev))
+
+
 def _strong_conflict(ev, field, actual):
     """A known repeated disagreement is different from an unknown short code."""
     stable = _stable(ev, field)
@@ -207,6 +252,13 @@ def live_pool(rows, ev, reference_day, *, job_type=None):
             if len(matches) >= ac.TYPEAHEAD_DEFAULT_COUNT:
                 return [], "task_candidate_limit"
             gids.update(str(t["gid"]) for t in matches if t.get("gid"))
+    primary_order = _focused_company_order(ev) if job_type == "CM" else None
+    if primary_order:
+        matches = ac._typeahead(primary_order)
+        if len(matches) >= ac.TYPEAHEAD_DEFAULT_COUNT:
+            return [], "task_candidate_limit"
+        gids.update(str(t["gid"]) for t in matches
+                    if t.get("gid") and ac.extract_order_no_from_name(t) == primary_order)
     if len(gids) > MAX_LIVE_TASKS:
         return [], "task_candidate_limit"
     # NO indexed type/date filtering: both may have changed since the snapshot.
@@ -343,22 +395,22 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     work_orders, shorter_reference = _matching_work_orders(ev) if job_type == "CM" else (set(), None)
     if len(work_orders) > 1:
         return None, "repeated_work_orders_conflict"
+    confirmed_by_company = False
     if work_orders:
         if shorter_reference and any(shorter_reference in _task_work_order_keys(t)
                                      and assess_task(t, ev, job_type) is not None for t in tasks):
             return None, "conflicting_live_reference_representations"
-        tasks = [t for t in tasks
-                 if work_orders.issubset(_task_work_order_keys(t))]
+        exact = [t for t in tasks if work_orders.issubset(_task_work_order_keys(t))]
+        if exact:
+            tasks = exact
+        else:
+            tasks = [t for t in tasks if _company_confirms_uncertain_reference(t, ev)]
+            confirmed_by_company = bool(tasks)
         if not tasks:
             return None, "live_work_order_conflict"
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
     if shorter_reference:
-        candidates = [row for row in candidates
-            if row["serial_distance"] == 0
-            and row["facts"]["serial"] in _stable(ev, "serial_candidates")
-            and {"product", "hospital", "phone"} <= row["support"]
-            and bool(_stable(ev, "phone_candidates") & row["facts"]["phones"])
-            and len(_stable(ev, "service_date_raw")) == 1]
+        candidates = [row for row in candidates if _reference_identity_corroborated(row, ev)]
     if not candidates:
         return None, "live_identity_not_confirmed"
     # Repeated readings of different known hospitals on different physical
@@ -404,7 +456,8 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         best_delta, best = dated[0]
         if len(dated) > 1 and dated[1][0] == best_delta and dated[1][1]["score"] >= best["score"] - 15:
             return None, "live_visits_tied"
-        return best["task"], "action_date_live_visit_confirmed"
+        return best["task"], ("company_order_live_visit_confirmed" if confirmed_by_company
+                               else "action_date_live_visit_confirmed")
     if any(row.get("requires_reliable_date") for row in visits):
         return None, "missing_hospital_fuzzy_needs_action_date"
     if reference_day is None:
@@ -452,6 +505,7 @@ def diagnostic_pool(tasks, ev, job_type):
                 _task_work_order_keys(task)) if references else None,
             "work_order_number_match": reference_numbers.issubset(
                 set(ac._task_work_orders(task))) if reference_numbers else None,
+            "company_confirms_uncertain_reference": _company_confirms_uncertain_reference(task, ev),
         })
     rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
     return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
@@ -547,6 +601,11 @@ def read_and_match(doc, job_type, reference_day=None):
             read(lambda z=zoom: vision.ocr_jobsheet_work_order_reference(doc, 0, zoom=z),
                  "fault_reference_focus")
         task = attempt()
+    if task is None and job_type == "CM" and _uncertain_full_reference(evidence(readings)):
+        for zoom in (5.0, 6.0):
+            read(lambda z=zoom: vision.ocr_jobsheet_focused_field(doc, 0, "order_no", zoom=z),
+                 "company_order_focus")
+        task = attempt()
     if task is None and job_type == "PM":
         for zoom in (5.0, 6.0):
             try:
@@ -567,9 +626,12 @@ def read_and_match(doc, job_type, reference_day=None):
     # the actual transcription without publishing it in public Actions logs.
     source_path = getattr(doc, "name", "")
     if isinstance(source_path, str) and source_path and Path(source_path).is_file():
-        references = _stable(evidence(readings), "work_order_candidates")
+        reference_evidence = evidence(readings)["work_order_candidates"]
+        references = set(reference_evidence)
         ocr["rules_audit"]["work_order_receipts"] = [
             {"prefix": match[1], "digits": len(match[2]),
+             "votes": reference_evidence[value]["votes"],
+             "focused_votes": reference_evidence[value]["sources"]["fault_reference_focus"],
              "tag": processor.selection_audit.receipt(Path(source_path), task_gid="",
                  filename="work-order:" + value)["filename"]}
             for value in sorted(references)

@@ -428,6 +428,77 @@ class MatchingRulesTests(unittest.TestCase):
                     with self.assertRaises(vision.NvidiaResponseError):
                         vision.ocr_jobsheet_work_order_reference(doc)
 
+    def company_reference_reads(self, company="62200001", company_count=2, **options):
+        values = self.reference_focus_reads(**options, focused_count=1)
+        values.append({**values[0], "_source": "fault_reference_focus"})
+        values.extend([{"order_no": company, "_source": "company_order_focus"}] * company_count)
+        return values
+
+    def test_independent_primary_company_order_confirms_an_uncertain_secondary_reference(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        ev = rules.evidence(self.company_reference_reads())
+        selected, reason = rules.select_task([live], ev, "CM", self.upload)
+        self.assertEqual(selected, live)
+        self.assertEqual(reason, "company_order_live_visit_confirmed")
+        self.assertEqual(len(ev["work_order_candidates"]), 2)
+
+    def test_company_confirmation_requires_exact_primary_number_and_full_device_support(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        for options in ({"company": "62200002"}, {"company_count": 1},
+                        {"phone": None}, {"day": None}, {"day": "1/8/2026"},
+                        {"full": "WO12745678"}, {"old": "WO12345679"}):
+            with self.subTest(options=options):
+                ev = rules.evidence(self.company_reference_reads(**options))
+                self.assertIsNone(rules.select_task([live], ev, "CM", self.upload)[0])
+
+    def test_company_confirmation_never_overrules_an_exact_existing_short_reference(self):
+        first = task(kind="CM")
+        first["name"] += "/ HAWO12345678/ 62200001"
+        second = task(gid="102", kind="CM")
+        second["name"] += "/ WO1234578/ 62200002"
+        ev = rules.evidence(self.company_reference_reads())
+        self.assertIsNone(rules.select_task([first, second], ev, "CM", self.upload)[0])
+
+    def test_primary_number_cannot_be_used_to_invent_a_missing_reference_digit(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        values = self.company_reference_reads(full="WO1234578")
+        self.assertIsNone(rules.select_task([live], rules.evidence(values), "CM", self.upload)[0])
+
+    def test_primary_company_lookup_discovers_a_current_visit_missing_from_index(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        ev = rules.evidence(self.company_reference_reads())
+        with patch.object(ac, "_typeahead", side_effect=[[], [], [{"gid": "101", "name": live["name"]}]]), \
+                patch.object(ac, "_fetch_task", return_value=live):
+            pool, _ = rules.live_pool([], ev, self.upload, job_type="CM")
+        self.assertEqual(rules.select_task(pool, ev, "CM", self.upload)[0], live)
+
+    def test_primary_company_confirmation_does_not_bypass_identity_or_visit_ambiguity(self):
+        from copy import deepcopy
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        for field, bad in (("serial_candidates", ["ABC12X3450"]),
+                           ("hospital_raw", "Other Hospital"), ("product_raw", "MX40")):
+            values = deepcopy(self.company_reference_reads())
+            for value in values:
+                if field in value:
+                    value[field] = bad
+            with self.subTest(field=field):
+                self.assertIsNone(rules.select_task([live], rules.evidence(values), "CM", self.upload)[0])
+        ev = rules.evidence(self.company_reference_reads())
+        self.assertIsNone(rules.select_task([live, {**live, "gid": "102"}], ev, "CM", self.upload)[0])
+
+    def test_primary_company_search_cannot_truncate_a_full_candidate_page(self):
+        ev = rules.evidence(self.company_reference_reads())
+        with patch.object(ac, "_typeahead", side_effect=[[], [], [{}] * ac.TYPEAHEAD_DEFAULT_COUNT]), \
+                patch.object(ac, "_fetch_task") as fetch:
+            self.assertEqual(rules.live_pool([], ev, self.upload, job_type="CM"),
+                             ([], "task_candidate_limit"))
+        fetch.assert_not_called()
+
     def test_stale_cm_index_can_retrieve_exact_work_order_live(self):
         reads = [{**reading(hospital="ZZZ", product="MX40", phone=None),
                   "work_order_candidates": ["WO# 123456"]}] * 2
