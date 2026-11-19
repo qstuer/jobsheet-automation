@@ -26,6 +26,8 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py"
       - name: Check Python syntax
         run: python -m compileall -q src tests
+      - name: Check actual SDK platform detection under the read-only guard
+        run: python scripts/check_readonly_sdk.py
       - name: Check Apps Script syntax
         run: node --check < apps_script/trigger.gs
       - name: Test order notification formatting

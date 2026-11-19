@@ -350,6 +350,27 @@ Apps Script 的 Project Settings → Script properties：
 
 ## 8. 設定及過時項目
 
+### Google Drive 專用 OAuth 及配額（2026-11-19）
+
+Google Drive 的 rclone remote 必須使用擁有者自己的 OAuth 用戶端，不能留空
+`client_id` 而繼續借用 rclone 共用專案；共用配額可能被其他使用者耗盡，該共用
+用戶端亦已進入退役程序。參考 [rclone 官方說明](https://rclone.org/drive/#making-your-own-client-id)。
+啟動前 `scripts/validate_drive_client.py` 只檢查配置是否完整，不輸出 secret 或 token。
+各存取工作限制每秒 4 次請求，重試間隔 10 秒；服務故障仍會顯示失敗並保留來源。
+
+專用應用要設為可持續背景運作的正式模式，避免外部測試應用的七天授權期限。
+Google 要求的公開應用說明及資料處理頁位於 `docs/`；只公開靜態說明，工作單及
+設備索引保留在原私有儲存。重新授權完成並驗證後，才更換本機配置及 `RCLONE_CONFIG`。
+這次只更換 Google Drive 部分，OneDrive 設定保持原值。
+
+`Jobsheet unattended storage readiness` 可手動檢查正式憑證：預設只讀入口、拆分佇列、
+索引和 OneDrive 目的地。`write_probe=true` 只在私有控制資料夾建立一個隨機測試 JSON，
+驗證建立、移動、讀回和刪除；不處理任何工作單，不寫 Asana，也不重傳已歸檔 PDF。
+
+唯讀測試外框使用 `scripts/readonly_guard.py`：固定的 `uname -p` 查詢計為本機 SDK
+資訊查詢，不能算成雲端寫入。其他指令及未允許的網路讀取另行記錄並令驗收失敗；
+Drive、OneDrive、Asana 的寫入仍會被阻止。Code Check 另用真正 SDK 做不連網複驗。
+
 Asana 設備索引不新增 secret；刷新工作沿用 `ASANA_TOKEN`、`ASANA_WORKSPACE_GID`。
 它只在手動啟動 `Jobsheet - Refresh Asana Device Index` 時更新，預設涵蓋今天往前兩年，
 不設每日排程。首次建立或索引過舊時可完整重掃；完成後才以 manifest 作版本交換。

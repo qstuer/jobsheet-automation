@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Privacy and data handling — Jobsheet Automation</title>
+<style>body{font:17px/1.65 system-ui,sans-serif;color:#17202a;max-width:760px;margin:64px auto;padding:0 24px}a{color:#1758a8}h1,h2{line-height:1.25}h2{font-size:1.2em;margin-top:32px}footer{margin-top:48px;color:#58616c}</style></head>
+<body><main><h1>Jobsheet Automation: privacy and data handling</h1>
+<p>Updated 19 November 2026. This page describes the owner's personal service-record filing workflow.</p>
+<h2>Google account access and purpose</h2>
+<p>With the owner's authorization, the application lists and downloads jobsheets in configured Google Drive folders, creates split PDFs and processing reports there, and moves or trashes source records according to the filing workflow. Google Drive access is used for these owner-directed operations.</p>
+<h2>Processing and connected services</h2>
+<p>The workflow runs locally or in the owner's GitHub Actions environment. Jobsheet images are sent to the configured vision provider for OCR; the production configuration uses NVIDIA. Extracted equipment and visit details are checked against the owner's Asana workspace. Matched PDFs are saved to the configured Microsoft OneDrive destination. The workflow may append a missing short service note to the confirmed Asana task and notify the owner, according to the owner's configured rules. These services process information under their own applicable policies.</p>
+<h2>Storage and access</h2>
+<p>Source scans, the equipment index and processing reports are kept in the configured private storage. Authorized PDFs remain in the selected archive. Credentials are held in local private configuration or encrypted GitHub Actions secrets. This public site contains application documentation, not a jobsheet collection or an upload form. It does not use analytics or advertising scripts.</p>
+<h2>Retention and control</h2>
+<p>Scans needing review remain in the configured source or review folders. Successfully processed sources follow the owner's filing rules; normal Google Drive deletions go to Trash. Archived files follow the owner's retention choices. The owner can revoke the application's access in Google Account settings and disable its automation. Revoking access stops future authorized access; it does not automatically delete existing archived records.</p>
+<h2>Contact</h2>
+<p>Contact the application owner through <a href="https://github.com/qstuer/jobsheet-automation">the project repository</a>. Do not attach private records or credentials to public issues.</p>
+<p><a href="index.html">Back to Jobsheet Automation</a></p>
+</main><footer>Jobsheet Automation</footer></body></html>

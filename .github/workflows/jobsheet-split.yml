@@ -13,6 +13,12 @@ env:
   # 不可命名為 RCLONE_VERSION；rclone 會把 RCLONE_* 環境變數
   # 當成自己的命令選項，將 1.75.0 誤當成布林值而拒絕啟動。
   JOBSHEET_RCLONE_RELEASE: '1.75.0'
+  RCLONE_TPSLIMIT: '4'
+  RCLONE_TPSLIMIT_BURST: '1'
+  RCLONE_RETRIES: '3'
+  RCLONE_RETRIES_SLEEP: '10s'
+  RCLONE_CONTIMEOUT: '20s'
+  RCLONE_TIMEOUT: '2m'
 
 concurrency:
   group: jobsheet-split
@@ -45,6 +51,7 @@ jobs:
           echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
+          python scripts/validate_drive_client.py
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Show queue before processing
