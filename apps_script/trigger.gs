@@ -8,7 +8,7 @@
  *    - GITHUB_PAT: 你的 fine-grained PAT
  *      (Contents: Read and write；Actions: Read-only；只授權本 repo)
  *    - ALERT_EMAIL: 收故障通知的電郵（建議；不填仍有 GitHub Issue 告警）
- * 4. 執行一次 checkDriveAndTrigger() 完成 OAuth 授權
+ * 4. 執行 authorizeJobsheetMail() 批准寄信權限，再執行 checkDriveAndTrigger()
  * 5. 設定 Triggers → Add Trigger:
  *    函式: checkDriveAndTrigger | 時間: Every 5 minutes
  */
@@ -31,6 +31,15 @@ const MONITORED_WORKFLOWS = [
   { key: 'STAGE_B', name: 'Stage B（辨認及上傳）', file: 'jobsheet-process.yml' },
 ];
 // ────────────────────────────────────────────────────
+
+function authorizeJobsheetMail() {
+  // The IDE can run with partial consents; request mail explicitly outside
+  // the timer's error handler so Google can display its consent prompt.
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, [
+    'https://www.googleapis.com/auth/script.send_mail',
+  ]);
+  Logger.log('Jobsheet 寄信授權檢查完成。');
+}
 
 function checkDriveAndTrigger() {
   // 時間觸發器、手動執行可能重疊；鎖住整段「檢查 → 等待 → dispatch」，

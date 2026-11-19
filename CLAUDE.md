@@ -327,7 +327,11 @@ Apps Script 的 Project Settings → Script properties：
 
 加入 `ALERT_EMAIL` 後，若專案有明列 `oauthScopes`，必須同時包含
 `https://www.googleapis.com/auth/script.send_mail`（參考 `apps_script/appsscript.json`，保留專案原有設定）。
-手動執行一次 `checkDriveAndTrigger()`，由使用者在 Google 批准新增寄信權限；只有收件地址
+先在 IDE 選擇 `authorizeJobsheetMail()` 執行，由使用者在 Google 批准新增寄信權限，
+再執行 `checkDriveAndTrigger()` 或等候下一輪定時檢查。IDE 可能在部分權限未批准時仍執行，
+主函式又會捕捉寄信錯誤，因此不能依賴普通執行自行彈出授權；此手動輔助函式使用
+[Google 的 requireScopes](https://developers.google.com/apps-script/reference/script/script-app)
+明確要求寄信同意，本身不寄信或處理佇列。只有收件地址
 或定時執行成功不代表已可寄信。Cloud 記錄若出現 `Specified permissions are not sufficient`
 及 `script.send_mail`，須處理此授權，不能當作郵件已送出。地址不是密鑰，但不要寫死在公開程式碼。
 
