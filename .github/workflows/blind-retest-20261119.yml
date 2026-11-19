@@ -1,0 +1,67 @@
+name: Jobsheet four-sheet blind read-only retest
+
+on:
+  push:
+    branches: [codex/blind-retest-20261119]
+    paths:
+      - .github/workflows/blind-retest-20261119.yml
+      - scripts/blind_retest_20261119.py
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check out the fixed production version separately
+        uses: actions/checkout@v7
+        with:
+          ref: 7c1b1fa0ae8518da47406a74e3cb6a4efc0377ca
+          path: production
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: production/requirements.txt
+      - name: Install the production dependencies
+        run: pip install -r production/requirements.txt
+      - name: Install the existing trusted transfer tool
+        run: |
+          curl --fail --location --output rclone.zip https://downloads.rclone.org/v1.75.0/rclone-v1.75.0-linux-amd64.zip
+          unzip -q rclone.zip
+          sudo mv rclone-v1.75.0-linux-amd64/rclone /usr/local/bin/rclone
+      - name: Restore existing credentials locally on the runner
+        env:
+          RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Run one blind pass with cloud mutations blocked
+        env:
+          PRODUCTION_SHA: 7c1b1fa0ae8518da47406a74e3cb6a4efc0377ca
+          OCR_PROVIDER: nvidia
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+          ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_WORKSPACE_GID: ${{ vars.ASANA_WORKSPACE_GID }}
+          JOBSHEET_MATCHING_RULES: evidence-live-v2
+          JOBSHEET_DRY_RUN: 'true'
+          JOBSHEET_ORDER_REVIEW_MODE: 'off'
+        run: |
+          test "$(git -C production rev-parse HEAD)" = "$PRODUCTION_SHA"
+          python scripts/blind_retest_20261119.py
+      - name: Retain anonymous measurements only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: four-sheet-blind-retest-20261119
+          path: anonymous-results/*.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove runner credentials
+        if: always()
+        run: shred -u ~/.config/rclone/rclone.conf 2>/dev/null || true
