@@ -304,6 +304,42 @@ class MatchingRulesTests(unittest.TestCase):
         for value in ("12345678", "ABC12X3456", "23456789", live["name"]):
             self.assertNotIn(value, json.dumps(diagnostic))
 
+    def test_eight_digit_hospital_reference_accepts_written_wo_and_asana_hawo(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO 12345678"
+        read = {**reading(), "work_order_candidates": ["WO# 12345678"]}
+        ev = rules.evidence([read, read])
+        self.assertEqual(rules.select_task([live], ev, "CM", self.upload)[0], live)
+        with patch.object(ac, "_typeahead", return_value=[{"gid": live["gid"], "name": live["name"]}]), \
+                patch.object(ac, "_fetch_task", return_value=live):
+            pool, _ = rules.live_pool([], ev, self.upload, job_type="CM")
+        self.assertEqual(pool, [live])
+
+    def test_same_eight_digit_reference_across_prefix_spellings_is_one_repeated_reading(self):
+        ev = rules.evidence([
+            {**reading(), "work_order_candidates": ["WO12345678"]},
+            {**reading(), "work_order_candidates": ["HAWO 12345678"]}])
+        self.assertEqual(len(rules._stable(ev, "work_order_candidates")), 1)
+
+    def test_reference_alias_does_not_accept_wrong_visit_or_equipment(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678"
+        good = {**reading(), "work_order_candidates": ["WO12345678"]}
+        for changes in ({"work_order_candidates": ["WO12345679"]},
+                        {"serial_candidates": ["ABC12X0000"]},
+                        {"hospital_raw": "Other Hospital"},
+                        {"product_raw": "MX40"}, {"service_date_raw": "1/8/2026"}):
+            with self.subTest(changes=changes):
+                ev = rules.evidence([{**good, **changes}] * 2)
+                self.assertIsNone(rules.select_task([live], ev, "CM", self.upload)[0])
+        ev = rules.evidence([good, good])
+        self.assertIsNone(rules.select_task([live, {**live, "gid": "102"}], ev, "CM", self.upload)[0])
+
+    def test_reference_alias_keeps_short_wo_and_company_order_separate(self):
+        self.assertNotEqual(rules._key("work_order_candidates", "WO123456"),
+                            rules._key("work_order_candidates", "HAWO123456"))
+        self.assertEqual(rules._key("work_order_candidates", "62200001"), "")
+
     def test_stale_cm_index_can_retrieve_exact_work_order_live(self):
         reads = [{**reading(hospital="ZZZ", product="MX40", phone=None),
                   "work_order_candidates": ["WO# 123456"]}] * 2

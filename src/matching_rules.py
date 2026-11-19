@@ -55,7 +55,12 @@ def _key(field, value):
         return info["canonical"] if info["status"] == "confirmed" else ""
     if field == "work_order_candidates":
         match = ac._WORK_ORDER_PATTERN.fullmatch(value)
-        return match[1].upper() + match[2] if match else ""
+        if not match:
+            return ""
+        # Paper often abbreviates the eight-digit hospital HAWO as WO.
+        # Keep six-digit hospital-specific references prefix-sensitive.
+        prefix = "HAWO" if len(match[2]) == 8 else match[1].upper()
+        return prefix + match[2]
     if field == "service_date_raw":
         parsed = vision._parse_action_date(value)
         return parsed.isoformat() if parsed else ""
@@ -87,6 +92,11 @@ def evidence(readings):
 
 def _stable(ev, field):
     return {key for key, item in ev[field].items() if item["votes"] >= 2}
+
+
+def _task_work_order_keys(task):
+    return {_key("work_order_candidates", value)
+            for value in ac._task_work_orders(task, with_prefix=True)}
 
 
 def _strong_conflict(ev, field, actual):
@@ -165,7 +175,7 @@ def live_pool(rows, ev, reference_day, *, job_type=None):
                 return [], "task_candidate_limit"
             gids.update(str(t["gid"]) for t in matches
                         if t.get("gid") and work_orders.intersection(
-                            ac._task_work_orders(t, with_prefix=True)))
+                            _task_work_order_keys(t)))
     else:
         # A known device can have new visits absent from its indexed task list.
         # Search transcribed serials for both indexed and unindexed equipment,
@@ -316,7 +326,7 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
         return None, "repeated_work_orders_conflict"
     if work_orders:
         tasks = [t for t in tasks
-                 if work_orders.issubset(ac._task_work_orders(t, with_prefix=True))]
+                 if work_orders.issubset(_task_work_order_keys(t))]
         if not tasks:
             return None, "live_work_order_conflict"
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
@@ -410,7 +420,7 @@ def diagnostic_pool(tasks, ev, job_type):
             "passes_identity": assessed is not None,
             "requires_reliable_date": assessed.get("requires_reliable_date") if assessed else None,
             "work_order_full_match": references.issubset(
-                set(ac._task_work_orders(task, with_prefix=True))) if references else None,
+                _task_work_order_keys(task)) if references else None,
             "work_order_number_match": reference_numbers.issubset(
                 set(ac._task_work_orders(task))) if reference_numbers else None,
         })
