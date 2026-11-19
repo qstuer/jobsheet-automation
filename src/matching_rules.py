@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+import logging
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import date
@@ -387,6 +389,9 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
 def diagnostic_pool(tasks, ev, job_type):
     """Anonymous rejection evidence, not raw OCR/Asana data or task IDs."""
     rows = []
+    references = _stable(ev, "work_order_candidates")
+    reference_numbers = {match[2] for value in references
+                         if (match := ac._WORK_ORDER_PATTERN.fullmatch(value))}
     for task in tasks:
         facts = _live_facts(task)
         if not facts:
@@ -404,6 +409,10 @@ def diagnostic_pool(tasks, ev, job_type):
             "type_matches": facts["type"] == job_type,
             "passes_identity": assessed is not None,
             "requires_reliable_date": assessed.get("requires_reliable_date") if assessed else None,
+            "work_order_full_match": references.issubset(
+                set(ac._task_work_orders(task, with_prefix=True))) if references else None,
+            "work_order_number_match": reference_numbers.issubset(
+                set(ac._task_work_orders(task))) if reference_numbers else None,
         })
     rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
     return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
@@ -508,4 +517,5 @@ def read_and_match(doc, job_type, reference_day=None):
         "reference_date_known": reference_day is not None,
         "read_count": len(readings), "crosspage_used": any(r.get("_page") == 1 for r in readings),
         "last_live_diagnostic": last_diagnostic}
+    logging.getLogger(__name__).info("MATCHING_DIAGNOSTIC %s", json.dumps(ocr["rules_audit"]))
     return task, 2 if task else 0, ocr

@@ -294,6 +294,16 @@ class MatchingRulesTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertEqual(reason, "repeated_product_models_conflict")
 
+    def test_reference_diagnostics_do_not_disclose_task_or_ocr_identifiers(self):
+        import json
+        live = task(kind="CM")
+        live["name"] += "/ HAWO 12345678"
+        ev = rules.evidence([{**reading(), "work_order_candidates": ["WO12345678"]}] * 2)
+        diagnostic = rules.diagnostic_pool([live], ev, "CM")
+        self.assertTrue(diagnostic["nearest_live_facts"][0]["work_order_number_match"])
+        for value in ("12345678", "ABC12X3456", "23456789", live["name"]):
+            self.assertNotIn(value, json.dumps(diagnostic))
+
     def test_stale_cm_index_can_retrieve_exact_work_order_live(self):
         reads = [{**reading(hospital="ZZZ", product="MX40", phone=None),
                   "work_order_candidates": ["WO# 123456"]}] * 2
