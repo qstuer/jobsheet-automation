@@ -35,9 +35,14 @@ const MONITORED_WORKFLOWS = [
 function authorizeJobsheetMail() {
   // The IDE can run with partial consents; request mail explicitly outside
   // the timer's error handler so Google can display its consent prompt.
-  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, [
+  const scopes = [
     'https://www.googleapis.com/auth/script.send_mail',
-  ]);
+  ];
+  const info = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL, scopes);
+  Logger.log(`MAIL_AUTHORIZATION_STATUS ${info.getAuthorizationStatus()}`);
+  const url = info.getAuthorizationUrl();
+  if (url) Logger.log(`MAIL_AUTHORIZATION_URL ${url}`);
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, scopes);
   Logger.log('Jobsheet 寄信授權檢查完成。');
 }
 

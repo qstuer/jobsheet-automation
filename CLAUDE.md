@@ -331,7 +331,9 @@ Apps Script 的 Project Settings → Script properties：
 再執行 `checkDriveAndTrigger()` 或等候下一輪定時檢查。IDE 可能在部分權限未批准時仍執行，
 主函式又會捕捉寄信錯誤，因此不能依賴普通執行自行彈出授權；此手動輔助函式使用
 [Google 的 requireScopes](https://developers.google.com/apps-script/reference/script/script-app)
-明確要求寄信同意，本身不寄信或處理佇列。只有收件地址
+明確要求寄信同意，本身不寄信或處理佇列。如「審查權限」在多帳戶登入時導向錯誤頁面，
+使用此函式記錄的 `MAIL_AUTHORIZATION_URL`（由 Google `getAuthorizationInfo()` 產生），
+交由使用者在正確帳戶完成同意；不要猜改網址或代替使用者略過安全警告。只有收件地址
 或定時執行成功不代表已可寄信。Cloud 記錄若出現 `Specified permissions are not sufficient`
 及 `script.send_mail`，須處理此授權，不能當作郵件已送出。地址不是密鑰，但不要寫死在公開程式碼。
 
