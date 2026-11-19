@@ -340,6 +340,81 @@ class MatchingRulesTests(unittest.TestCase):
                             rules._key("work_order_candidates", "HAWO123456"))
         self.assertEqual(rules._key("work_order_candidates", "62200001"), "")
 
+    def reference_focus_reads(self, *, day="28/9/2026", phone="23456789",
+                              old="WO1234578", full="WO12345678", focused_count=2):
+        base = {**reading(day=day, phone=phone), "work_order_candidates": [old]}
+        focused = {**reading(day=day, phone=phone), "work_order_candidates": [full],
+                   "_source": "fault_reference_focus"}
+        return [base, base] + [focused] * focused_count
+
+    def test_two_physical_field_reads_recover_one_missing_reference_digit(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678"
+        ev = rules.evidence(self.reference_focus_reads())
+        self.assertEqual(len(rules._stable(ev, "work_order_candidates")), 2)
+        self.assertEqual(rules.select_task([live], ev, "CM", self.upload)[0], live)
+        self.assertTrue(rules.diagnostic_pool([live], ev, "CM")["focused_reference_digit_recovery"])
+
+    def test_reference_digit_recovery_requires_two_reads_and_device_and_date_support(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678"
+        for options in ({"focused_count": 1}, {"day": None}, {"phone": None},
+                        {"full": "WO12745678"}, {"old": "WO12345679"}):
+            with self.subTest(options=options):
+                ev = rules.evidence(self.reference_focus_reads(**options))
+                self.assertIsNone(rules.select_task([live], ev, "CM", self.upload)[0])
+
+    def test_reference_digit_recovery_never_overrules_a_real_shorter_reference_visit(self):
+        first = task(kind="CM")
+        first["name"] += "/ HAWO12345678"
+        second = {**first, "gid": "102", "name": first["name"].replace("HAWO12345678", "WO1234578")}
+        ev = rules.evidence(self.reference_focus_reads())
+        chosen, reason = rules.select_task([first, second], ev, "CM", self.upload)
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "conflicting_live_reference_representations")
+
+    def test_reference_digit_recovery_keeps_company_order_conflicts_blocked(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678/ 62200001"
+        reads = [{**r, "order_no": "62200002"} for r in self.reference_focus_reads()]
+        chosen, reason = rules.select_task([live], rules.evidence(reads), "CM", self.upload)
+        self.assertIsNone(chosen)
+        self.assertEqual(reason, "live_order_conflict")
+
+    def test_reference_focus_is_bounded_and_only_used_after_reference_rejection(self):
+        live = task(kind="CM")
+        live["name"] += "/ HAWO12345678"
+        bad = self.reference_focus_reads()[0]
+        focused = {"work_order_candidates": ["WO12345678"]}
+        with patch.object(rules, "retrieve_rows", return_value=([], "index_miss")), \
+                patch.object(rules, "live_pool", return_value=([live], "live_work_order_tasks_read")), \
+                patch.object(private_ocr_context, "build_vocabulary", return_value={}), \
+                patch.object(vision, "ocr_jobsheet_fields", return_value=bad), \
+                patch.object(vision, "ocr_jobsheet_identity_fields", return_value=bad), \
+                patch.object(vision, "ocr_jobsheet_support_fields", return_value=bad), \
+                patch.object(vision, "ocr_jobsheet_work_order_reference", return_value=focused) as focus:
+            chosen, _, _ = rules.read_and_match([object()], "CM", self.upload)
+        self.assertEqual(chosen, live)
+        self.assertEqual([c.kwargs["zoom"] for c in focus.call_args_list], [5.0, 6.0])
+
+    def test_reference_field_reader_preserves_all_written_digits(self):
+        import fitz
+        with fitz.open() as doc:
+            doc.new_page()
+            with patch.object(vision, "_call_vision", return_value='{"prefix":"WO","number":"12345678"}'):
+                result = vision.ocr_jobsheet_work_order_reference(doc)
+        self.assertEqual(result["work_order_candidates"], ["WO12345678"])
+
+    def test_reference_field_reader_does_not_fill_uncertain_digits(self):
+        import fitz
+        with fitz.open() as doc:
+            doc.new_page()
+            with patch.object(vision, "_call_vision", return_value='{"prefix":null,"number":null}'):
+                self.assertEqual(vision.ocr_jobsheet_work_order_reference(doc)["work_order_candidates"], [])
+            with patch.object(vision, "_call_vision", return_value='{"prefix":"WO","number":"12345?78"}'):
+                with self.assertRaises(vision.NvidiaResponseError):
+                    vision.ocr_jobsheet_work_order_reference(doc)
+
     def test_stale_cm_index_can_retrieve_exact_work_order_live(self):
         reads = [{**reading(hospital="ZZZ", product="MX40", phone=None),
                   "work_order_candidates": ["WO# 123456"]}] * 2

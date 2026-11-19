@@ -85,9 +85,10 @@ def evidence(readings):
         for field in fields:
             source_field = "product_raw" if field == "product_model" else field
             for key in {_key(field, v) for v in _values(reading, source_field)} - {""}:
-                item = result[field].setdefault(key, {"votes": 0, "pages": Counter()})
+                item = result[field].setdefault(key, {"votes": 0, "pages": Counter(), "sources": Counter()})
                 item["votes"] += 1
                 item["pages"][reading.get("_page", 0)] += 1
+                item["sources"][reading.get("_source", "unspecified")] += 1
     return result
 
 
@@ -98,6 +99,22 @@ def _stable(ev, field):
 def _task_work_order_keys(task):
     return {_key("work_order_candidates", value)
             for value in ac._task_work_orders(task, with_prefix=True)}
+
+
+def _matching_work_orders(ev):
+    """Keep both readings; qualify a bounded missing-digit repair by provenance."""
+    stable = _stable(ev, "work_order_candidates")
+    focused = {key for key in stable if
+               ev["work_order_candidates"][key]["sources"]["fault_reference_focus"] >= 2}
+    if len(stable) == 2 and len(focused) == 1:
+        full = next(iter(focused))
+        shorter = next(iter(stable - focused))
+        full_match = ac._WORK_ORDER_PATTERN.fullmatch(full)
+        short_match = ac._WORK_ORDER_PATTERN.fullmatch(shorter)
+        if (full_match and short_match and len(full_match[2]) == 8
+                and len(short_match[2]) == 7 and ac._lev(full_match[2], short_match[2]) == 1):
+            return {full}, shorter
+    return stable, None
 
 
 def _strong_conflict(ev, field, actual):
@@ -159,14 +176,15 @@ def retrieve_rows(index, ev):
 def live_pool(rows, ev, reference_day, *, job_type=None):
     gids = {str(ref["gid"]) for row in rows for ref in row.get("task_refs") or []
             if ref.get("gid")}
-    work_orders = _stable(ev, "work_order_candidates") if job_type == "CM" else set()
+    work_orders, shorter_reference = _matching_work_orders(ev) if job_type == "CM" else (set(), None)
     if len(work_orders) > 1:
         return [], "repeated_work_orders_conflict"
     if work_orders:
         # Even an exact indexed device can predate this work order. Search
         # live by the confirmed reference and, when known, the exact serial.
         # The serial also finds titles that write the reference with spaces.
-        terms = list(work_orders)
+        lookup_references = work_orders | ({shorter_reference} if shorter_reference else set())
+        terms = sorted(lookup_references)
         serials = _stable(ev, "serial_candidates")
         if len(serials) == 1 and vision._valid_serial_token(next(iter(serials))):
             terms.extend(serials)
@@ -175,7 +193,7 @@ def live_pool(rows, ev, reference_day, *, job_type=None):
             if len(matches) >= ac.TYPEAHEAD_DEFAULT_COUNT:
                 return [], "task_candidate_limit"
             gids.update(str(t["gid"]) for t in matches
-                        if t.get("gid") and work_orders.intersection(
+                        if t.get("gid") and lookup_references.intersection(
                             _task_work_order_keys(t)))
     else:
         # A known device can have new visits absent from its indexed task list.
@@ -322,15 +340,25 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
     models = _stable(ev, "product_model")
     if len(models) > 1 and models.intersection(product_models.EXACT_MATCH_MODELS):
         return None, "repeated_product_models_conflict"
-    work_orders = _stable(ev, "work_order_candidates") if job_type == "CM" else set()
+    work_orders, shorter_reference = _matching_work_orders(ev) if job_type == "CM" else (set(), None)
     if len(work_orders) > 1:
         return None, "repeated_work_orders_conflict"
     if work_orders:
+        if shorter_reference and any(shorter_reference in _task_work_order_keys(t)
+                                     and assess_task(t, ev, job_type) is not None for t in tasks):
+            return None, "conflicting_live_reference_representations"
         tasks = [t for t in tasks
                  if work_orders.issubset(_task_work_order_keys(t))]
         if not tasks:
             return None, "live_work_order_conflict"
     candidates = [row for task in tasks if (row := assess_task(task, ev, job_type))]
+    if shorter_reference:
+        candidates = [row for row in candidates
+            if row["serial_distance"] == 0
+            and row["facts"]["serial"] in _stable(ev, "serial_candidates")
+            and {"product", "hospital", "phone"} <= row["support"]
+            and bool(_stable(ev, "phone_candidates") & row["facts"]["phones"])
+            and len(_stable(ev, "service_date_raw")) == 1]
     if not candidates:
         return None, "live_identity_not_confirmed"
     # Repeated readings of different known hospitals on different physical
@@ -400,7 +428,7 @@ def select_task(tasks, ev, job_type, reference_day, *, allow_upload_prior=True):
 def diagnostic_pool(tasks, ev, job_type):
     """Anonymous rejection evidence, not raw OCR/Asana data or task IDs."""
     rows = []
-    references = _stable(ev, "work_order_candidates")
+    references, shorter_reference = _matching_work_orders(ev)
     reference_numbers = {match[2] for value in references
                          if (match := ac._WORK_ORDER_PATTERN.fullmatch(value))}
     for task in tasks:
@@ -427,6 +455,7 @@ def diagnostic_pool(tasks, ev, job_type):
         })
     rows.sort(key=lambda r: (r["serial_distance"], not r["product_supported"], not r["phone_exact"]))
     return {"live_task_count": len(tasks), "nearest_live_facts": rows[:10],
+            "focused_reference_digit_recovery": shorter_reference is not None,
             "valid_serial_count": len([s for s in _serials(ev) if vision._valid_serial_token(s)]),
             "serial_query_limit": MAX_SERIAL_QUERIES,
             "repeated_product_count": len(_stable(ev, "product_raw")),
@@ -511,6 +540,12 @@ def read_and_match(doc, job_type, reference_day=None):
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_context_field(doc, 0, f, vocabulary, zoom=z), "cover_focus")
                 else:
                     read(lambda f=field, z=zoom: vision.ocr_jobsheet_focused_field(doc, 0, f, zoom=z), "cover_focus")
+        task = attempt()
+    if task is None and job_type == "CM" and trace[-1] in {
+            "live_work_order_conflict", "repeated_work_orders_conflict"}:
+        for zoom in (5.0, 6.0):
+            read(lambda z=zoom: vision.ocr_jobsheet_work_order_reference(doc, 0, zoom=z),
+                 "fault_reference_focus")
         task = attempt()
     if task is None and job_type == "PM":
         for zoom in (5.0, 6.0):
