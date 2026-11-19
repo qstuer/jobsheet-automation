@@ -1,0 +1,34 @@
+name: Diagnose the read-only subprocess guard offline
+on:
+  push:
+    branches: [codex/blind-retest-20261119]
+    paths: [.github/workflows/blind-guard-probe-20261119.yml]
+permissions: {}
+jobs:
+  offline-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: pip install openai==2.54.0
+      - name: Reproduce SDK metadata collection without credentials or API calls
+        run: |
+          python - <<'PY'
+          import json, subprocess, traceback
+          import httpx
+          import openai._base_client as sdk
+          attempts=[]
+          def blocked_process(args, *pos, **kwargs):
+              attempts.append({'argv':list(args), 'callers':[f.name for f in traceback.extract_stack()[-7:-1]]})
+              raise RuntimeError('Local subprocess blocked')
+          def blocked_network(*args, **kwargs):
+              raise AssertionError('No network allowed in offline probe')
+          subprocess.Popen=blocked_process
+          httpx.Client.send=blocked_network
+          result=sdk.get_platform()
+          assert len(attempts)==1 and attempts[0]['argv']==['uname','-p'], attempts
+          assert result=='Unknown', result
+          print('OFFLINE_GUARD_PROBE '+json.dumps({'openai':'2.54.0','python':'3.11','platform_result':result,'blocked_local_operations':attempts,'cloud_api_calls':0}))
+          PY
