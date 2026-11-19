@@ -356,6 +356,8 @@ Google Drive 的 rclone remote 必須使用擁有者自己的 OAuth 用戶端，
 `client_id` 而繼續借用 rclone 共用專案；共用配額可能被其他使用者耗盡，該共用
 用戶端亦已進入退役程序。參考 [rclone 官方說明](https://rclone.org/drive/#making-your-own-client-id)。
 啟動前 `scripts/validate_drive_client.py` 只檢查配置是否完整，不輸出 secret 或 token。
+Drive 的 `client_secret` 是 Sensitive 欄位、不是 IsPassword 欄位，必須按 rclone 原格式
+保存在私有配置及加密 Secret，不要自行 `rclone obscure`；切換前須強制測一次離線刷新。
 各存取工作限制每秒 4 次請求，重試間隔 10 秒；服務故障仍會顯示失敗並保留來源。
 
 專用應用要設為可持續背景運作的正式模式，避免外部測試應用的七天授權期限。
