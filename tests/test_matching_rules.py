@@ -415,6 +415,19 @@ class MatchingRulesTests(unittest.TestCase):
                 with self.assertRaises(vision.NvidiaResponseError):
                     vision.ocr_jobsheet_work_order_reference(doc)
 
+    def test_reference_field_reader_accepts_literal_numeric_json_and_hash_delimiter(self):
+        import fitz
+        with fitz.open() as doc:
+            doc.new_page()
+            with patch.object(vision, "_call_vision", return_value='{"prefix":"WO#","number":12345678}'):
+                self.assertEqual(vision.ocr_jobsheet_work_order_reference(doc)["work_order_candidates"],
+                                 ["WO12345678"])
+            for number in (True, 12345678.0, "12345?78"):
+                import json
+                with patch.object(vision, "_call_vision", return_value=json.dumps({"prefix":"WO","number":number})):
+                    with self.assertRaises(vision.NvidiaResponseError):
+                        vision.ocr_jobsheet_work_order_reference(doc)
+
     def test_stale_cm_index_can_retrieve_exact_work_order_live(self):
         reads = [{**reading(hospital="ZZZ", product="MX40", phone=None),
                   "work_order_candidates": ["WO# 123456"]}] * 2
